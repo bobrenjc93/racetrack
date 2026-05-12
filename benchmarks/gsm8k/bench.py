@@ -131,6 +131,19 @@ def _resolve_dtype(name: str, device: torch.device) -> torch.dtype:
     return mapping[name]
 
 
+def _discover_kernel_map(dispatcher, backend: str) -> dict[str, str] | None:
+    kernel_map: dict[str, str] = {}
+    for mod in dispatcher._load_backend_modules(backend):
+        if not bool(getattr(mod, "BACKEND_AVAILABLE", False)):
+            continue
+        for name in dir(mod):
+            if name.startswith("_") or name == "BACKEND_AVAILABLE":
+                continue
+            if callable(getattr(mod, name)):
+                kernel_map[name] = backend
+    return kernel_map or None
+
+
 def run(
     device_str: str = "cuda:0",
     dtype_str: str = "auto",
@@ -163,14 +176,8 @@ def run(
 
                     status = "native"
                     kernel_map = None
-                    if dispatcher is not None:
-                        if dispatcher._best_ops:
-                            kernel_map = {
-                                op: next(iter(backends))
-                                for op, backends in dispatcher._best_ops.items()
-                            }
-                        if hasattr(dispatcher, "best_summary"):
-                            status = dispatcher.best_summary()
+                    if dispatcher is not None and backend != "torch":
+                        kernel_map = _discover_kernel_map(dispatcher, backend)
 
                     results.append(Result(
                         model=model_name,
@@ -273,6 +280,7 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
             key=lambda kv: sum(r.mean_ms for r in kv[1]),
         )
         backend_name, runs = best_backend
+        kernel_map = next((r.kernels for r in runs if r.kernels), None)
         for r in runs:
             best_results.append(Result(
                 model=r.model,
@@ -287,7 +295,7 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
                 min_ms=r.min_ms,
                 max_ms=r.max_ms,
                 tokens_per_second=r.tokens_per_second,
-                kernels=r.kernels,
+                kernels=kernel_map,
             ))
     return best_results
 
