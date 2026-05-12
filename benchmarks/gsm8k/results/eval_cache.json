@@ -1,0 +1,8 @@
+{
+  "Qwen/Qwen2.5-1.5B-Instruct:200": {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "num_samples": 200,
+    "correct": 120,
+    "accuracy_pct": 60.0
+  }
+}

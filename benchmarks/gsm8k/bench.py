@@ -29,7 +29,7 @@ import torch
 
 BENCHMARK_DIR = Path(__file__).parent
 MODELS = ("dsv3_2",)
-BACKENDS = ("torch", "triton", "helion")
+BACKENDS = ("torch", "triton", "cutedsl", "helion")
 
 CASES: list[tuple[str, int]] = [
     ("question", 96),
@@ -176,6 +176,8 @@ def run(
 
                     status = "native"
                     kernel_map = None
+                    if dispatcher is not None and backend != "torch":
+                        kernel_map = _discover_kernel_map(dispatcher, backend)
 
                     results.append(Result(
                         model=model_name,
@@ -384,6 +386,7 @@ def _print_table(results: list[Result]) -> None:
 def _render_markdown(report: dict, slug: str) -> str:
     hw = report["hardware"]
     winner = report["winner"]
+    eval_result = report.get("eval")
     lines: list[str] = []
 
     lines.append(f"# GSM8K Benchmark: {slug}")
@@ -393,6 +396,12 @@ def _render_markdown(report: dict, slug: str) -> str:
     lines.append(f"**PyTorch**: {hw.get('torch', 'N/A')}  ")
     lines.append(f"**dtype**: {report.get('dtype', 'N/A')}  ")
     lines.append(f"**Date**: {report.get('timestamp', 'N/A')}")
+    if eval_result:
+        lines.append(f"**Eval model**: {eval_result['model']}  ")
+        lines.append(
+            f"**GSM8K accuracy**: {eval_result['accuracy_pct']}% "
+            f"({eval_result['correct']}/{eval_result['num_samples']})"
+        )
     lines.append("")
 
     lines.append("## Winner")
@@ -411,15 +420,21 @@ def _render_markdown(report: dict, slug: str) -> str:
     lines.append("## Leaderboard")
     lines.append("")
     case_names = list(next(iter(report["leaderboard"]))["cases"].keys())
-    header = "| # | partition | backend | " + " | ".join(
-        f"{c} (ms)" for c in case_names
-    ) + " | total (ms) | vs baseline |"
-    sep = "|" + "|".join("---" for _ in range(len(case_names) + 5)) + "|"
-    lines.append(header)
-    lines.append(sep)
+    headers = [
+        "#",
+        "partition",
+        "backend",
+        *(f"{case_name} (ms)" for case_name in case_names),
+        "total (ms)",
+        "vs baseline",
+    ]
+    if eval_result:
+        headers.append("correctness")
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("---" for _ in headers) + "|")
     for rank, entry in enumerate(report["leaderboard"], 1):
         cases = entry["cases"]
-        case_cols = " | ".join(f"{cases[c]['mean_ms']:.1f}" for c in case_names)
+        case_cols = [f"{cases[c]['mean_ms']:.1f}" for c in case_names]
         speedup_val = entry.get("speedup_vs_baseline")
         speedup_cell = f"{speedup_val:.3f}x" if speedup_val is not None else "-"
         kernels_note = ""
@@ -427,19 +442,26 @@ def _render_markdown(report: dict, slug: str) -> str:
             kernels_note = " (" + ", ".join(
                 f"{op}={b}" for op, b in sorted(entry["kernels"].items())
             ) + ")"
-        lines.append(
-            f"| {rank} | {entry['partition']} | "
-            f"{entry['backend']}{kernels_note} | "
-            f"{case_cols} | {entry['aggregate_mean_ms']:.1f} | {speedup_cell} |"
-        )
+        row = [
+            str(rank),
+            entry["partition"],
+            f"{entry['backend']}{kernels_note}",
+            *case_cols,
+            f"{entry['aggregate_mean_ms']:.1f}",
+            speedup_cell,
+        ]
+        if eval_result:
+            row.append(f"{eval_result['accuracy_pct']}%")
+        lines.append("| " + " | ".join(row) + " |")
     lines.append("")
 
-    lines.append("## Cases")
-    lines.append("")
-    for case_name in case_names:
-        first_entry = report["leaderboard"][0]["cases"][case_name]
-        lines.append(f"- **{case_name}**: {first_entry['tokens']} tokens")
-    lines.append("")
+    if report["leaderboard"]:
+        first_cases = report["leaderboard"][0]["cases"]
+        lines.append("## Cases")
+        lines.append("")
+        for case_name, case_data in first_cases.items():
+            lines.append(f"- **{case_name}**: {case_data['tokens']} tokens")
+        lines.append("")
 
     baseline = report.get("baseline", {})
     if baseline:
@@ -461,13 +483,29 @@ def main() -> None:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=10)
+    parser.add_argument("--no-eval", action="store_true", help="Skip GSM8K accuracy eval")
+    parser.add_argument("--eval-model", default=None, help="HF model for GSM8K eval")
+    parser.add_argument("--eval-samples", type=int, default=200, help="Number of GSM8K samples")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
+
+    eval_result = None
+    if not args.no_eval:
+        from benchmarks.gsm8k.eval import EVAL_MODEL, evaluate
+
+        eval_result = evaluate(
+            model_name=args.eval_model or EVAL_MODEL,
+            num_samples=args.eval_samples,
+            device=args.device,
+        )
+
     results = run(args.device, args.dtype, args.warmup, args.repeat)
     _print_table(results)
 
     report = pick_winner(results)
+    if eval_result is not None:
+        report["eval"] = eval_result
     winner = report["winner"]
     slug = _hardware_slug(args.device)
     results_dir = BENCHMARK_DIR / "results"
