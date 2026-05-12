@@ -1,12 +1,14 @@
-"""GSM8K accuracy evaluation using a real HuggingFace model.
+"""GSM8K accuracy evaluation using DeepSeek-V3.2.
 
-Downloads a small model, runs it on GSM8K test questions, extracts numerical
-answers, and compares to ground truth.  Results are cached so subsequent
-benchmark runs skip the expensive generation step.
+Loads the full DeepSeek-V3.2 model in 4-bit quantization across all available
+GPUs, runs it on GSM8K test questions, extracts numerical answers, and compares
+to ground truth.  Results are cached so subsequent benchmark runs skip the
+expensive generation step.
 
 Usage (standalone):
     python -m benchmarks.gsm8k.eval
-    python -m benchmarks.gsm8k.eval --model Qwen/Qwen2.5-1.5B-Instruct --samples 200
+    python -m benchmarks.gsm8k.eval --samples 200
+    python -m benchmarks.gsm8k.eval --model deepseek-ai/DeepSeek-V3.2 --samples 200
 """
 
 from __future__ import annotations
@@ -25,9 +27,9 @@ for _tv_mod in ("torchvision", "torchvision.transforms"):
 
 import torch
 
-EVAL_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+EVAL_MODEL = "deepseek-ai/DeepSeek-V3.2"
 NUM_SAMPLES = 200
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 2048
 CACHE_PATH = Path(__file__).parent / "results" / "eval_cache.json"
 
 
@@ -86,16 +88,24 @@ def evaluate(
         return cache[cache_key]
 
     from datasets import load_dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    print(f"Loading model {model_name} ...")
+    print(f"Loading model {model_name} (4-bit quantized, device_map=auto) ...")
     hf_token = _load_hf_token()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, token=hf_token, trust_remote_code=True,
+    )
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         token=hf_token,
-        dtype=torch.bfloat16,
-        device_map=device,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
     )
     model.eval()
 
@@ -125,7 +135,7 @@ def evaluate(
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
         with torch.no_grad():
             outputs = model.generate(

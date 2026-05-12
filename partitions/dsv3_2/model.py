@@ -413,10 +413,13 @@ class DeepSeekConfig:
     num_layers: int = 2
     num_attention_heads: int = 8
     head_dim: int = 64
+    qk_nope_head_dim: int | None = None
+    v_head_dim: int | None = None
     q_lora_rank: int = 128
     kv_lora_rank: int = 128
     qk_rope_head_dim: int = 16
     intermediate_size: int = 1024
+    first_k_dense_replace: int = 0
     moe_intermediate_size: int = 384
     n_routed_experts: int = 8
     num_experts_per_tok: int = 2
@@ -428,6 +431,18 @@ class DeepSeekConfig:
     hc_eps: float = 1.0e-5
     compress_ratio: int = 1
     seed: int = 1234
+
+    @property
+    def resolved_qk_nope_head_dim(self) -> int:
+        if self.qk_nope_head_dim is not None:
+            return self.qk_nope_head_dim
+        return self.head_dim - self.qk_rope_head_dim
+
+    @property
+    def resolved_v_head_dim(self) -> int:
+        if self.v_head_dim is not None:
+            return self.v_head_dim
+        return self.head_dim
 
     def for_benchmark(self, **overrides: int | float | str) -> "DeepSeekConfig":
         return replace(self, **overrides)
@@ -530,15 +545,11 @@ class FlattenedMLAAttention(nn.Module):
         dispatcher: KernelDispatcher | None = None,
     ):
         super().__init__()
-        if config.hidden_size != config.num_attention_heads * config.head_dim:
-            raise ValueError(
-                "This flattened baseline expects hidden_size == heads * head_dim."
-            )
-        if config.qk_rope_head_dim >= config.head_dim:
-            raise ValueError("qk_rope_head_dim must be smaller than head_dim.")
         self.config = config
         self.dispatcher = dispatcher
-        self.nope_dim = config.head_dim - config.qk_rope_head_dim
+        self.nope_dim = config.resolved_qk_nope_head_dim
+        self.v_head_dim = config.resolved_v_head_dim
+        self.qk_head_dim = self.nope_dim + config.qk_rope_head_dim
 
         qkv_out = config.q_lora_rank + config.kv_lora_rank + config.qk_rope_head_dim
         self.fused_qkv_a_proj = nn.Linear(config.hidden_size, qkv_out, bias=False)
@@ -546,15 +557,15 @@ class FlattenedMLAAttention(nn.Module):
         self.kv_a_layernorm_weight = nn.Parameter(torch.ones(config.kv_lora_rank))
         self.q_b_proj = nn.Linear(
             config.q_lora_rank,
-            config.num_attention_heads * config.head_dim,
+            config.num_attention_heads * self.qk_head_dim,
             bias=False,
         )
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
-            config.num_attention_heads * (self.nope_dim + config.head_dim),
+            config.num_attention_heads * (self.nope_dim + self.v_head_dim),
             bias=False,
         )
-        self.o_proj = nn.Linear(config.num_attention_heads * config.head_dim, config.hidden_size, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.v_head_dim, config.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         config = self.config
@@ -591,7 +602,7 @@ class FlattenedMLAAttention(nn.Module):
 
         tokens = hidden_states.shape[0]
         heads = config.num_attention_heads
-        q = self.q_b_proj(q_c).view(tokens, heads, config.head_dim)
+        q = self.q_b_proj(q_c).view(tokens, heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.nope_dim, config.qk_rope_head_dim], dim=-1)
         q_pe = apply_rope(
             q_pe,
@@ -601,11 +612,11 @@ class FlattenedMLAAttention(nn.Module):
         )
         q = torch.cat((q_nope, q_pe), dim=-1)
 
-        kv = self.kv_b_proj(kv_c).view(tokens, heads, self.nope_dim + config.head_dim)
-        k_nope, v = kv.split([self.nope_dim, config.head_dim], dim=-1)
+        kv = self.kv_b_proj(kv_c).view(tokens, heads, self.nope_dim + self.v_head_dim)
+        k_nope, v = kv.split([self.nope_dim, self.v_head_dim], dim=-1)
         k = torch.cat((k_nope, k_pe.unsqueeze(1).expand(-1, heads, -1)), dim=-1)
         attn_out = causal_attention(q, k, v)
-        return self.o_proj(attn_out.reshape(tokens, heads * config.head_dim))
+        return self.o_proj(attn_out.reshape(tokens, heads * self.v_head_dim))
 
 
 class FlattenedDeepSeekBlock(nn.Module):
