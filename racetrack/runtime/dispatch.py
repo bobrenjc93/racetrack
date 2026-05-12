@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import time
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Callable
+
+import torch
+
+
+Fallback = Callable[..., Any]
+
+
+class KernelDispatcher:
+    """Loads partition-local kernel modules and routes calls by env/backend.
+
+    The public switch is ``RACETRACK_KERNEL_BACKEND``. Supported values are
+    ``torch``, ``triton``, ``cutedsl``, ``cutedl`` (alias), ``helion``, and
+    ``best``. ``best`` times all callable candidates on first use and caches
+    the fastest backend for the operation signature.
+    """
+
+    BACKENDS = ("triton", "cutedsl", "helion")
+
+    def __init__(self, kernel_root: str | Path | None = None):
+        self.kernel_root = Path(kernel_root) if kernel_root is not None else None
+        self._modules: dict[tuple[str, str], ModuleType | None] = {}
+        self._best: dict[str, str] = {}
+
+    @staticmethod
+    def selected_backend(default: str = "torch") -> str:
+        raw = os.getenv("RACETRACK_KERNEL_BACKEND", default).strip().lower()
+        if raw == "cutedl":
+            return "cutedsl"
+        return raw
+
+    def backend_status(self, backend: str) -> str:
+        if backend == "torch":
+            return "native"
+        module = self._load_module(backend, "fused_rope")
+        if module is None:
+            return "missing"
+        return "native" if bool(getattr(module, "BACKEND_AVAILABLE", False)) else "emulated"
+
+    def call(
+        self,
+        op_name: str,
+        fallback: Fallback,
+        *args: Any,
+        backend: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        selected = backend or self.selected_backend(default="torch")
+        if selected == "all":
+            selected = "torch"
+        if selected == "torch":
+            return fallback(*args, **kwargs)
+        if selected == "best":
+            selected = self._select_best(op_name, fallback, *args, **kwargs)
+        fn = self._resolve(selected, op_name)
+        if fn is None:
+            self._handle_missing(selected, op_name)
+            return fallback(*args, **kwargs)
+        return fn(*args, fallback=fallback, **kwargs)
+
+    def _handle_missing(self, backend: str, op_name: str) -> None:
+        strict = os.getenv("RACETRACK_KERNEL_STRICT", "0") == "1"
+        if strict:
+            raise RuntimeError(f"No {backend} kernel found for {op_name}")
+
+    def _resolve(self, backend: str, op_name: str) -> Callable[..., Any] | None:
+        module = self._load_module(backend, "fused_rope")
+        if module is None:
+            return None
+        fn = getattr(module, op_name, None)
+        return fn if callable(fn) else None
+
+    def _load_module(self, backend: str, module_name: str) -> ModuleType | None:
+        if self.kernel_root is None:
+            return None
+        key = (backend, module_name)
+        if key in self._modules:
+            return self._modules[key]
+        path = self.kernel_root / backend / f"{module_name}.py"
+        if not path.exists():
+            self._modules[key] = None
+            return None
+        spec_name = f"racetrack_partition_kernel_{abs(hash(path))}_{backend}_{module_name}"
+        spec = importlib.util.spec_from_file_location(spec_name, path)
+        if spec is None or spec.loader is None:
+            self._modules[key] = None
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self._modules[key] = module
+        return module
+
+    def _select_best(
+        self,
+        op_name: str,
+        fallback: Fallback,
+        *args: Any,
+        **kwargs: Any,
+    ) -> str:
+        if op_name in self._best:
+            return self._best[op_name]
+
+        candidates = [
+            backend for backend in self.BACKENDS if self._resolve(backend, op_name)
+        ]
+        candidates.append("torch")
+        timings: list[tuple[float, str]] = []
+        for candidate in candidates:
+            fn = fallback if candidate == "torch" else self._resolve(candidate, op_name)
+            if fn is None:
+                continue
+            try:
+                elapsed = self._time_candidate(candidate, fn, fallback, *args, **kwargs)
+            except Exception:
+                if os.getenv("RACETRACK_KERNEL_STRICT", "0") == "1":
+                    raise
+                continue
+            timings.append((elapsed, candidate))
+        if not timings:
+            self._best[op_name] = "torch"
+        else:
+            self._best[op_name] = min(timings)[1]
+        return self._best[op_name]
+
+    @staticmethod
+    def _time_candidate(
+        backend: str,
+        fn: Callable[..., Any],
+        fallback: Fallback,
+        *args: Any,
+        **kwargs: Any,
+    ) -> float:
+        def run_once() -> Any:
+            if backend == "torch":
+                return fn(*args, **kwargs)
+            return fn(*args, fallback=fallback, **kwargs)
+
+        run_once()
+        tensor_arg = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
+        if tensor_arg is not None and tensor_arg.device.type == "cuda":
+            torch.cuda.synchronize(tensor_arg.device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(3):
+                run_once()
+            end.record()
+            torch.cuda.synchronize(tensor_arg.device)
+            return float(start.elapsed_time(end)) / 3.0
+
+        start_time = time.perf_counter()
+        for _ in range(3):
+            run_once()
+        return (time.perf_counter() - start_time) * 1000.0 / 3.0
