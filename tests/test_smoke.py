@@ -1,24 +1,20 @@
 from __future__ import annotations
 
-import importlib.util
-
 import torch
 import pytest
 
-from racetrack.bench import parse_args, run
+from racetrack.bench import CONCRETE_KERNEL_BACKENDS, parse_args, run
 
 
-def test_cpu_smoke_dsv3_2_all_backends() -> None:
-    if importlib.util.find_spec("cutlass") is None or importlib.util.find_spec("helion") is None:
-        pytest.skip("optional kernel backend packages are not installed")
+def test_cpu_smoke_dsv3_2_torch() -> None:
     args = parse_args(
         [
             "--model",
             "dsv3_2",
             "--partition",
-            "all",
+            "baseline",
             "--kernel-filter",
-            "all",
+            "torch",
             "--benchmark",
             "smoke",
             "--device",
@@ -35,6 +31,7 @@ def test_cpu_smoke_dsv3_2_all_backends() -> None:
     assert results
     assert all(result.ok for result in results)
     assert {result.model for result in results} == {"dsv3_2"}
+    assert {result.backend for result in results} == {"torch"}
 
 
 def test_missing_backend_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -52,12 +49,13 @@ def test_backend_env_alias(monkeypatch: pytest.MonkeyPatch) -> None:
 
     model = build_model().eval()
     input_ids = torch.arange(4, dtype=torch.long)
-    if model.backend_status["cutedsl"] == "missing":
-        with pytest.raises(RuntimeError, match="No available cutedsl kernel"):
-            model(input_ids)
-    else:
-        out = model(input_ids)
-        assert out.shape == (4, model.config.vocab_size)
+    assert model.backend_status["cutedsl"] == "missing"
+    with pytest.raises(RuntimeError, match="No available cutedsl kernel"):
+        model(input_ids)
+
+
+def test_all_uses_only_implemented_backends() -> None:
+    assert CONCRETE_KERNEL_BACKENDS == ("triton", "helion")
 
 
 def test_only_one_model_is_supported() -> None:

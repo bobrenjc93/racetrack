@@ -1,5 +1,11 @@
-from racetrack.runtime.package_kernels import fused_norm_rope, hc_head, package_available
+BACKEND_AVAILABLE = False
 
-BACKEND_AVAILABLE = package_available("cutlass") or package_available("cutedsl")
+
+def fused_norm_rope(*args, **kwargs):
+    raise RuntimeError("CUTEDSL fused_norm_rope is not implemented")
+
+
+def hc_head(*args, **kwargs):
+    raise RuntimeError("CUTEDSL hc_head is not implemented")
 
 __all__ = ["BACKEND_AVAILABLE", "fused_norm_rope", "hc_head"]

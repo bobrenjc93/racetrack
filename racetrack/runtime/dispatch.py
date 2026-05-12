@@ -18,11 +18,11 @@ class KernelDispatcher:
 
     The public switch is ``RACETRACK_KERNEL_BACKEND``. Supported values are
     ``torch``, ``triton``, ``cutedsl``, ``cutedl`` (alias), ``helion``, and
-    ``best``. ``best`` times all callable candidates on first use and caches
-    the fastest backend for the operation signature.
+    ``best``. ``best`` times all implemented callable candidates on first use
+    and caches the fastest backend for the operation signature.
     """
 
-    BACKENDS = ("triton", "cutedsl", "helion")
+    BACKENDS = ("triton", "helion")
 
     def __init__(self, kernel_root: str | Path | None = None):
         self.kernel_root = Path(kernel_root) if kernel_root is not None else None

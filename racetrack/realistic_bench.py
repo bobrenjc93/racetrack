@@ -15,7 +15,7 @@ from racetrack.runtime.dispatch import KernelDispatcher
 from racetrack.runtime import torch_ops
 
 
-CONCRETE_BACKENDS = ("triton", "cutedsl", "helion")
+CONCRETE_BACKENDS = ("triton", "helion")
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,7 @@ class DistBenchResult:
     max_ms: float
     tokens_per_second: float
     max_abs_diff: float | None
+    max_rel_diff: float | None
     peak_mem_gib: float
     ok: bool
 
@@ -469,6 +470,7 @@ def _run_backend(
     repeat: int,
     baseline_out: torch.Tensor | None,
     atol: float,
+    rtol: float,
 ) -> tuple[DistBenchResult, torch.Tensor]:
     os.environ["RACETRACK_KERNEL_BACKEND"] = backend
     generator = torch.Generator(device=device)
@@ -496,12 +498,17 @@ def _run_backend(
         device=device,
     )
     diff = None
+    rel_diff = None
     ok = True
     if baseline_out is not None:
         local_diff = (output.float() - baseline_out.float()).abs().max()
         dist.all_reduce(local_diff, op=dist.ReduceOp.MAX)
         diff = float(local_diff.item())
-        ok = diff <= atol
+        local_ref = baseline_out.float().abs().max()
+        dist.all_reduce(local_ref, op=dist.ReduceOp.MAX)
+        ref_scale = max(float(local_ref.item()), 1.0e-12)
+        rel_diff = diff / ref_scale
+        ok = diff <= atol + rtol * ref_scale
     mean_ms = sum(times) / len(times)
     peak = torch.cuda.max_memory_allocated(device) / 1024**3
     peak_tensor = torch.tensor([peak], device=device)
@@ -522,6 +529,7 @@ def _run_backend(
         max_ms=max(times),
         tokens_per_second=tokens * layers / (mean_ms / 1000.0),
         max_abs_diff=diff,
+        max_rel_diff=rel_diff,
         peak_mem_gib=float(peak_tensor.item()),
         ok=ok,
     )
@@ -545,6 +553,7 @@ def _best_result(candidates: list[DistBenchResult]) -> DistBenchResult:
         max_ms=best.max_ms,
         tokens_per_second=best.tokens_per_second,
         max_abs_diff=best.max_abs_diff,
+        max_rel_diff=best.max_rel_diff,
         peak_mem_gib=best.peak_mem_gib,
         ok=best.ok,
     )
@@ -563,6 +572,7 @@ def _print_results(results: list[DistBenchResult]) -> None:
         "mean_ms",
         "tok*layer/s",
         "diff",
+        "rel",
         "peak_gib",
         "ok",
     ]
@@ -579,6 +589,7 @@ def _print_results(results: list[DistBenchResult]) -> None:
                 f"{result.mean_ms:.3f}",
                 f"{result.tokens_per_second:.1f}",
                 "-" if result.max_abs_diff is None else f"{result.max_abs_diff:.3e}",
+                "-" if result.max_rel_diff is None else f"{result.max_rel_diff:.3e}",
                 f"{result.peak_mem_gib:.2f}",
                 "yes" if result.ok else "no",
             ]
@@ -605,6 +616,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--atol", type=float, default=0.5)
+    parser.add_argument("--rtol", type=float, default=1.0e-2)
     parser.add_argument("--json", type=Path, default=None)
     return parser.parse_args()
 
@@ -641,6 +653,7 @@ def _run_shape(
         repeat=1,
         baseline_out=None,
         atol=args.atol,
+        rtol=args.rtol,
     )
     results: list[DistBenchResult] = []
     if args.backend == "torch":
@@ -667,6 +680,7 @@ def _run_shape(
                     repeat=args.repeat,
                     baseline_out=baseline_out,
                     atol=args.atol,
+                    rtol=args.rtol,
                 )
                 results.append(result)
                 candidates.append(result)
@@ -683,6 +697,7 @@ def _run_shape(
                 repeat=args.repeat,
                 baseline_out=baseline_out,
                 atol=args.atol,
+                rtol=args.rtol,
             )
             candidates.append(mixed)
             results.append(_best_result(candidates))
@@ -700,6 +715,7 @@ def _run_shape(
                 repeat=args.repeat,
                 baseline_out=baseline_out if args.backend != "torch" else None,
                 atol=args.atol,
+                rtol=args.rtol,
             )
             results.append(result)
     return results

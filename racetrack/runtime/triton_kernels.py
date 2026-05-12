@@ -18,6 +18,25 @@ except Exception:
 if BACKEND_AVAILABLE:
 
     @triton.jit
+    def _rms_norm_kernel(
+        x,
+        weight,
+        out,
+        eps: tl.constexpr,
+        cols: tl.constexpr,
+        stride_t: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        token = tl.program_id(0)
+        offsets = tl.arange(0, block_size)
+        mask = offsets < cols
+        values = tl.load(x + token * stride_t + offsets, mask=mask, other=0.0).to(tl.float32)
+        weights = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
+        variance = tl.sum(values * values, axis=0) / cols
+        scale = tl.rsqrt(variance + eps)
+        tl.store(out + token * cols + offsets, values * scale * weights, mask=mask)
+
+    @triton.jit
     def _rope_kernel(x, cos, sin, out, rotary_dim: tl.constexpr, stride_t: tl.constexpr):
         token = tl.program_id(0)
         half: tl.constexpr = rotary_dim // 2
@@ -31,19 +50,52 @@ if BACKEND_AVAILABLE:
         tl.store(out + row + offsets + half, x2 * c + x1 * s)
 
 
+def _rms_norm_triton(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    if not BACKEND_AVAILABLE:
+        raise RuntimeError("Triton backend requested, but triton is not installed")
+    if x.device.type != "cuda":
+        raise RuntimeError("Triton RMSNorm kernel requires CUDA tensors")
+    if x.dim() != 2:
+        raise RuntimeError("Triton RMSNorm kernel expects a 2D tensor")
+    if weight.dim() != 1 or weight.shape[0] != x.shape[-1]:
+        raise RuntimeError("Triton RMSNorm weight shape must match the hidden dimension")
+    cols = x.shape[-1]
+    block_size = triton.next_power_of_2(cols)
+    out = torch.empty((x.shape[0], cols), device=x.device, dtype=x.dtype)
+    _rms_norm_kernel[(x.shape[0],)](
+        x,
+        weight.contiguous(),
+        out,
+        eps,
+        cols,
+        x.stride(0),
+        block_size,
+        num_warps=8 if block_size >= 2048 else 4,
+    )
+    return out
+
+
 def _apply_rope_triton(
     x: torch.Tensor,
     positions: torch.Tensor,
     *,
     rope_base: float,
 ) -> torch.Tensor:
-    if not BACKEND_AVAILABLE or x.device.type != "cuda" or not x.is_contiguous():
-        return torch_ops.apply_rope(x, positions, base=rope_base)
+    if not BACKEND_AVAILABLE:
+        raise RuntimeError("Triton backend requested, but triton is not installed")
+    if x.device.type != "cuda":
+        raise RuntimeError("Triton kernels require CUDA tensors")
+    if not x.is_contiguous():
+        raise RuntimeError("Triton RoPE kernel requires contiguous input")
     if x.dim() != 2:
-        return torch_ops.apply_rope(x, positions, base=rope_base)
+        raise RuntimeError("Triton RoPE kernel expects a 2D tensor")
     rotary_dim = x.shape[-1]
     if rotary_dim % 2 != 0:
-        return torch_ops.apply_rope(x, positions, base=rope_base)
+        raise RuntimeError("Triton RoPE kernel requires an even RoPE dimension")
     cos, sin = torch_ops.rope_cache(positions, rotary_dim, base=rope_base, dtype=x.dtype)
     out = torch.empty_like(x)
     _rope_kernel[(x.shape[0],)](
@@ -70,39 +122,11 @@ def fused_norm_rope(
     rope_base: float,
     fallback,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not BACKEND_AVAILABLE or q_c.device.type != "cuda":
-        return fallback(
-            q_c,
-            q_weight,
-            kv_c,
-            kv_weight,
-            k_pe,
-            positions,
-            eps=eps,
-            rope_base=rope_base,
-        )
+    del fallback
+    if q_c.device.type != "cuda":
+        raise RuntimeError("Triton fused_norm_rope requires CUDA tensors")
     return (
-        torch_ops.rms_norm(q_c, q_weight, eps),
-        torch_ops.rms_norm(kv_c, kv_weight, eps),
+        _rms_norm_triton(q_c, q_weight, eps),
+        _rms_norm_triton(kv_c, kv_weight, eps),
         _apply_rope_triton(k_pe.contiguous(), positions, rope_base=rope_base),
-    )
-
-
-def hc_head(
-    hidden_states: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    *,
-    rms_norm_eps: float,
-    hc_eps: float,
-    fallback,
-) -> torch.Tensor:
-    return fallback(
-        hidden_states,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        rms_norm_eps=rms_norm_eps,
-        hc_eps=hc_eps,
     )

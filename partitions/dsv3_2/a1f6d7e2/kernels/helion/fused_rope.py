@@ -1,5 +1,3 @@
-from racetrack.runtime.package_kernels import fused_norm_rope, hc_head, package_available
+from racetrack.runtime.helion_kernels import BACKEND_AVAILABLE, fused_norm_rope
 
-BACKEND_AVAILABLE = package_available("helion")
-
-__all__ = ["BACKEND_AVAILABLE", "fused_norm_rope", "hc_head"]
+__all__ = ["BACKEND_AVAILABLE", "fused_norm_rope"]
