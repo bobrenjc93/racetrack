@@ -176,8 +176,6 @@ def run(
 
                     status = "native"
                     kernel_map = None
-                    if dispatcher is not None and backend != "torch":
-                        kernel_map = _discover_kernel_map(dispatcher, backend)
 
                     results.append(Result(
                         model=model_name,
@@ -401,10 +399,10 @@ def _render_markdown(report: dict, slug: str) -> str:
         speedup_val = entry.get("speedup_vs_baseline")
         speedup_cell = f"{speedup_val:.3f}x" if speedup_val is not None else "-"
         kernels_note = ""
-        if entry.get("kernels"):
-            kernels_note = " " + ", ".join(
-                f"`{op}`={b}" for op, b in sorted(entry["kernels"].items())
-            )
+        if entry["backend"] == "best" and entry.get("kernels"):
+            kernels_note = " (" + ", ".join(
+                f"{op}={b}" for op, b in sorted(entry["kernels"].items())
+            ) + ")"
         lines.append(
             f"| {rank} | {entry['partition']} | "
             f"{entry['backend']}{kernels_note} | "
