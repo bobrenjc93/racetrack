@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 import pytest
 
@@ -7,6 +9,8 @@ from racetrack.bench import parse_args, run
 
 
 def test_cpu_smoke_all_models_all_backends() -> None:
+    if importlib.util.find_spec("cutlass") is None or importlib.util.find_spec("helion") is None:
+        pytest.skip("optional kernel backend packages are not installed")
     args = parse_args(
         [
             "--model",

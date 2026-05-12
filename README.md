@@ -54,8 +54,9 @@ Set `RACETRACK_KERNEL_BACKEND` or pass `--kernel-filter`:
 - `triton`: uses a native Triton RoPE kernel on CUDA, falling back to torch where needed
 - `cutedsl` or `cutedl`: CUTEDSL adapter; requires the CUTLASS DSL package
 - `helion`: Helion adapter; requires the Helion package
-- `best`: times available candidates on first use and caches the fastest
-- `all`: runner-only option that sweeps every backend
+- `best`: runtime micro-dispatch mode that times available candidates for an op
+- `all`: runner-only option that sweeps `triton`, `cutedsl`, and `helion`, then
+  adds an `all` row equal to the fastest measured backend for that case
 
 CUTEDSL and Helion are optional dependencies. Explicitly selecting a backend
 whose package is unavailable is an error. The runner reports unavailable
