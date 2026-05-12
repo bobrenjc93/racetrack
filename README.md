@@ -56,13 +56,16 @@ Set `RACETRACK_KERNEL_BACKEND` or pass `--kernel-filter`:
 - `helion`: Helion adapter; requires the Helion package
 - `best`: runtime mixed-kernel mode; each kernel callsite is timed across
   Triton, CUTEDSL, and Helion, then the winner is cached for that callsite
-- `all`: runner-only option that reports `triton`, `cutedsl`, `helion`, and
-  runtime mixed-kernel `best` rows
+- `all`: runner-only option that reports `triton`, `cutedsl`, `helion`, and a
+  final `best` row. The `best` row is the fastest end-to-end measured
+  candidate among the concrete backends and the runtime mixed-kernel plan.
 
-For `best`, the status column reports the selected kernel plan. `best:helion`
-means every tuned callsite selected Helion. If different callsites select
-different backends, the status includes the plan, for example
-`best:fused_norm_rope=helion;hc_head=cutedsl`.
+For `best`, the status column reports what won. `pure=helion` means the pure
+Helion run was the fastest end-to-end candidate. If the mixed-kernel plan wins,
+the status includes the selected callsite plan, for example
+`mixed=fused_norm_rope=helion;hc_head=cutedsl`. If the mixed planner selects
+the same backend for every callsite, the end-to-end report uses the pure backend
+row for clarity.
 
 CUTEDSL and Helion are optional dependencies. Explicitly selecting a backend
 whose package is unavailable is an error. The runner reports unavailable

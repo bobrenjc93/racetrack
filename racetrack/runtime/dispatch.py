@@ -76,12 +76,12 @@ class KernelDispatcher:
             {backend for backends in self._best_ops.values() for backend in backends}
         )
         if len(unique_backends) == 1:
-            return f"best:{unique_backends[0]}"
+            return f"mixed={unique_backends[0]}"
         parts = [
             f"{op_name}={'+'.join(sorted(backends))}"
             for op_name, backends in sorted(self._best_ops.items())
         ]
-        return "best:" + ";".join(parts)
+        return "mixed=" + ";".join(parts)
 
     def _handle_missing(self, backend: str, op_name: str) -> None:
         raise RuntimeError(f"No available {backend} kernel found for {op_name}")
