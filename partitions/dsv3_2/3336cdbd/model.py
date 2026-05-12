@@ -191,6 +191,7 @@ class KernelDispatcher:
     def __init__(self, kernel_root: str | Path | None = None):
         self.kernel_root = Path(kernel_root) if kernel_root is not None else None
         self._modules: dict[tuple[str, str], ModuleType | None] = {}
+        self._backend_modules_cache: dict[str, list[ModuleType]] = {}
         self._best: dict[tuple[Any, ...], str] = {}
         self._best_ops: dict[str, set[str]] = {}
         self._best_fast_path: dict[str, str] = {}
@@ -269,10 +270,13 @@ class KernelDispatcher:
         return None
 
     def _load_backend_modules(self, backend: str) -> list[ModuleType]:
+        if backend in self._backend_modules_cache:
+            return self._backend_modules_cache[backend]
         if self.kernel_root is None:
             return []
         backend_dir = self.kernel_root / backend
         if not backend_dir.is_dir():
+            self._backend_modules_cache[backend] = []
             return []
         modules: list[ModuleType] = []
         for path in sorted(backend_dir.glob("*.py")):
@@ -281,6 +285,7 @@ class KernelDispatcher:
             module = self._load_module(backend, path.stem)
             if module is not None:
                 modules.append(module)
+        self._backend_modules_cache[backend] = modules
         return modules
 
     def _load_module(self, backend: str, module_name: str) -> ModuleType | None:
@@ -317,8 +322,9 @@ class KernelDispatcher:
             return selected
 
         timings: list[tuple[float, str]] = []
+        _fb = fallback
         torch_elapsed = self._time_candidate(
-            "torch", lambda *a, **kw: fallback(*a, **{k: v for k, v in kw.items() if k != "fallback"}),
+            "torch", lambda *a, fallback=None, **kw: _fb(*a, **kw),
             fallback, *args, **kwargs,
         )
         timings.append((torch_elapsed, "torch"))
