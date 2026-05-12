@@ -263,6 +263,29 @@ def _build_combo_entry(
     }
 
 
+def _discover_dispatched_ops(results: list[Result], partition: str) -> list[str]:
+    for r in results:
+        if r.partition != partition or r.backend == "torch":
+            continue
+        module = _load_partition_module(r.model, partition)
+        model = module.build_model(**MODEL_OVERRIDES)
+        dispatcher = getattr(model, "dispatcher", None)
+        if dispatcher is None:
+            return []
+        ops: list[str] = []
+        for backend in ("triton", "helion", "cutedsl"):
+            for mod in dispatcher._load_backend_modules(backend):
+                if not bool(getattr(mod, "BACKEND_AVAILABLE", False)):
+                    continue
+                for name in sorted(dir(mod)):
+                    if not name.startswith("_") and name != "BACKEND_AVAILABLE" and callable(getattr(mod, name)):
+                        if name not in ops:
+                            ops.append(name)
+        del model
+        return ops
+    return []
+
+
 def _synthesize_best(results: list[Result]) -> list[Result]:
     """For each partition, pick the backend with the lowest aggregate time."""
     by_partition: dict[str, dict[str, list[Result]]] = {}
@@ -278,7 +301,8 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
             key=lambda kv: sum(r.mean_ms for r in kv[1]),
         )
         backend_name, runs = best_backend
-        kernel_map = next((r.kernels for r in runs if r.kernels), None)
+        dispatched_ops = _discover_dispatched_ops(results, partition)
+        kernel_map = {op: backend_name for op in dispatched_ops} if dispatched_ops else None
         for r in runs:
             best_results.append(Result(
                 model=r.model,
