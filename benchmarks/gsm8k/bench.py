@@ -29,7 +29,7 @@ import torch
 
 BENCHMARK_DIR = Path(__file__).parent
 MODELS = ("dsv3_2",)
-BACKENDS = ("torch", "triton", "helion", "best")
+BACKENDS = ("torch", "triton", "helion")
 
 CASES: list[tuple[str, int]] = [
     ("question", 96),
@@ -258,9 +258,45 @@ def _build_combo_entry(
     }
 
 
-def pick_winner(results: list[Result]) -> dict:
-    combos: dict[tuple, list[Result]] = {}
+def _synthesize_best(results: list[Result]) -> list[Result]:
+    """For each partition, pick the backend with the lowest aggregate time."""
+    by_partition: dict[str, dict[str, list[Result]]] = {}
     for r in results:
+        by_partition.setdefault(r.partition, {}).setdefault(r.backend, []).append(r)
+
+    best_results: list[Result] = []
+    for partition, backends in by_partition.items():
+        if partition == "baseline":
+            continue
+        best_backend = min(
+            backends.items(),
+            key=lambda kv: sum(r.mean_ms for r in kv[1]),
+        )
+        backend_name, runs = best_backend
+        for r in runs:
+            best_results.append(Result(
+                model=r.model,
+                partition=r.partition,
+                backend="best",
+                backend_status=f"={backend_name}",
+                case=r.case,
+                tokens=r.tokens,
+                device=r.device,
+                dtype=r.dtype,
+                mean_ms=r.mean_ms,
+                min_ms=r.min_ms,
+                max_ms=r.max_ms,
+                tokens_per_second=r.tokens_per_second,
+                kernels=r.kernels,
+            ))
+    return best_results
+
+
+def pick_winner(results: list[Result]) -> dict:
+    all_results = results + _synthesize_best(results)
+
+    combos: dict[tuple, list[Result]] = {}
+    for r in all_results:
         combos.setdefault(_combo_key(r), []).append(r)
 
     baseline_key = next(
