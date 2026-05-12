@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 import time
@@ -169,6 +170,7 @@ class KernelDispatcher:
         self._best: dict[tuple[Any, ...], str] = {}
         self._best_ops: dict[str, set[str]] = {}
         self._best_fast_path: dict[str, str] = {}
+        self._load_best_config()
 
     @staticmethod
     def selected_backend(default: str = "torch") -> str:
@@ -200,9 +202,12 @@ class KernelDispatcher:
             return fallback(*args, **kwargs)
         if selected == "best":
             selected = self._best_fast_path.get(op_name)
+            if selected is not None and self._resolve(selected, op_name) is None:
+                selected = None
             if selected is None:
                 selected = self._select_best(op_name, fallback, *args, **kwargs)
                 self._best_fast_path[op_name] = selected
+                self._save_best_config()
         fn = self._resolve(selected, op_name)
         if fn is None:
             self._handle_missing(selected, op_name)
@@ -344,6 +349,28 @@ class KernelDispatcher:
         for _ in range(iterations):
             run_once()
         return (time.perf_counter() - start_time) * 1000.0 / iterations
+
+    def _load_best_config(self) -> None:
+        if self.kernel_root is None:
+            return
+        path = self.kernel_root / "best.json"
+        if not path.exists():
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._best_fast_path.update(data)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    def _save_best_config(self) -> None:
+        if self.kernel_root is None:
+            return
+        path = self.kernel_root / "best.json"
+        with open(path, "w") as f:
+            json.dump(self._best_fast_path, f, indent=2, sort_keys=True)
+            f.write("\n")
 
 
 # ---------------------------------------------------------------------------
