@@ -37,6 +37,17 @@ CASES: list[tuple[str, int]] = [
     ("full", 384),
 ]
 
+MODEL_OVERRIDES: dict[str, int | float | str] = {
+    "hidden_size": 4096,
+    "num_attention_heads": 64,
+    "head_dim": 64,
+    "q_lora_rank": 1024,
+    "kv_lora_rank": 512,
+    "qk_rope_head_dim": 32,
+    "moe_intermediate_size": 2048,
+    "num_layers": 8,
+}
+
 
 @dataclass
 class Result:
@@ -136,7 +147,7 @@ def run(
             for backend in backends:
                 os.environ["RACETRACK_KERNEL_BACKEND"] = backend
                 module = _load_partition_module(model_name, partition)
-                model = module.build_model().to(device=device, dtype=dtype).eval()
+                model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
 
                 dispatcher = getattr(model, "dispatcher", None)
 
@@ -153,7 +164,11 @@ def run(
                     status = "native"
                     kernel_map = None
                     if dispatcher is not None:
-                        kernel_map = dict(dispatcher._best_fast_path) or None
+                        if dispatcher._best_ops:
+                            kernel_map = {
+                                op: next(iter(backends))
+                                for op, backends in dispatcher._best_ops.items()
+                            }
                         if hasattr(dispatcher, "best_summary"):
                             status = dispatcher.best_summary()
 
@@ -300,6 +315,77 @@ def _print_table(results: list[Result]) -> None:
         print("  ".join(str(v).ljust(widths[i]) for i, v in enumerate(row)))
 
 
+def _render_markdown(report: dict, slug: str) -> str:
+    hw = report["hardware"]
+    winner = report["winner"]
+    lines: list[str] = []
+
+    lines.append(f"# GSM8K Benchmark: {slug}")
+    lines.append("")
+    lines.append(f"**GPU**: {hw.get('gpu', 'N/A')} x{hw.get('gpu_count', 1)}  ")
+    lines.append(f"**CUDA**: {hw.get('cuda', 'N/A')}  ")
+    lines.append(f"**PyTorch**: {hw.get('torch', 'N/A')}  ")
+    lines.append(f"**dtype**: {report.get('dtype', 'N/A')}  ")
+    lines.append(f"**Date**: {report.get('timestamp', 'N/A')}")
+    lines.append("")
+
+    lines.append("## Winner")
+    lines.append("")
+    speedup = winner.get("speedup_vs_baseline")
+    speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
+    lines.append(f"**{winner['partition']}/{winner['backend']}**{speedup_str}  ")
+    lines.append(f"Aggregate: {winner['aggregate_mean_ms']:.1f}ms")
+    if winner.get("kernels"):
+        lines.append("")
+        lines.append("Kernel dispatch:")
+        for op, backend in sorted(winner["kernels"].items()):
+            lines.append(f"- `{op}` -> {backend}")
+    lines.append("")
+
+    lines.append("## Leaderboard")
+    lines.append("")
+    case_names = list(next(iter(report["leaderboard"]))["cases"].keys())
+    header = "| # | partition | backend | " + " | ".join(
+        f"{c} (ms)" for c in case_names
+    ) + " | total (ms) | vs baseline |"
+    sep = "|" + "|".join("---" for _ in range(len(case_names) + 5)) + "|"
+    lines.append(header)
+    lines.append(sep)
+    for rank, entry in enumerate(report["leaderboard"], 1):
+        cases = entry["cases"]
+        case_cols = " | ".join(f"{cases[c]['mean_ms']:.1f}" for c in case_names)
+        speedup_val = entry.get("speedup_vs_baseline")
+        speedup_cell = f"{speedup_val:.3f}x" if speedup_val is not None else "-"
+        kernels_note = ""
+        if entry.get("kernels"):
+            kernels_note = " " + ", ".join(
+                f"`{op}`={b}" for op, b in sorted(entry["kernels"].items())
+            )
+        lines.append(
+            f"| {rank} | {entry['partition']} | "
+            f"{entry['backend']}{kernels_note} | "
+            f"{case_cols} | {entry['aggregate_mean_ms']:.1f} | {speedup_cell} |"
+        )
+    lines.append("")
+
+    lines.append("## Cases")
+    lines.append("")
+    for case_name in case_names:
+        first_entry = report["leaderboard"][0]["cases"][case_name]
+        lines.append(f"- **{case_name}**: {first_entry['tokens']} tokens")
+    lines.append("")
+
+    baseline = report.get("baseline", {})
+    if baseline:
+        lines.append("## Baseline reference")
+        lines.append("")
+        for case_name, ms in baseline.items():
+            lines.append(f"- {case_name}: {ms:.1f}ms")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GSM8K-shaped benchmark")
     parser.add_argument(
@@ -320,10 +406,9 @@ def main() -> None:
     slug = _hardware_slug(args.device)
     results_dir = BENCHMARK_DIR / "results"
     results_dir.mkdir(exist_ok=True)
-    results_path = results_dir / f"{slug}.json"
-    with open(results_path, "w") as f:
-        json.dump(report, f, indent=2)
-        f.write("\n")
+    results_path = results_dir / f"{slug}.md"
+    md = _render_markdown(report, slug)
+    results_path.write_text(md)
     speedup = winner.get("speedup_vs_baseline")
     speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
     print(f"\nWinner: {winner['partition']}/{winner['backend']} "
