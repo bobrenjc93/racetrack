@@ -19,6 +19,7 @@ import argparse
 import importlib
 import json
 import os
+import platform
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -178,44 +179,92 @@ def run(
     return results
 
 
-def pick_winner(results: list[Result]) -> dict:
-    combos: dict[tuple, list[Result]] = {}
-    for r in results:
-        key = (r.model, r.partition, r.backend, r.backend_status)
-        combos.setdefault(key, []).append(r)
+def _combo_key(r: Result) -> tuple[str, str, str]:
+    return (r.model, r.partition, r.backend)
 
-    best_key = None
-    best_total = float("inf")
-    for key, runs in combos.items():
-        total = sum(r.mean_ms for r in runs)
-        if total < best_total:
-            best_total = total
-            best_key = key
 
-    assert best_key is not None
-    model, partition, backend, status = best_key
-    runs = combos[best_key]
+def _hardware_info(device: str) -> dict:
+    info: dict = {
+        "device": device,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "platform": platform.platform(),
+    }
+    if device.startswith("cuda") and torch.cuda.is_available():
+        idx = int(device.split(":")[-1]) if ":" in device else 0
+        props = torch.cuda.get_device_properties(idx)
+        info["gpu"] = props.name
+        info["gpu_memory_gb"] = round(props.total_memory / 1024**3, 1)
+        info["cuda"] = torch.version.cuda or "unknown"
+    return info
+
+
+def _build_combo_entry(
+    runs: list[Result],
+    baseline_ms: dict[str, float],
+) -> dict:
     kernel_map = next((r.kernels for r in runs if r.kernels), None)
-    result: dict = {
-        "model": model,
-        "partition": partition,
-        "backend": backend,
-        "backend_status": status,
+    aggregate = sum(r.mean_ms for r in runs)
+    baseline_aggregate = sum(baseline_ms.get(r.case, r.mean_ms) for r in runs)
+    return {
+        "partition": runs[0].partition,
+        "backend": runs[0].backend,
+        "backend_status": runs[0].backend_status,
         "kernels": kernel_map,
-        "device": runs[0].device,
-        "dtype": runs[0].dtype,
+        "aggregate_mean_ms": round(aggregate, 3),
+        "speedup_vs_baseline": round(baseline_aggregate / aggregate, 4) if aggregate > 0 else None,
         "cases": {
             r.case: {
                 "tokens": r.tokens,
                 "mean_ms": round(r.mean_ms, 3),
+                "min_ms": round(r.min_ms, 3),
+                "max_ms": round(r.max_ms, 3),
                 "tokens_per_second": round(r.tokens_per_second, 1),
+                "vs_baseline": round(
+                    baseline_ms.get(r.case, r.mean_ms) / r.mean_ms, 4
+                ) if r.mean_ms > 0 else None,
             }
             for r in runs
         },
-        "aggregate_mean_ms": round(best_total, 3),
+    }
+
+
+def pick_winner(results: list[Result]) -> dict:
+    combos: dict[tuple, list[Result]] = {}
+    for r in results:
+        combos.setdefault(_combo_key(r), []).append(r)
+
+    baseline_key = next(
+        (k for k in combos if k[1] == "baseline" and k[2] == "torch"), None
+    )
+    baseline_ms: dict[str, float] = {}
+    if baseline_key is not None:
+        for r in combos[baseline_key]:
+            baseline_ms[r.case] = r.mean_ms
+
+    ranked = sorted(
+        combos.items(),
+        key=lambda kv: sum(r.mean_ms for r in kv[1]),
+    )
+
+    winner_key, winner_runs = ranked[0]
+    winner_entry = _build_combo_entry(winner_runs, baseline_ms)
+
+    leaderboard = []
+    for key, runs in ranked:
+        leaderboard.append(_build_combo_entry(runs, baseline_ms))
+
+    return {
+        "winner": winner_entry,
+        "baseline": {
+            case: round(ms, 3) for case, ms in baseline_ms.items()
+        },
+        "leaderboard": leaderboard,
+        "model": winner_runs[0].model,
+        "dtype": winner_runs[0].dtype,
+        "hardware": _hardware_info(winner_runs[0].device),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    return result
 
 
 def _print_table(results: list[Result]) -> None:
@@ -252,13 +301,16 @@ def main() -> None:
     results = run(args.device, args.dtype, args.warmup, args.repeat)
     _print_table(results)
 
-    winner = pick_winner(results)
+    report = pick_winner(results)
+    winner = report["winner"]
     winner_path = BENCHMARK_DIR / "winner.json"
     with open(winner_path, "w") as f:
-        json.dump(winner, f, indent=2)
+        json.dump(report, f, indent=2)
         f.write("\n")
+    speedup = winner.get("speedup_vs_baseline")
+    speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
     print(f"\nWinner: {winner['partition']}/{winner['backend']} "
-          f"({winner['aggregate_mean_ms']:.1f}ms aggregate)")
+          f"({winner['aggregate_mean_ms']:.1f}ms aggregate){speedup_str}")
     print(f"Saved to {winner_path}")
 
 
