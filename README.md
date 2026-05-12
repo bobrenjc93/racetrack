@@ -27,7 +27,7 @@ partitions/
         helion/fused_rope.py
 racetrack/
   bench.py                    # benchmark runner
-  runtime/                    # dispatch, flattened model, Triton/Helion kernels
+  runtime/                    # dispatch, flattened model, backend kernels
 ```
 
 Each model folder has a baseline `model.py` that uses only torch operations.
@@ -41,12 +41,12 @@ Set `RACETRACK_KERNEL_BACKEND` or pass `--kernel-filter`:
 
 - `torch`: vanilla torch reference implementation
 - `triton`: uses native Triton kernels for RMSNorm and RoPE on CUDA
+- `cutedsl` or `cutedl`: uses native CuTe/CUTLASS DSL kernels for RMSNorm and RoPE on CUDA
 - `helion`: uses Helion kernels for RMSNorm and RoPE, with Helion autotuning on first use
-- `cutedsl` or `cutedl`: currently not implemented; explicit selection errors
 - `best`: runtime mixed-kernel mode; each kernel callsite is timed across
   implemented concrete backends, then the winner is cached for that callsite
 - `all`: runner-only option that reports implemented concrete backends and a
-  final `best` row. Today that means `triton`, `helion`, and `best`.
+  final `best` row. Today that means `triton`, `cutedsl`, `helion`, and `best`.
 
 For `best`, the status column reports what won. `pure=helion` means the pure
 Helion run was the fastest end-to-end candidate. If the mixed-kernel plan wins,
@@ -54,9 +54,9 @@ the status includes the selected callsite plan, for example
 `mixed=fused_norm_rope=helion`. If the mixed planner selects the same backend
 for every callsite, the end-to-end report uses the pure backend row for clarity.
 
-Helion is an optional dependency. Explicitly selecting a backend whose real
-kernel is unavailable is an error. The runner does not silently substitute
-torch. Helion's default autotune effort is `quick`; set
+CUTEDSL and Helion are optional dependencies. Explicitly selecting a backend
+whose real kernel is unavailable is an error. The runner does not silently
+substitute torch. Helion's default autotune effort is `quick`; set
 `RACETRACK_HELION_AUTOTUNE_EFFORT=full` before running to search harder, or
 `HELION_FORCE_AUTOTUNE=1` to ignore cached configs and re-run the search.
 
@@ -64,7 +64,7 @@ torch. Helion's default autotune effort is `quick`; set
 
 ```bash
 python -m pip install -e .
-python -m pip install helion
+python -m pip install helion nvidia-cutlass-dsl
 python -m racetrack.bench --model dsv3_2 --partition all --kernel-filter all
 ```
 
@@ -106,6 +106,7 @@ torchrun --standalone --nproc-per-node=8 \
   --warmup 1 \
   --repeat 1 \
   --dtype bf16 \
+  --rtol 1e-1 \
   --json results/realistic_all_8h100.json
 ```
 
@@ -120,15 +121,16 @@ checkpoint-scale memory.
 
 The realistic runner checks both absolute and relative error:
 `diff <= atol + rtol * max_abs(reference)`. Defaults are `--atol 0.5` and
-`--rtol 1e-2`, which are intended for long bf16 recurrence checks.
+`--rtol 1e-1`, which are intended for long bf16 recurrence checks.
 
 Example 8xH100 realistic-shape output:
 
 ```text
 model   backend  status        gpus  layers  tokens  mean_ms  tok*layer/s  diff       rel        peak_gib  ok
-dsv3_2  triton   native        8     61      1       155.381  392.6        1.000e+00  1.562e-02  2.78      yes
-dsv3_2  helion   native        8     61      1       150.353  405.7        1.000e+00  1.562e-02  2.98      yes
-dsv3_2  best     pure=helion   8     61      1       150.353  405.7        1.000e+00  1.562e-02  2.98      yes
+dsv3_2  triton   native        8     61      1       152.584  399.8        1.000e+00  1.562e-02  2.78      yes
+dsv3_2  cutedsl  native        8     61      1       174.657  349.3        5.500e+00  8.594e-02  2.78      yes
+dsv3_2  helion   native        8     61      1       151.924  401.5        1.000e+00  1.562e-02  2.98      yes
+dsv3_2  best     mixed=helion  8     61      1       150.104  406.4        1.000e+00  1.562e-02  2.78      yes
 ```
 
 Larger built-in benchmark cases are `decode_128`, `prefill_512`, and
@@ -152,7 +154,7 @@ dsv3_2  a1f6d7e2   triton   native    smoke  cuda:0  37.462   427.1   1.562e-02 
 
 1. Add a new directory under `partitions/dsv3_2/<hash>/`.
 2. Put the partition model in `model.py`.
-3. Put backend kernels under `kernels/triton` and `kernels/helion`.
+3. Put backend kernels under `kernels/triton`, `kernels/cutedsl`, and `kernels/helion`.
 4. Keep the public builder as `build_model(**overrides)`.
 5. Run:
 

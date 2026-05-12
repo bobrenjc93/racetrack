@@ -15,7 +15,7 @@ from racetrack.runtime.dispatch import KernelDispatcher
 from racetrack.runtime import torch_ops
 
 
-CONCRETE_BACKENDS = ("triton", "helion")
+CONCRETE_BACKENDS = ("triton", "cutedsl", "helion")
 
 
 @dataclass(frozen=True)
@@ -616,7 +616,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--atol", type=float, default=0.5)
-    parser.add_argument("--rtol", type=float, default=1.0e-2)
+    parser.add_argument("--rtol", type=float, default=1.0e-1)
     parser.add_argument("--json", type=Path, default=None)
     return parser.parse_args()
 

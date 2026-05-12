@@ -23,7 +23,7 @@ class KernelDispatcher:
     and caches the fastest backend for the operation signature.
     """
 
-    BACKENDS = ("triton", "helion")
+    BACKENDS = ("triton", "cutedsl", "helion")
 
     def __init__(self, kernel_root: str | Path | None = None):
         self.kernel_root = Path(kernel_root) if kernel_root is not None else None

@@ -49,13 +49,18 @@ def test_backend_env_alias(monkeypatch: pytest.MonkeyPatch) -> None:
 
     model = build_model().eval()
     input_ids = torch.arange(4, dtype=torch.long)
-    assert model.backend_status["cutedsl"] == "missing"
-    with pytest.raises(RuntimeError, match="No available cutedsl kernel"):
+    assert model.backend_status["cutedsl"] in {"native", "missing"}
+    expected = (
+        "CUTEDSL kernels require CUDA tensors"
+        if model.backend_status["cutedsl"] == "native"
+        else "No available cutedsl kernel"
+    )
+    with pytest.raises(RuntimeError, match=expected):
         model(input_ids)
 
 
 def test_all_uses_only_implemented_backends() -> None:
-    assert CONCRETE_KERNEL_BACKENDS == ("triton", "helion")
+    assert CONCRETE_KERNEL_BACKENDS == ("triton", "cutedsl", "helion")
 
 
 def test_only_one_model_is_supported() -> None:

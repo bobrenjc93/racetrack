@@ -14,7 +14,7 @@ import torch
 from benchmarks import get_cases
 
 
-CONCRETE_KERNEL_BACKENDS = ("triton", "helion")
+CONCRETE_KERNEL_BACKENDS = ("triton", "cutedsl", "helion")
 BACKENDS = ("torch", "triton", "cutedsl", "helion", "best", "all")
 MODELS = ("dsv3_2",)
 
@@ -392,7 +392,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--kernel-filter",
         default="all",
-        help="torch, triton, helion, best, all, or explicit cutedsl (errors until implemented)",
+        help="torch, triton, cutedsl/cutedl, helion, best, or all",
     )
     parser.add_argument("--benchmark", default="smoke", help="smoke, decode_128, prefill_512, prefill_2048, or all")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")

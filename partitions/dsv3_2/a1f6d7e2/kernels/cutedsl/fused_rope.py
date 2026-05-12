@@ -1,11 +1,4 @@
-BACKEND_AVAILABLE = False
+from racetrack.runtime.cutedsl_kernels import BACKEND_AVAILABLE, fused_norm_rope
 
 
-def fused_norm_rope(*args, **kwargs):
-    raise RuntimeError("CUTEDSL fused_norm_rope is not implemented")
-
-
-def hc_head(*args, **kwargs):
-    raise RuntimeError("CUTEDSL hc_head is not implemented")
-
-__all__ = ["BACKEND_AVAILABLE", "fused_norm_rope", "hc_head"]
+__all__ = ["BACKEND_AVAILABLE", "fused_norm_rope"]
