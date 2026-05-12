@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 triton = ["triton"]
+backends = ["helion", "nvidia-cutlass-dsl"]
 dev = ["pytest"]
 
 [project.scripts]

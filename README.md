@@ -52,19 +52,20 @@ Set `RACETRACK_KERNEL_BACKEND` or pass `--kernel-filter`:
 
 - `torch`: vanilla torch fallback
 - `triton`: uses a native Triton RoPE kernel on CUDA, falling back to torch where needed
-- `cutedsl` or `cutedl`: CUTEDSL adapter
-- `helion`: Helion adapter
+- `cutedsl` or `cutedl`: CUTEDSL adapter; requires the CUTLASS DSL package
+- `helion`: Helion adapter; requires the Helion package
 - `best`: times available candidates on first use and caches the fastest
 - `all`: runner-only option that sweeps every backend
 
-CUTEDSL and Helion are optional. On machines without those packages, their
-adapters still run end to end through torch and are reported as `emulated`.
-Use `RACETRACK_KERNEL_STRICT=1` to fail instead of falling back.
+CUTEDSL and Helion are optional dependencies. Explicitly selecting a backend
+whose package is unavailable is an error. The runner reports unavailable
+backends as `missing`; it does not silently substitute torch.
 
 ## Quick Start
 
 ```bash
 python -m pip install -e .
+python -m pip install helion nvidia-cutlass-dsl
 python -m racetrack.bench --model dsv3_2 --partition all --kernel-filter all
 ```
 

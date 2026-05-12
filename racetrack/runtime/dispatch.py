@@ -42,7 +42,7 @@ class KernelDispatcher:
         module = self._load_module(backend, "fused_rope")
         if module is None:
             return "missing"
-        return "native" if bool(getattr(module, "BACKEND_AVAILABLE", False)) else "emulated"
+        return "native" if bool(getattr(module, "BACKEND_AVAILABLE", False)) else "missing"
 
     def call(
         self,
@@ -59,20 +59,21 @@ class KernelDispatcher:
             return fallback(*args, **kwargs)
         if selected == "best":
             selected = self._select_best(op_name, fallback, *args, **kwargs)
+            if selected == "torch":
+                return fallback(*args, **kwargs)
         fn = self._resolve(selected, op_name)
         if fn is None:
             self._handle_missing(selected, op_name)
-            return fallback(*args, **kwargs)
         return fn(*args, fallback=fallback, **kwargs)
 
     def _handle_missing(self, backend: str, op_name: str) -> None:
-        strict = os.getenv("RACETRACK_KERNEL_STRICT", "0") == "1"
-        if strict:
-            raise RuntimeError(f"No {backend} kernel found for {op_name}")
+        raise RuntimeError(f"No available {backend} kernel found for {op_name}")
 
     def _resolve(self, backend: str, op_name: str) -> Callable[..., Any] | None:
         module = self._load_module(backend, "fused_rope")
         if module is None:
+            return None
+        if not bool(getattr(module, "BACKEND_AVAILABLE", False)):
             return None
         fn = getattr(module, op_name, None)
         return fn if callable(fn) else None
