@@ -20,7 +20,7 @@ import importlib
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,6 +51,7 @@ class Result:
     min_ms: float
     max_ms: float
     tokens_per_second: float
+    kernels: dict[str, str] | None = None
 
 
 def _load_partition_module(model_name: str, partition: str):
@@ -136,6 +137,8 @@ def run(
                 module = _load_partition_module(model_name, partition)
                 model = module.build_model().to(device=device, dtype=dtype).eval()
 
+                dispatcher = getattr(model, "dispatcher", None)
+
                 for case_name, tokens in CASES:
                     input_ids = torch.arange(tokens, device=device, dtype=torch.long) % 4096
                     positions = torch.arange(tokens, device=device, dtype=torch.long)
@@ -147,9 +150,10 @@ def run(
                     mean_ms = sum(times) / len(times)
 
                     status = "native"
-                    if backend == "best":
-                        dispatcher = getattr(model, "dispatcher", None)
-                        if dispatcher and hasattr(dispatcher, "best_summary"):
+                    kernel_map = None
+                    if dispatcher is not None:
+                        kernel_map = dict(dispatcher._best_fast_path) or None
+                        if hasattr(dispatcher, "best_summary"):
                             status = dispatcher.best_summary()
 
                     results.append(Result(
@@ -165,6 +169,7 @@ def run(
                         min_ms=min(times),
                         max_ms=max(times),
                         tokens_per_second=tokens / (mean_ms / 1000.0),
+                        kernels=kernel_map,
                     ))
 
                 del model
@@ -190,11 +195,13 @@ def pick_winner(results: list[Result]) -> dict:
     assert best_key is not None
     model, partition, backend, status = best_key
     runs = combos[best_key]
-    return {
+    kernel_map = next((r.kernels for r in runs if r.kernels), None)
+    result: dict = {
         "model": model,
         "partition": partition,
         "backend": backend,
         "backend_status": status,
+        "kernels": kernel_map,
         "device": runs[0].device,
         "dtype": runs[0].dtype,
         "cases": {
@@ -208,6 +215,7 @@ def pick_winner(results: list[Result]) -> dict:
         "aggregate_mean_ms": round(best_total, 3),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    return result
 
 
 def _print_table(results: list[Result]) -> None:
