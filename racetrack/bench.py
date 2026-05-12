@@ -239,6 +239,11 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                             repeat=repeat,
                             device=device,
                         )
+                        if backend == "best":
+                            dispatcher = getattr(model, "dispatcher", None)
+                            best_summary = getattr(dispatcher, "best_summary", None)
+                            if callable(best_summary):
+                                backend_status = best_summary()
                         diff = None
                         ok = True
                         if args.check:
@@ -273,7 +278,7 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                             BenchResult(
                                 model=best.model,
                                 partition=best.partition,
-                                backend="all",
+                                backend="best",
                                 backend_status=f"best:{best.backend}",
                                 case=best.case,
                                 device=best.device,
