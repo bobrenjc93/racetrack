@@ -228,13 +228,15 @@ class KernelDispatcher:
             return fallback(*args, **kwargs)
         if selected == "best":
             selected = self._best_fast_path.get(op_name)
-            if selected is not None and self._resolve(selected, op_name) is None:
+            if selected is not None and selected != "torch" and self._resolve(selected, op_name) is None:
                 selected = None
             if selected is None:
                 selected = self._select_best(op_name, fallback, *args, **kwargs)
                 self._best_fast_path[op_name] = selected
                 self._save_best_config()
             self._best_ops.setdefault(op_name, set()).add(selected)
+        if selected == "torch":
+            return fallback(*args, **kwargs)
         fn = self._resolve(selected, op_name)
         if fn is None:
             self._handle_missing(selected, op_name)
@@ -314,11 +316,13 @@ class KernelDispatcher:
             self._best_ops.setdefault(op_name, set()).add(selected)
             return selected
 
-        candidates = [
-            backend for backend in self.BACKENDS if self._resolve(backend, op_name)
-        ]
         timings: list[tuple[float, str]] = []
-        for candidate in candidates:
+        torch_elapsed = self._time_candidate(
+            "torch", lambda *a, **kw: fallback(*a, **{k: v for k, v in kw.items() if k != "fallback"}),
+            fallback, *args, **kwargs,
+        )
+        timings.append((torch_elapsed, "torch"))
+        for candidate in self.BACKENDS:
             fn = self._resolve(candidate, op_name)
             if fn is None:
                 continue
@@ -329,8 +333,6 @@ class KernelDispatcher:
                     raise
                 continue
             timings.append((elapsed, candidate))
-        if not timings:
-            raise RuntimeError(f"No available kernels found for best {op_name}")
         selected = min(timings)[1]
         self._best[key] = selected
         self._best_ops.setdefault(op_name, set()).add(selected)
