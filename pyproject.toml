@@ -19,6 +19,7 @@ dev = ["pytest"]
 
 [project.scripts]
 racetrack-bench = "racetrack.bench:main"
+racetrack-realistic-bench = "racetrack.realistic_bench:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

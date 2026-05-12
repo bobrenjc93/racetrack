@@ -103,6 +103,48 @@ python -m racetrack.bench \
   --dtype bfloat16
 ```
 
+Run the realistic-shape distributed suite across all 8 H100s:
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+  -m racetrack.realistic_bench \
+  --model all \
+  --backend all \
+  --tokens 1 \
+  --layers realistic \
+  --warmup 1 \
+  --repeat 1 \
+  --dtype bf16 \
+  --json results/realistic_all_8h100.json
+```
+
+`racetrack.realistic_bench` uses DeepSeek-scale tensor dimensions:
+hidden size 7168, 61 layers, 128 attention heads, 256 routed experts, top-k 8,
+and model-specific MLA/V4 hyper-compression dimensions. It is still a synthetic
+shape benchmark: it does not load Hugging Face checkpoints or allocate a full
+61-layer checkpoint. Each rank owns its sharded heads and its 32-expert MoE
+shard, then reuses one synthetic layer across the requested layer count so the
+benchmark can exercise realistic matrix sizes, routing, kernel dispatch, and
+NCCL all-reduces without checkpoint-scale memory.
+
+Example 8xH100 realistic-shape output:
+
+```text
+model   backend  status        gpus  layers  tokens  mean_ms  tok*layer/s  diff       peak_gib  ok
+dsv3_2  triton   native        8     61      1       154.847  393.9        0.000e+00  2.78      yes
+dsv3_2  cutedsl  native        8     61      1       153.249  398.0        0.000e+00  2.78      yes
+dsv3_2  helion   native        8     61      1       154.785  394.1        0.000e+00  2.78      yes
+dsv3_2  best     pure=cutedsl  8     61      1       153.249  398.0        0.000e+00  2.78      yes
+dsv4    triton   native        8     61      1       190.043  321.0        0.000e+00  2.77      yes
+dsv4    cutedsl  native        8     61      1       189.871  321.3        0.000e+00  2.77      yes
+dsv4    helion   native        8     61      1       189.440  322.0        0.000e+00  2.77      yes
+dsv4    best     pure=helion   8     61      1       189.440  322.0        0.000e+00  2.77      yes
+ds      triton   native        8     61      1       165.935  367.6        0.000e+00  2.78      yes
+ds      cutedsl  native        8     61      1       166.282  366.8        0.000e+00  2.78      yes
+ds      helion   native        8     61      1       166.467  366.4        0.000e+00  2.78      yes
+ds      best     mixed=triton  8     61      1       165.764  368.0        0.000e+00  2.78      yes
+```
+
 Larger built-in benchmark cases are `decode_128`, `prefill_512`, and
 `prefill_2048`.
 
