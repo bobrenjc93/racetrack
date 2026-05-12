@@ -129,7 +129,7 @@ def _backend_list(kernel_filter: str, partition: str) -> list[str]:
     if partition == "baseline":
         return ["torch"]
     if kernel_filter == "all":
-        return list(CONCRETE_KERNEL_BACKENDS)
+        return [*CONCRETE_KERNEL_BACKENDS, "best"]
     if kernel_filter == "cutedl":
         return ["cutedsl"]
     if kernel_filter not in BACKENDS:
@@ -224,7 +224,6 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 _sync(device)
 
                 for partition in _discover_partitions(model_name, args.partition):
-                    partition_case_results: list[BenchResult] = []
                     for backend in _backend_list(args.kernel_filter, partition):
                         os.environ["RACETRACK_KERNEL_BACKEND"] = backend
                         module = _load_model(model_name, partition)
@@ -267,31 +266,8 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                             ok=ok,
                         )
                         results.append(result)
-                        partition_case_results.append(result)
                         del model, output
                         _sync(device)
-                    if args.kernel_filter == "all" and partition != "baseline":
-                        ok_results = [result for result in partition_case_results if result.ok]
-                        candidates = ok_results or partition_case_results
-                        best = min(candidates, key=lambda result: result.mean_ms)
-                        results.append(
-                            BenchResult(
-                                model=best.model,
-                                partition=best.partition,
-                                backend="best",
-                                backend_status=f"best:{best.backend}",
-                                case=best.case,
-                                device=best.device,
-                                tokens=best.tokens,
-                                dtype=best.dtype,
-                                mean_ms=best.mean_ms,
-                                min_ms=best.min_ms,
-                                max_ms=best.max_ms,
-                                tokens_per_second=best.tokens_per_second,
-                                max_abs_diff=best.max_abs_diff,
-                                ok=best.ok,
-                            )
-                        )
     return results
 
 
