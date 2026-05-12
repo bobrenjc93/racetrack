@@ -61,7 +61,7 @@ class DistBenchResult:
 
 def realistic_shape(model: str) -> RealisticShape:
     key = model.lower().replace("-", "_")
-    if key in {"dsv3_2", "ds3_2", "deepseek_v3_2"}:
+    if key == "dsv3_2":
         return RealisticShape(
             name="dsv3_2",
             source="DeepSeek V3.2 NVFP4-like MLA/MoE dimensions from vLLM PR 38595",
@@ -78,43 +78,6 @@ def realistic_shape(model: str) -> RealisticShape:
             n_routed_experts=256,
             num_experts_per_tok=8,
             seed=38595,
-        )
-    if key in {"dsv4", "deepseek_v4"}:
-        return RealisticShape(
-            name="dsv4",
-            source="DeepSeek V4-like hypercompressed MLA/MegaMoE dimensions from vLLM PR 40860",
-            vocab_size=129280,
-            hidden_size=7168,
-            num_layers=61,
-            num_attention_heads=128,
-            q_lora_rank=1536,
-            kv_lora_rank=128,
-            qk_nope_head_dim=64,
-            qk_rope_head_dim=64,
-            v_head_dim=128,
-            moe_intermediate_size=2048,
-            n_routed_experts=256,
-            num_experts_per_tok=8,
-            hc_mult=2,
-            seed=40860,
-        )
-    if key in {"ds", "deepseek"}:
-        return RealisticShape(
-            name="ds",
-            source="Generic DeepSeek MLA/MoE dimensions",
-            vocab_size=129280,
-            hidden_size=7168,
-            num_layers=61,
-            num_attention_heads=128,
-            q_lora_rank=1536,
-            kv_lora_rank=512,
-            qk_nope_head_dim=128,
-            qk_rope_head_dim=64,
-            v_head_dim=128,
-            moe_intermediate_size=2048,
-            n_routed_experts=256,
-            num_experts_per_tok=8,
-            seed=40861,
         )
     raise KeyError(f"Unknown realistic model {model!r}")
 
@@ -634,7 +597,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a realistic-shape sharded synthetic DeepSeek benchmark with torchrun."
     )
-    parser.add_argument("--model", default="dsv3_2", choices=("dsv3_2", "dsv4", "ds", "all"))
+    parser.add_argument("--model", default="dsv3_2", choices=("dsv3_2",))
     parser.add_argument("--backend", default="all", choices=("torch", "triton", "cutedsl", "helion", "best", "all"))
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--layers", default="realistic", help="'realistic' or an integer layer count")
@@ -757,19 +720,17 @@ def main() -> None:
         device = torch.device(f"cuda:{local_rank}")
         args = parse_args()
         dtype = _dtype(args.dtype)
-        model_names = ("dsv3_2", "dsv4", "ds") if args.model == "all" else (args.model,)
         results: list[DistBenchResult] = []
-        for model_name in model_names:
-            results.extend(
-                _run_shape(
-                    args,
-                    model_name=model_name,
-                    dtype=dtype,
-                    device=device,
-                    rank=rank,
-                    world_size=world_size,
-                )
+        results.extend(
+            _run_shape(
+                args,
+                model_name=args.model,
+                dtype=dtype,
+                device=device,
+                rank=rank,
+                world_size=world_size,
             )
+        )
         _print_results(results)
         if rank == 0 and args.json is not None:
             args.json.parent.mkdir(parents=True, exist_ok=True)

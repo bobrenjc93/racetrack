@@ -5,12 +5,11 @@ partitions against swappable kernel backends. It is inspired by the vLLM
 specialized model work in:
 
 - DeepSeek V3.2 NVFP4 specialized path: https://github.com/vllm-project/vllm/pull/38595
-- DeepSeek V4 model path: https://github.com/vllm-project/vllm/pull/40860
 
 The repo intentionally uses flattened, synthetic torch models instead of real
 checkpoint loaders. The goal is to benchmark partition shapes and kernel
-boundaries quickly: MLA projection/norm/RoPE, sparse-indexer-like staging,
-hyper-compressed residual mixing, and routed MoE.
+boundaries quickly: MLA projection/norm/RoPE, sparse-indexer-like staging, and
+routed MoE.
 
 ## Layout
 
@@ -26,16 +25,6 @@ partitions/
         triton/fused_rope.py
         cutedsl/fused_rope.py
         helion/fused_rope.py
-  dsv4/
-    model.py
-    b49c2a81/
-      model.py
-      kernels/{triton,cutedsl,helion}/fused_rope.py
-  ds/
-    model.py
-    c7d9e510/
-      model.py
-      kernels/{triton,cutedsl,helion}/fused_rope.py
 racetrack/
   bench.py                    # benchmark runner
   runtime/                    # dispatch, flattened model, torch/triton kernels
@@ -44,7 +33,7 @@ racetrack/
 Each model folder has a baseline `model.py` that uses only torch operations.
 Each partition folder is named like a content hash and has its own `model.py`
 plus partition-local kernel entrypoints. The current partitions wrap fused
-RMSNorm/RoPE and V4 `hc_head` calls through the kernel dispatcher.
+RMSNorm/RoPE calls through the kernel dispatcher.
 
 ## Kernel Selection
 
@@ -79,11 +68,11 @@ python -m pip install helion nvidia-cutlass-dsl
 python -m racetrack.bench --model dsv3_2 --partition all --kernel-filter all
 ```
 
-Run every initial model and backend on one GPU:
+Run every backend on one GPU:
 
 ```bash
 python -m racetrack.bench \
-  --model all \
+  --model dsv3_2 \
   --partition all \
   --kernel-filter all \
   --benchmark smoke \
@@ -95,7 +84,7 @@ Run the smoke sweep across an 8xH100 node:
 
 ```bash
 python -m racetrack.bench \
-  --model all \
+  --model dsv3_2 \
   --partition all \
   --kernel-filter all \
   --benchmark smoke \
@@ -108,7 +97,7 @@ Run the realistic-shape distributed suite across all 8 H100s:
 ```bash
 torchrun --standalone --nproc-per-node=8 \
   -m racetrack.realistic_bench \
-  --model all \
+  --model dsv3_2 \
   --backend all \
   --tokens 1 \
   --layers realistic \
@@ -120,29 +109,21 @@ torchrun --standalone --nproc-per-node=8 \
 
 `racetrack.realistic_bench` uses DeepSeek-scale tensor dimensions:
 hidden size 7168, 61 layers, 128 attention heads, 256 routed experts, top-k 8,
-and model-specific MLA/V4 hyper-compression dimensions. It is still a synthetic
-shape benchmark: it does not load Hugging Face checkpoints or allocate a full
-61-layer checkpoint. Each rank owns its sharded heads and its 32-expert MoE
-shard, then reuses one synthetic layer across the requested layer count so the
-benchmark can exercise realistic matrix sizes, routing, kernel dispatch, and
-NCCL all-reduces without checkpoint-scale memory.
+and the V3.2 MLA dimensions. It is still a synthetic shape benchmark: it does
+not load Hugging Face checkpoints or allocate a full 61-layer checkpoint. Each
+rank owns its sharded heads and its 32-expert MoE shard, then reuses one
+synthetic layer across the requested layer count so the benchmark can exercise
+realistic matrix sizes, routing, kernel dispatch, and NCCL all-reduces without
+checkpoint-scale memory.
 
 Example 8xH100 realistic-shape output:
 
 ```text
 model   backend  status        gpus  layers  tokens  mean_ms  tok*layer/s  diff       peak_gib  ok
-dsv3_2  triton   native        8     61      1       154.847  393.9        0.000e+00  2.78      yes
-dsv3_2  cutedsl  native        8     61      1       153.249  398.0        0.000e+00  2.78      yes
-dsv3_2  helion   native        8     61      1       154.785  394.1        0.000e+00  2.78      yes
-dsv3_2  best     pure=cutedsl  8     61      1       153.249  398.0        0.000e+00  2.78      yes
-dsv4    triton   native        8     61      1       190.043  321.0        0.000e+00  2.77      yes
-dsv4    cutedsl  native        8     61      1       189.871  321.3        0.000e+00  2.77      yes
-dsv4    helion   native        8     61      1       189.440  322.0        0.000e+00  2.77      yes
-dsv4    best     pure=helion   8     61      1       189.440  322.0        0.000e+00  2.77      yes
-ds      triton   native        8     61      1       165.935  367.6        0.000e+00  2.78      yes
-ds      cutedsl  native        8     61      1       166.282  366.8        0.000e+00  2.78      yes
-ds      helion   native        8     61      1       166.467  366.4        0.000e+00  2.78      yes
-ds      best     mixed=triton  8     61      1       165.764  368.0        0.000e+00  2.78      yes
+dsv3_2  triton   native        8     61      1       158.573  384.7        0.000e+00  2.78      yes
+dsv3_2  cutedsl  native        8     61      1       155.932  391.2        0.000e+00  2.78      yes
+dsv3_2  helion   native        8     61      1       157.160  388.1        0.000e+00  2.78      yes
+dsv3_2  best     pure=cutedsl  8     61      1       155.932  391.2        0.000e+00  2.78      yes
 ```
 
 Larger built-in benchmark cases are `decode_128`, `prefill_512`, and
@@ -164,7 +145,7 @@ dsv3_2  a1f6d7e2   triton   native    smoke  cuda:0  37.462   427.1   1.562e-02 
 
 ## Adding A Partition
 
-1. Add a new directory under `partitions/<model>/<hash>/`.
+1. Add a new directory under `partitions/dsv3_2/<hash>/`.
 2. Put the partition model in `model.py`.
 3. Put backend kernels under `kernels/triton`, `kernels/cutedsl`, and
    `kernels/helion`.
@@ -172,7 +153,7 @@ dsv3_2  a1f6d7e2   triton   native    smoke  cuda:0  37.462   427.1   1.562e-02 
 5. Run:
 
 ```bash
-python -m racetrack.bench --model <model> --partition all --kernel-filter all
+python -m racetrack.bench --model dsv3_2 --partition all --kernel-filter all
 ```
 
 A practical hash command for a new partition file is:
@@ -188,7 +169,7 @@ PY
 
 ```bash
 python -m pytest
-python -m racetrack.bench --model all --partition all --kernel-filter all --device cpu --dtype float32
+python -m racetrack.bench --model dsv3_2 --partition all --kernel-filter all --device cpu --dtype float32
 ```
 
 The flattened models are deliberately small by default so kernel dispatch,

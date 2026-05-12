@@ -42,7 +42,7 @@ class DeepSeekConfig:
 
 def model_config(name: str) -> DeepSeekConfig:
     key = name.lower().replace("-", "_")
-    if key in {"dsv3_2", "ds3_2", "deepseek_v3_2"}:
+    if key == "dsv3_2":
         return DeepSeekConfig(
             name="dsv3_2",
             source="vLLM PR 38595 specialized DeepSeek V3.2 NVFP4 path",
@@ -58,42 +58,6 @@ def model_config(name: str) -> DeepSeekConfig:
             num_experts_per_tok=2,
             n_shared_experts=1,
             seed=38595,
-        )
-    if key in {"dsv4", "deepseek_v4"}:
-        return DeepSeekConfig(
-            name="dsv4",
-            source="vLLM PR 40860 DeepSeek V4 model path",
-            hidden_size=512,
-            num_layers=2,
-            num_attention_heads=8,
-            head_dim=64,
-            q_lora_rank=128,
-            kv_lora_rank=64,
-            qk_rope_head_dim=16,
-            moe_intermediate_size=512,
-            n_routed_experts=8,
-            num_experts_per_tok=2,
-            n_shared_experts=1,
-            hc_mult=2,
-            compress_ratio=4,
-            seed=40860,
-        )
-    if key in {"ds", "deepseek"}:
-        return DeepSeekConfig(
-            name="ds",
-            source="Generic flattened DeepSeek MLA/MoE path seeded from PR 40860 shapes",
-            hidden_size=384,
-            num_layers=2,
-            num_attention_heads=6,
-            head_dim=64,
-            q_lora_rank=96,
-            kv_lora_rank=96,
-            qk_rope_head_dim=16,
-            moe_intermediate_size=256,
-            n_routed_experts=4,
-            num_experts_per_tok=2,
-            n_shared_experts=1,
-            seed=40861,
         )
     raise KeyError(f"Unknown model config: {name}")
 

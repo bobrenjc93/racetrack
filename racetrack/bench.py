@@ -16,7 +16,7 @@ from benchmarks import get_cases
 
 CONCRETE_KERNEL_BACKENDS = ("triton", "cutedsl", "helion")
 BACKENDS = ("torch", *CONCRETE_KERNEL_BACKENDS, "best", "all")
-MODELS = ("dsv3_2", "dsv4", "ds")
+MODELS = ("dsv3_2",)
 
 
 @dataclass
@@ -139,10 +139,8 @@ def _backend_list(kernel_filter: str, partition: str) -> list[str]:
 
 
 def _model_list(model_filter: str) -> Iterable[str]:
-    if model_filter == "all":
-        return MODELS
     if model_filter not in MODELS:
-        known = ", ".join((*MODELS, "all"))
+        known = ", ".join(MODELS)
         raise KeyError(f"Unknown model {model_filter!r}. Known: {known}")
     return [model_filter]
 
@@ -389,7 +387,7 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep racetrack model partitions and kernels.")
-    parser.add_argument("--model", default="dsv3_2", help="dsv3_2, dsv4, ds, or all")
+    parser.add_argument("--model", default="dsv3_2", choices=MODELS)
     parser.add_argument("--partition", default="all", help="baseline, all, or a partition hash")
     parser.add_argument(
         "--kernel-filter",
