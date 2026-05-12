@@ -187,10 +187,12 @@ class KernelDispatcher:
     def backend_status(self, backend: str) -> str:
         if backend == "torch":
             return "native"
-        module = self._load_module(backend, "fused_rope")
-        if module is None:
+        modules = self._load_backend_modules(backend)
+        if not modules:
             return "missing"
-        return "native" if bool(getattr(module, "BACKEND_AVAILABLE", False)) else "missing"
+        if any(bool(getattr(m, "BACKEND_AVAILABLE", False)) for m in modules):
+            return "native"
+        return "missing"
 
     def call(
         self,
@@ -237,13 +239,28 @@ class KernelDispatcher:
         raise RuntimeError(f"No available {backend} kernel found for {op_name}")
 
     def _resolve(self, backend: str, op_name: str) -> Callable[..., Any] | None:
-        module = self._load_module(backend, "fused_rope")
-        if module is None:
-            return None
-        if not bool(getattr(module, "BACKEND_AVAILABLE", False)):
-            return None
-        fn = getattr(module, op_name, None)
-        return fn if callable(fn) else None
+        for module in self._load_backend_modules(backend):
+            if not bool(getattr(module, "BACKEND_AVAILABLE", False)):
+                continue
+            fn = getattr(module, op_name, None)
+            if callable(fn):
+                return fn
+        return None
+
+    def _load_backend_modules(self, backend: str) -> list[ModuleType]:
+        if self.kernel_root is None:
+            return []
+        backend_dir = self.kernel_root / backend
+        if not backend_dir.is_dir():
+            return []
+        modules: list[ModuleType] = []
+        for path in sorted(backend_dir.glob("*.py")):
+            if path.name.startswith("_"):
+                continue
+            module = self._load_module(backend, path.stem)
+            if module is not None:
+                modules.append(module)
+        return modules
 
     def _load_module(self, backend: str, module_name: str) -> ModuleType | None:
         if self.kernel_root is None:
