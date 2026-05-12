@@ -208,6 +208,7 @@ class KernelDispatcher:
                 selected = self._select_best(op_name, fallback, *args, **kwargs)
                 self._best_fast_path[op_name] = selected
                 self._save_best_config()
+            self._best_ops.setdefault(op_name, set()).add(selected)
         fn = self._resolve(selected, op_name)
         if fn is None:
             self._handle_missing(selected, op_name)
