@@ -194,9 +194,23 @@ def _hardware_info(device: str) -> dict:
         idx = int(device.split(":")[-1]) if ":" in device else 0
         props = torch.cuda.get_device_properties(idx)
         info["gpu"] = props.name
+        info["gpu_count"] = torch.cuda.device_count()
         info["gpu_memory_gb"] = round(props.total_memory / 1024**3, 1)
         info["cuda"] = torch.version.cuda or "unknown"
     return info
+
+
+def _hardware_slug(device: str) -> str:
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return "cpu"
+    idx = int(device.split(":")[-1]) if ":" in device else 0
+    props = torch.cuda.get_device_properties(idx)
+    gpu_count = torch.cuda.device_count()
+    name = props.name.lower()
+    for prefix in ("nvidia ", "amd ", "intel "):
+        name = name.removeprefix(prefix)
+    slug = name.replace(" ", "_")
+    return f"{gpu_count}x{slug}"
 
 
 def _build_combo_entry(
@@ -303,15 +317,18 @@ def main() -> None:
 
     report = pick_winner(results)
     winner = report["winner"]
-    winner_path = BENCHMARK_DIR / "winner.json"
-    with open(winner_path, "w") as f:
+    slug = _hardware_slug(args.device)
+    results_dir = BENCHMARK_DIR / "results"
+    results_dir.mkdir(exist_ok=True)
+    results_path = results_dir / f"{slug}.json"
+    with open(results_path, "w") as f:
         json.dump(report, f, indent=2)
         f.write("\n")
     speedup = winner.get("speedup_vs_baseline")
     speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
     print(f"\nWinner: {winner['partition']}/{winner['backend']} "
           f"({winner['aggregate_mean_ms']:.1f}ms aggregate){speedup_str}")
-    print(f"Saved to {winner_path}")
+    print(f"Saved to {results_path}")
 
 
 if __name__ == "__main__":

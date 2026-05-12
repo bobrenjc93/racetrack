@@ -15,7 +15,8 @@ benchmark workload.
   backend-specific implementation of a dispatchable op. Each file exports
   `BACKEND_AVAILABLE: bool` and one or more op functions.
 - **Benchmark**: `benchmarks/<name>/` -- a folder with `bench.py` (runner)
-  and `winner.json` (best combo). Run with `python -m benchmarks.<name>.bench`.
+  and `results/<hardware>.json` (results per hardware config, e.g.
+  `results/8xh100.json`). Run with `python -m benchmarks.<name>.bench`.
 
 ## Creating a new partition
 
@@ -83,8 +84,11 @@ python -m racetrack.bench --partition all --kernel-filter all --benchmark smoke
 ```
 
 After a benchmark run:
-- `benchmarks/<name>/winner.json` has the best model/partition/backend/kernels
-- `partitions/<model>/<hash>/kernels/best.json` caches per-op backend winners
+- `benchmarks/<name>/results/<hardware>.json` has the winner, full leaderboard,
+  baseline comparison, and hardware info. The hardware slug is auto-detected
+  (e.g., `8xh100.json`). These files are committed.
+- `partitions/<model>/<hash>/kernels/best.json` is a runtime cache for per-op
+  backend winners (gitignored, not committed -- hardware-specific).
 
 ## Iteration loop
 
@@ -98,7 +102,7 @@ The workflow for improving performance:
    - Create a new partition with different fusion boundaries
    - Write better kernel implementations for existing ops
 5. Re-run the benchmark
-6. Commit `winner.json` and `best.json` when a partition beats baseline
+6. Commit `results/<hardware>.json` when a partition beats baseline
 
 ## Partition files are self-contained
 

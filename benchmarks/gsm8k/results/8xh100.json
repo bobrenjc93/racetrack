@@ -1,0 +1,228 @@
+{
+  "winner": {
+    "partition": "a1f6d7e2",
+    "backend": "torch",
+    "backend_status": "best",
+    "kernels": null,
+    "aggregate_mean_ms": 30.071,
+    "speedup_vs_baseline": 1.006,
+    "cases": {
+      "question": {
+        "tokens": 96,
+        "mean_ms": 10.252,
+        "min_ms": 10.181,
+        "max_ms": 10.363,
+        "tokens_per_second": 9363.7,
+        "vs_baseline": 1.0076
+      },
+      "cot": {
+        "tokens": 256,
+        "mean_ms": 9.862,
+        "min_ms": 9.788,
+        "max_ms": 10.029,
+        "tokens_per_second": 25959.5,
+        "vs_baseline": 0.9958
+      },
+      "full": {
+        "tokens": 384,
+        "mean_ms": 9.957,
+        "min_ms": 9.862,
+        "max_ms": 10.063,
+        "tokens_per_second": 38565.8,
+        "vs_baseline": 1.0146
+      }
+    }
+  },
+  "baseline": {
+    "question": 10.33,
+    "cot": 9.82,
+    "full": 10.103
+  },
+  "leaderboard": [
+    {
+      "partition": "a1f6d7e2",
+      "backend": "torch",
+      "backend_status": "best",
+      "kernels": null,
+      "aggregate_mean_ms": 30.071,
+      "speedup_vs_baseline": 1.006,
+      "cases": {
+        "question": {
+          "tokens": 96,
+          "mean_ms": 10.252,
+          "min_ms": 10.181,
+          "max_ms": 10.363,
+          "tokens_per_second": 9363.7,
+          "vs_baseline": 1.0076
+        },
+        "cot": {
+          "tokens": 256,
+          "mean_ms": 9.862,
+          "min_ms": 9.788,
+          "max_ms": 10.029,
+          "tokens_per_second": 25959.5,
+          "vs_baseline": 0.9958
+        },
+        "full": {
+          "tokens": 384,
+          "mean_ms": 9.957,
+          "min_ms": 9.862,
+          "max_ms": 10.063,
+          "tokens_per_second": 38565.8,
+          "vs_baseline": 1.0146
+        }
+      }
+    },
+    {
+      "partition": "baseline",
+      "backend": "torch",
+      "backend_status": "native",
+      "kernels": null,
+      "aggregate_mean_ms": 30.252,
+      "speedup_vs_baseline": 1.0,
+      "cases": {
+        "question": {
+          "tokens": 96,
+          "mean_ms": 10.33,
+          "min_ms": 10.204,
+          "max_ms": 10.464,
+          "tokens_per_second": 9293.3,
+          "vs_baseline": 1.0
+        },
+        "cot": {
+          "tokens": 256,
+          "mean_ms": 9.82,
+          "min_ms": 9.76,
+          "max_ms": 9.902,
+          "tokens_per_second": 26069.8,
+          "vs_baseline": 1.0
+        },
+        "full": {
+          "tokens": 384,
+          "mean_ms": 10.103,
+          "min_ms": 9.957,
+          "max_ms": 10.209,
+          "tokens_per_second": 38010.3,
+          "vs_baseline": 1.0
+        }
+      }
+    },
+    {
+      "partition": "a1f6d7e2",
+      "backend": "helion",
+      "backend_status": "best",
+      "kernels": null,
+      "aggregate_mean_ms": 30.748,
+      "speedup_vs_baseline": 0.9839,
+      "cases": {
+        "question": {
+          "tokens": 96,
+          "mean_ms": 10.484,
+          "min_ms": 10.449,
+          "max_ms": 10.528,
+          "tokens_per_second": 9156.7,
+          "vs_baseline": 0.9853
+        },
+        "cot": {
+          "tokens": 256,
+          "mean_ms": 10.117,
+          "min_ms": 10.001,
+          "max_ms": 10.387,
+          "tokens_per_second": 25303.9,
+          "vs_baseline": 0.9706
+        },
+        "full": {
+          "tokens": 384,
+          "mean_ms": 10.147,
+          "min_ms": 10.092,
+          "max_ms": 10.269,
+          "tokens_per_second": 37843.1,
+          "vs_baseline": 0.9956
+        }
+      }
+    },
+    {
+      "partition": "a1f6d7e2",
+      "backend": "best",
+      "backend_status": "mixed=helion",
+      "kernels": {
+        "fused_norm_rope": "helion"
+      },
+      "aggregate_mean_ms": 31.866,
+      "speedup_vs_baseline": 0.9493,
+      "cases": {
+        "question": {
+          "tokens": 96,
+          "mean_ms": 10.932,
+          "min_ms": 10.869,
+          "max_ms": 11.036,
+          "tokens_per_second": 8781.9,
+          "vs_baseline": 0.945
+        },
+        "cot": {
+          "tokens": 256,
+          "mean_ms": 10.445,
+          "min_ms": 10.301,
+          "max_ms": 10.585,
+          "tokens_per_second": 24509.7,
+          "vs_baseline": 0.9402
+        },
+        "full": {
+          "tokens": 384,
+          "mean_ms": 10.49,
+          "min_ms": 10.435,
+          "max_ms": 10.55,
+          "tokens_per_second": 36606.6,
+          "vs_baseline": 0.9631
+        }
+      }
+    },
+    {
+      "partition": "a1f6d7e2",
+      "backend": "triton",
+      "backend_status": "best",
+      "kernels": null,
+      "aggregate_mean_ms": 33.735,
+      "speedup_vs_baseline": 0.8968,
+      "cases": {
+        "question": {
+          "tokens": 96,
+          "mean_ms": 10.454,
+          "min_ms": 10.411,
+          "max_ms": 10.509,
+          "tokens_per_second": 9182.9,
+          "vs_baseline": 0.9881
+        },
+        "cot": {
+          "tokens": 256,
+          "mean_ms": 11.969,
+          "min_ms": 10.026,
+          "max_ms": 13.83,
+          "tokens_per_second": 21388.2,
+          "vs_baseline": 0.8204
+        },
+        "full": {
+          "tokens": 384,
+          "mean_ms": 11.311,
+          "min_ms": 10.04,
+          "max_ms": 14.203,
+          "tokens_per_second": 33948.3,
+          "vs_baseline": 0.8931
+        }
+      }
+    }
+  ],
+  "model": "dsv3_2",
+  "dtype": "bfloat16",
+  "hardware": {
+    "device": "cuda:0",
+    "python": "3.10.20",
+    "torch": "2.13.0a0+git0a0fcd7",
+    "platform": "Linux-6.13.2-0_fbk12_0_g0b66b3635210-x86_64-with-glibc2.34",
+    "gpu": "NVIDIA H100",
+    "gpu_count": 8,
+    "gpu_memory_gb": 95.1,
+    "cuda": "12.4"
+  },
+  "timestamp": "2026-05-12T21:33:29.318857+00:00"
+}

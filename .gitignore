@@ -8,6 +8,7 @@ __pycache__/
 venv/
 build/
 dist/
-results/
+/results/
+**/kernels/best.json
 *.jsonl
 *.log
