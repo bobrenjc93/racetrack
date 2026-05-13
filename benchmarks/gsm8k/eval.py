@@ -1,14 +1,17 @@
 """GSM8K accuracy evaluation using DeepSeek-V3.2.
 
-Loads the full DeepSeek-V3.2 model in 4-bit quantization across all available
-GPUs, runs it on GSM8K test questions, extracts numerical answers, and compares
-to ground truth.  Results are cached so subsequent benchmark runs skip the
-expensive generation step.
+Loads the full DeepSeek-V3.2 model across 8 GPUs using the official inference
+code, runs it on GSM8K test questions, and reports accuracy.  Results are
+cached so subsequent benchmark runs skip the expensive generation step.
 
-Usage (standalone):
+Usage:
+    torchrun --standalone --nproc-per-node=8 \
+        -m benchmarks.gsm8k.eval \
+        --ckpt-path checkpoints/dsv3_2-mp8 \
+        --samples 200
+
+Standalone (no torchrun, uses cached results only):
     python -m benchmarks.gsm8k.eval
-    python -m benchmarks.gsm8k.eval --samples 200
-    python -m benchmarks.gsm8k.eval --model deepseek-ai/DeepSeek-V3.2 --samples 200
 """
 
 from __future__ import annotations
@@ -20,7 +23,6 @@ import re
 import sys
 from pathlib import Path
 
-# Block torchvision to avoid operator registration errors in dev builds
 for _tv_mod in ("torchvision", "torchvision.transforms"):
     if _tv_mod not in sys.modules:
         sys.modules[_tv_mod] = None  # type: ignore[assignment]
@@ -29,8 +31,39 @@ import torch
 
 EVAL_MODEL = "deepseek-ai/DeepSeek-V3.2"
 NUM_SAMPLES = 200
-MAX_NEW_TOKENS = 2048
+MAX_NEW_TOKENS = 1024
 CACHE_PATH = Path(__file__).parent / "results" / "eval_cache.json"
+
+DSV3_2_CONFIG = {
+    "vocab_size": 129280,
+    "dim": 7168,
+    "inter_dim": 18432,
+    "moe_inter_dim": 2048,
+    "n_layers": 61,
+    "n_dense_layers": 3,
+    "n_heads": 128,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "n_activated_experts": 8,
+    "n_expert_groups": 8,
+    "n_limited_groups": 4,
+    "score_func": "sigmoid",
+    "route_scale": 2.5,
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "original_seq_len": 4096,
+    "rope_theta": 10000.0,
+    "rope_factor": 40,
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "mscale": 1.0,
+    "index_n_heads": 64,
+    "index_head_dim": 128,
+    "index_topk": 2048,
+}
 
 
 def _load_hf_token() -> str | None:
@@ -75,117 +108,185 @@ def extract_ground_truth(answer_text: str) -> float:
 
 
 def evaluate(
-    model_name: str = EVAL_MODEL,
+    ckpt_path: str,
     num_samples: int = NUM_SAMPLES,
-    device: str = "cuda:0",
+    max_new_tokens: int = MAX_NEW_TOKENS,
     force: bool = False,
 ) -> dict:
     cache = _load_cache()
-    cache_key = f"{model_name}:{num_samples}"
+    cache_key = f"{EVAL_MODEL}:{num_samples}"
     if not force and cache_key in cache:
-        print(f"Using cached eval: {model_name} ({num_samples} samples) "
+        print(f"Using cached eval: {EVAL_MODEL} ({num_samples} samples) "
               f"-> {cache[cache_key]['accuracy_pct']}%")
         return cache[cache_key]
 
+    import torch.distributed as dist
     from datasets import load_dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from safetensors.torch import load_model
+    from transformers import PreTrainedTokenizerFast
 
-    print(f"Loading model {model_name} (4-bit quantized, device_map=auto) ...")
-    hf_token = _load_hf_token()
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, token=hf_token, trust_remote_code=True,
-    )
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        token=hf_token,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
+    from inference.model import ModelArgs, Transformer
 
-    print("Loading GSM8K test set ...")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group("nccl")
+
+    torch.cuda.set_device(local_rank)
+    torch.set_default_dtype(torch.bfloat16)
+
+    config = dict(DSV3_2_CONFIG)
+    config["max_batch_size"] = 1
+    config["max_seq_len"] = 2048
+    config["dtype"] = "fp8"
+    config["scale_fmt"] = "ue8m0"
+    args = ModelArgs(**config)
+
+    if rank == 0:
+        print(f"Loading model from {ckpt_path} (world_size={world_size}) ...")
+
+    with torch.device("cuda"):
+        model = Transformer(args)
+
+    ckpt_file = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
+    load_model(model, ckpt_file)
+
+    if rank == 0:
+        print("Model loaded. Loading tokenizer ...")
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=os.path.join(ckpt_path, "tokenizer.json"),
+    )
+
+    if rank == 0:
+        print("Loading GSM8K test set ...")
+
     dataset = load_dataset("openai/gsm8k", "main", split="test")
     if num_samples < len(dataset):
         dataset = dataset.select(range(num_samples))
 
+    from inference.model import Transformer as _  # noqa: ensure generate can find model
+
     correct = 0
     total = len(dataset)
-    print(f"Evaluating {total} GSM8K problems ...")
+
+    if rank == 0:
+        print(f"Evaluating {total} GSM8K problems ...")
 
     for i, example in enumerate(dataset):
         question = example["question"]
         ground_truth = extract_ground_truth(example["answer"])
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Solve this math problem step by step. "
-                    "End your answer with #### followed by the numerical answer."
-                ),
-            },
-            {"role": "user", "content": question},
-        ]
-        prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+        system = (
+            "Solve this math problem step by step. "
+            "End your answer with #### followed by the numerical answer."
         )
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-            )
-
-        response = tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=True,
+        prompt = (
+            "<｜begin▁of▁sentence｜>"
+            + system
+            + "<｜User｜>" + question + "<｜Assistant｜>"
+            + "<think>\n"
         )
+        prompt_tokens = tokenizer.encode(prompt)
+        eos_id = 1
+        completion_tokens = _generate_greedy(
+            model, [prompt_tokens], max_new_tokens, eos_id,
+        )
+
+        response = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
         predicted = extract_answer(response)
 
         if predicted is not None and abs(predicted - ground_truth) < 1e-3:
             correct += 1
 
-        if (i + 1) % 50 == 0:
+        if rank == 0 and (i + 1) % 10 == 0:
             print(f"  [{i + 1}/{total}] accuracy so far: {correct / (i + 1) * 100:.1f}%")
 
     accuracy = correct / total * 100.0
-    print(f"Final accuracy: {accuracy:.1f}% ({correct}/{total})")
+    if rank == 0:
+        print(f"Final accuracy: {accuracy:.1f}% ({correct}/{total})")
 
     result = {
-        "model": model_name,
+        "model": EVAL_MODEL,
         "num_samples": total,
         "correct": correct,
         "accuracy_pct": round(accuracy, 1),
     }
 
-    cache[cache_key] = result
-    _save_cache(cache)
+    if rank == 0:
+        cache[cache_key] = result
+        _save_cache(cache)
 
     del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+
+    if world_size > 1:
+        dist.destroy_process_group()
 
     return result
 
 
+@torch.inference_mode()
+def _generate_greedy(
+    model,
+    prompt_tokens: list[list[int]],
+    max_new_tokens: int,
+    eos_id: int,
+) -> list[list[int]]:
+    prompt_lens = [len(t) for t in prompt_tokens]
+    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
+    tokens = torch.full(
+        (len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda",
+    )
+    for i, t in enumerate(prompt_tokens):
+        tokens[i, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+
+    prev_pos = 0
+    finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
+    prompt_mask = tokens != -1
+
+    for cur_pos in range(min(prompt_lens), total_len):
+        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        next_token = logits.argmax(dim=-1)
+        next_token = torch.where(
+            prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token,
+        )
+        tokens[:, cur_pos] = next_token
+        finished |= torch.logical_and(
+            ~prompt_mask[:, cur_pos], next_token == eos_id,
+        )
+        prev_pos = cur_pos
+        if finished.all():
+            break
+
+    completion_tokens = []
+    for i, toks in enumerate(tokens.tolist()):
+        toks = toks[prompt_lens[i] : prompt_lens[i] + max_new_tokens]
+        if eos_id in toks:
+            toks = toks[: toks.index(eos_id)]
+        completion_tokens.append(toks)
+    return completion_tokens
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GSM8K accuracy evaluation")
-    parser.add_argument("--model", default=EVAL_MODEL)
+    parser.add_argument(
+        "--ckpt-path",
+        default="checkpoints/dsv3_2-mp8",
+        help="Path to converted checkpoint directory",
+    )
     parser.add_argument("--samples", type=int, default=NUM_SAMPLES)
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--force", action="store_true", help="Ignore cache")
     args = parser.parse_args()
 
-    result = evaluate(args.model, args.samples, args.device, args.force)
-    print(json.dumps(result, indent=2))
+    result = evaluate(args.ckpt_path, args.samples, args.max_new_tokens, args.force)
+
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

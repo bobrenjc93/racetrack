@@ -484,21 +484,26 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--no-eval", action="store_true", help="Skip GSM8K accuracy eval")
-    parser.add_argument("--eval-model", default=None, help="HF model for GSM8K eval")
-    parser.add_argument("--eval-samples", type=int, default=200, help="Number of GSM8K samples")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
 
     eval_result = None
     if not args.no_eval:
-        from benchmarks.gsm8k.eval import EVAL_MODEL, evaluate
+        from benchmarks.gsm8k.eval import CACHE_PATH
 
-        eval_result = evaluate(
-            model_name=args.eval_model or EVAL_MODEL,
-            num_samples=args.eval_samples,
-            device=args.device,
-        )
+        if CACHE_PATH.exists():
+            import json as _json
+            _cache = _json.loads(CACHE_PATH.read_text())
+            if _cache:
+                eval_result = next(iter(_cache.values()))
+                print(f"Loaded cached eval: {eval_result['accuracy_pct']}% "
+                      f"({eval_result['correct']}/{eval_result['num_samples']})")
+        if eval_result is None:
+            print("No cached eval results. Run the eval first with torchrun:\n"
+                  "  torchrun --standalone --nproc-per-node=8 \\\n"
+                  "    -m benchmarks.gsm8k.eval \\\n"
+                  "    --ckpt-path checkpoints/dsv3_2-mp8")
 
     results = run(args.device, args.dtype, args.warmup, args.repeat)
     _print_table(results)
