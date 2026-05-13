@@ -578,7 +578,6 @@ class MLA(nn.Module):
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
             scores = torch.einsum("bshd,bthd->bsht", q, k).mul_(self.softmax_scale)
 
-            # indexer
             topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
             index_mask = torch.full((bsz, seqlen, seqlen), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
             index_mask += mask
@@ -595,7 +594,6 @@ class MLA(nn.Module):
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
 
-            # indexer
             topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
             index_mask = torch.full((bsz, 1, end_pos), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
             scores += index_mask.unsqueeze(2)

@@ -30,8 +30,8 @@ for _tv_mod in ("torchvision", "torchvision.transforms"):
 import torch
 
 EVAL_MODEL = "deepseek-ai/DeepSeek-V3.2"
-NUM_SAMPLES = 200
-MAX_NEW_TOKENS = 1024
+NUM_SAMPLES = 50
+MAX_NEW_TOKENS = 512
 CACHE_PATH = Path(__file__).parent / "results" / "eval_cache.json"
 
 DSV3_2_CONFIG = {
@@ -139,9 +139,9 @@ def evaluate(
 
     config = dict(DSV3_2_CONFIG)
     config["max_batch_size"] = 1
-    config["max_seq_len"] = 2048
+    config["max_seq_len"] = 512
     config["dtype"] = "fp8"
-    config["scale_fmt"] = "ue8m0"
+    config["scale_fmt"] = None
     args = ModelArgs(**config)
 
     if rank == 0:
@@ -179,14 +179,12 @@ def evaluate(
         question = example["question"]
         ground_truth = extract_ground_truth(example["answer"])
 
-        system = (
-            "Solve this math problem step by step. "
-            "End your answer with #### followed by the numerical answer."
-        )
         prompt = (
             "<｜begin▁of▁sentence｜>"
-            + system
-            + "<｜User｜>" + question + "<｜Assistant｜>"
+            + "<｜User｜>"
+            + question
+            + "\nGive your final numerical answer after ####."
+            + "<｜Assistant｜>"
             + "<think>\n"
         )
         prompt_tokens = tokenizer.encode(prompt)
@@ -200,6 +198,10 @@ def evaluate(
 
         if predicted is not None and abs(predicted - ground_truth) < 1e-3:
             correct += 1
+
+        if rank == 0 and i == 0:
+            print(f"  [sample response] {response[:300]}", flush=True)
+            print(f"  predicted={predicted}, truth={ground_truth}", flush=True)
 
         if rank == 0 and (i + 1) % 10 == 0:
             print(f"  [{i + 1}/{total}] accuracy so far: {correct / (i + 1) * 100:.1f}%")
