@@ -31,7 +31,7 @@ import torch
 
 EVAL_MODEL = "deepseek-ai/DeepSeek-V3.2"
 NUM_SAMPLES = 50
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 256
 CACHE_PATH = Path(__file__).parent / "results" / "eval_cache.json"
 
 DSV3_2_CONFIG = {
@@ -139,7 +139,7 @@ def evaluate(
 
     config = dict(DSV3_2_CONFIG)
     config["max_batch_size"] = 1
-    config["max_seq_len"] = 512
+    config["max_seq_len"] = 384
     config["dtype"] = "fp8"
     args = ModelArgs(**config)
 
