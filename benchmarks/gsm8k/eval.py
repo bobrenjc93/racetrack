@@ -184,7 +184,6 @@ def evaluate(
             + question
             + "\nGive your final numerical answer after ####."
             + "<｜Assistant｜>"
-            + "<think>\n"
         )
         prompt_tokens = tokenizer.encode(prompt)
         eos_id = 1
