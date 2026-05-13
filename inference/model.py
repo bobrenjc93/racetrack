@@ -565,9 +565,7 @@ class MLA(nn.Module):
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv = self.kv_norm(kv)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-        # we use fp8 kv cache in actual deployment, so here we simulate the precision by casting kv to fp8 and then back to bf16.
-        kv_fp8, kv_scale = act_quant(kv, block_size, self.scale_fmt)
-        kv = (kv_fp8.view(-1, block_size).float() * kv_scale.view(-1, 1)).to(kv.dtype).view_as(kv)
+        # Skip FP8 KV cache simulation — we use BF16 throughout
         self.kv_cache[:bsz, start_pos:end_pos] = kv
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
         if mask is not None:    # MHA prefill

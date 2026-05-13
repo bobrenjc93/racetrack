@@ -141,7 +141,6 @@ def evaluate(
     config["max_batch_size"] = 1
     config["max_seq_len"] = 512
     config["dtype"] = "fp8"
-    config["scale_fmt"] = None
     args = ModelArgs(**config)
 
     if rank == 0:
