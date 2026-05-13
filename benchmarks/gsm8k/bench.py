@@ -32,20 +32,20 @@ MODELS = ("dsv3_2",)
 BACKENDS = ("torch", "triton", "cutedsl", "helion")
 
 CASES: list[tuple[str, int]] = [
-    ("question", 96),
-    ("cot", 256),
-    ("full", 384),
+    ("prefill_128", 128),
+    ("prefill_512", 512),
+    ("prefill_2048", 2048),
 ]
 
 MODEL_OVERRIDES: dict[str, int | float | str] = {
     "hidden_size": 4096,
-    "num_attention_heads": 64,
-    "head_dim": 64,
+    "num_attention_heads": 32,
+    "head_dim": 128,
     "q_lora_rank": 1024,
     "kv_lora_rank": 512,
-    "qk_rope_head_dim": 32,
+    "qk_rope_head_dim": 64,
     "moe_intermediate_size": 2048,
-    "num_layers": 8,
+    "num_layers": 4,
 }
 
 
@@ -147,8 +147,8 @@ def _discover_kernel_map(dispatcher, backend: str) -> dict[str, str] | None:
 def run(
     device_str: str = "cuda:0",
     dtype_str: str = "auto",
-    warmup: int = 3,
-    repeat: int = 10,
+    warmup: int = 10,
+    repeat: int = 30,
 ) -> list[Result]:
     device = torch.device(device_str)
     dtype = _resolve_dtype(dtype_str, device)
@@ -470,8 +470,8 @@ def main() -> None:
         default="cuda:0" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument("--dtype", default="auto")
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--repeat", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--no-eval", action="store_true", help="Skip GSM8K accuracy eval")
     args = parser.parse_args()
 
