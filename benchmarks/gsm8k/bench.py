@@ -419,22 +419,12 @@ def _render_markdown(report: dict, slug: str) -> str:
 
     lines.append("## Leaderboard")
     lines.append("")
-    case_names = list(next(iter(report["leaderboard"]))["cases"].keys())
-    headers = [
-        "#",
-        "partition",
-        "backend",
-        *(f"{case_name} (ms)" for case_name in case_names),
-        "total (ms)",
-        "vs baseline",
-    ]
+    headers = ["#", "partition", "backend", "total (ms)", "vs baseline"]
     if eval_result:
         headers.append("correctness")
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("---" for _ in headers) + "|")
     for rank, entry in enumerate(report["leaderboard"], 1):
-        cases = entry["cases"]
-        case_cols = [f"{cases[c]['mean_ms']:.1f}" for c in case_names]
         speedup_val = entry.get("speedup_vs_baseline")
         speedup_cell = f"{speedup_val:.3f}x" if speedup_val is not None else "-"
         kernels_note = ""
@@ -446,7 +436,6 @@ def _render_markdown(report: dict, slug: str) -> str:
             str(rank),
             entry["partition"],
             f"{entry['backend']}{kernels_note}",
-            *case_cols,
             f"{entry['aggregate_mean_ms']:.1f}",
             speedup_cell,
         ]
