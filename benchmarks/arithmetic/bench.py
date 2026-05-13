@@ -43,18 +43,14 @@ KERNEL_FILTERS = (
 )
 
 MODEL_OVERRIDES: dict[str, int | float | str] = {
-    "vocab_size": 512,
-    "hidden_size": 256,
-    "num_attention_heads": 4,
-    "head_dim": 64,
-    "q_lora_rank": 64,
-    "kv_lora_rank": 64,
-    "qk_rope_head_dim": 16,
-    "moe_intermediate_size": 128,
-    "num_layers": 1,
-    "n_routed_experts": 4,
-    "num_experts_per_tok": 1,
-    "n_shared_experts": 1,
+    "hidden_size": 4096,
+    "num_attention_heads": 32,
+    "head_dim": 128,
+    "q_lora_rank": 1024,
+    "kv_lora_rank": 512,
+    "qk_rope_head_dim": 64,
+    "moe_intermediate_size": 2048,
+    "num_layers": 4,
 }
 
 
@@ -327,8 +323,8 @@ def _benchmark_backend(
 def run(
     device_str: str = "cuda:0",
     dtype_str: str = "auto",
-    warmup: int = 1,
-    repeat: int = 3,
+    warmup: int = 10,
+    repeat: int = 30,
     partition_filter: str = "tracked",
     kernel_filter: str = "torch",
 ) -> list[Result]:
@@ -345,7 +341,7 @@ def run(
             raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is false")
         torch.cuda.set_device(device)
     dtype = _resolve_dtype(dtype_str, device)
-    vocab_size = int(MODEL_OVERRIDES["vocab_size"])
+    vocab_size = int(MODEL_OVERRIDES.get("vocab_size", 8192))
 
     results: list[Result] = []
     for model_name in MODELS:
@@ -731,8 +727,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=KERNEL_FILTERS,
         help="available, all, torch, triton, cutedsl/cutedl, helion, or best",
     )
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--no-eval", action="store_true", help="Do not load cached real-weight eval")
     parser.add_argument("--no-save", action="store_true", help="Do not write results/<hardware>.md")
     return parser.parse_args(argv)
