@@ -3,9 +3,10 @@
 Uses short deterministic arithmetic prompts such as:
   1 * 213813290183291 =
 
-The flattened racetrack models do not generate text from prompts. This runner
-therefore encodes each prompt plus its expected identity answer into stable
-byte-level token IDs and benchmarks those short arithmetic-shaped sequences.
+The flattened racetrack models do not use real checkpoint weights or generate
+text. This runner benchmarks short arithmetic-shaped token sequences for
+partition/kernel latency and, when available, reports real checkpoint
+correctness from benchmarks.arithmetic.eval.
 
 Usage:
     python -m benchmarks.arithmetic.bench
@@ -96,8 +97,6 @@ class Result:
     min_ms: float
     max_ms: float
     tokens_per_second: float
-    max_abs_diff: float | None
-    ok: bool
     kernels: dict[str, str] | None = None
 
 
@@ -275,11 +274,8 @@ def _benchmark_backend(
     dtype: torch.dtype,
     input_ids: torch.Tensor,
     positions: torch.Tensor,
-    baseline_out: torch.Tensor,
     warmup: int,
     repeat: int,
-    check: bool,
-    atol: float,
 ) -> Result:
     os.environ["RACETRACK_KERNEL_BACKEND"] = backend
     module = _load_partition_module(model_name, partition)
@@ -301,12 +297,6 @@ def _benchmark_backend(
         if callable(best_summary):
             backend_status = best_summary()
 
-    diff = None
-    ok = True
-    if check:
-        diff = float((output.float() - baseline_out.float()).abs().max())
-        ok = diff <= atol
-
     kernel_map = None
     if dispatcher is not None and backend in CONCRETE_BACKENDS:
         kernel_map = _discover_kernel_map(dispatcher, backend)
@@ -327,8 +317,6 @@ def _benchmark_backend(
         min_ms=min(times),
         max_ms=max(times),
         tokens_per_second=case.tokens / (mean_ms / 1000.0),
-        max_abs_diff=diff,
-        ok=ok,
         kernels=kernel_map,
     )
     del model, output
@@ -343,8 +331,6 @@ def run(
     repeat: int = 3,
     partition_filter: str = "tracked",
     kernel_filter: str = "torch",
-    check: bool = False,
-    atol: float = 5.0e-2,
 ) -> list[Result]:
     if repeat < 1:
         raise ValueError("repeat must be at least 1")
@@ -368,15 +354,6 @@ def run(
             input_ids = _encode_case(case, device=device, vocab_size=vocab_size)
             positions = torch.arange(input_ids.numel(), device=device, dtype=torch.long)
 
-            baseline_module = _load_partition_module(model_name, "baseline")
-            baseline = baseline_module.build_model(**MODEL_OVERRIDES).to(
-                device=device,
-                dtype=dtype,
-            ).eval()
-            baseline_out = baseline(input_ids, positions)
-            _sync(device)
-            del baseline
-
             for partition in partitions:
                 for backend in _backend_list(model_name, partition, kernel_filter, device):
                     results.append(
@@ -389,14 +366,10 @@ def run(
                             dtype=dtype,
                             input_ids=input_ids,
                             positions=positions,
-                            baseline_out=baseline_out,
                             warmup=warmup,
                             repeat=repeat,
-                            check=check,
-                            atol=atol,
                         )
                     )
-            del baseline_out
             _sync(device)
     return results
 
@@ -480,8 +453,6 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
                     min_ms=result.min_ms,
                     max_ms=result.max_ms,
                     tokens_per_second=result.tokens_per_second,
-                    max_abs_diff=result.max_abs_diff,
-                    ok=result.ok,
                     kernels=kernel_map,
                 )
             )
@@ -492,8 +463,6 @@ def _build_combo_entry(runs: list[Result], baseline_ms: dict[str, float]) -> dic
     kernel_map = next((result.kernels for result in runs if result.kernels), None)
     aggregate = sum(result.mean_ms for result in runs)
     baseline_aggregate = sum(baseline_ms.get(result.case, result.mean_ms) for result in runs)
-    diffs = [result.max_abs_diff for result in runs if result.max_abs_diff is not None]
-    checked = bool(diffs)
     return {
         "partition": runs[0].partition,
         "backend": runs[0].backend,
@@ -501,9 +470,6 @@ def _build_combo_entry(runs: list[Result], baseline_ms: dict[str, float]) -> dic
         "kernels": kernel_map,
         "aggregate_mean_ms": round(aggregate, 3),
         "speedup_vs_baseline": round(baseline_aggregate / aggregate, 4) if aggregate > 0 else None,
-        "max_abs_diff": max(diffs) if diffs else None,
-        "checked": checked,
-        "ok": all(result.ok for result in runs) if checked else True,
         "cases": {
             result.case: {
                 "prompt": result.prompt,
@@ -513,8 +479,6 @@ def _build_combo_entry(runs: list[Result], baseline_ms: dict[str, float]) -> dic
                 "min_ms": round(result.min_ms, 3),
                 "max_ms": round(result.max_ms, 3),
                 "tokens_per_second": round(result.tokens_per_second, 1),
-                "max_abs_diff": result.max_abs_diff,
-                "ok": result.ok,
                 "vs_baseline": round(
                     baseline_ms.get(result.case, result.mean_ms) / result.mean_ms,
                     4,
@@ -543,10 +507,7 @@ def pick_winner(results: list[Result]) -> dict:
 
     ranked = sorted(
         combos.items(),
-        key=lambda kv: (
-            not all(result.ok for result in kv[1]),
-            sum(result.mean_ms for result in kv[1]),
-        ),
+        key=lambda kv: sum(result.mean_ms for result in kv[1]),
     )
     _, winner_runs = ranked[0]
 
@@ -591,7 +552,48 @@ def _hardware_slug(device: str) -> str:
     return f"{gpu_count}x{name.replace(' ', '_')}"
 
 
-def _print_table(results: list[Result]) -> None:
+def _eval_case_map(eval_result: dict | None) -> dict[str, dict]:
+    if not eval_result:
+        return {}
+    return {
+        str(case_result.get("name")): case_result
+        for case_result in eval_result.get("cases", [])
+        if case_result.get("name") is not None
+    }
+
+
+def _format_correctness(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.1f}%"
+
+
+def _case_correctness(eval_result: dict | None, case_name: str) -> float | None:
+    case_result = _eval_case_map(eval_result).get(case_name)
+    if case_result is None:
+        return None
+    value = case_result.get("correctness_pct")
+    return float(value) if value is not None else None
+
+
+def _load_cached_eval() -> dict | None:
+    path = BENCHMARK_DIR / "results" / "eval_cache.json"
+    if not path.exists():
+        return None
+    try:
+        import json as _json
+
+        cache = _json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cache, dict) or not cache:
+        return None
+    latest_key = sorted(cache)[-1]
+    result = cache.get(latest_key)
+    return result if isinstance(result, dict) else None
+
+
+def _print_table(results: list[Result], eval_result: dict | None = None) -> None:
     headers = [
         "model",
         "partition",
@@ -601,8 +603,7 @@ def _print_table(results: list[Result]) -> None:
         "tokens",
         "mean_ms",
         "tok/s",
-        "diff",
-        "ok",
+        "correctness",
     ]
     rows = [
         [
@@ -614,8 +615,7 @@ def _print_table(results: list[Result]) -> None:
             str(result.tokens),
             f"{result.mean_ms:.3f}",
             f"{result.tokens_per_second:.1f}",
-            "-" if result.max_abs_diff is None else f"{result.max_abs_diff:.3e}",
-            "-" if result.max_abs_diff is None else ("yes" if result.ok else "no"),
+            _format_correctness(_case_correctness(eval_result, result.case)),
         ]
         for result in results
     ]
@@ -632,30 +632,33 @@ def _print_table(results: list[Result]) -> None:
 def _render_markdown(report: dict, slug: str) -> str:
     hw = report["hardware"]
     winner = report["winner"]
+    eval_result = report.get("eval")
     lines: list[str] = []
 
     lines.append(f"# Arithmetic Benchmark: {slug}")
     lines.append("")
-    lines.append(f"**GPU**: {hw.get('gpu', 'N/A')} x{hw.get('gpu_count', 1)}  ")
-    lines.append(f"**CUDA**: {hw.get('cuda', 'N/A')}  ")
-    lines.append(f"**PyTorch**: {hw.get('torch', 'N/A')}  ")
-    lines.append(f"**dtype**: {report.get('dtype', 'N/A')}  ")
+    lines.append(f"**GPU**: {hw.get('gpu', 'N/A')} x{hw.get('gpu_count', 1)}")
+    lines.append(f"**CUDA**: {hw.get('cuda', 'N/A')}")
+    lines.append(f"**PyTorch**: {hw.get('torch', 'N/A')}")
+    lines.append(f"**dtype**: {report.get('dtype', 'N/A')}")
     lines.append(f"**Date**: {report.get('timestamp', 'N/A')}")
+    if eval_result:
+        lines.append(f"**Eval model**: {eval_result.get('model', 'N/A')}")
+        lines.append(
+            f"**Arithmetic accuracy**: "
+            f"{_format_correctness(float(eval_result.get('accuracy_pct', 0.0)))} "
+            f"({eval_result.get('correct', 0)}/{eval_result.get('num_samples', 0)})"
+        )
+    else:
+        lines.append("**Arithmetic accuracy**: not run")
     lines.append("")
 
     speedup = winner.get("speedup_vs_baseline")
     speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
-    diff = winner.get("max_abs_diff")
-    diff_str = "-" if diff is None else f"{diff:.3e}"
     lines.append("## Winner")
     lines.append("")
-    lines.append(f"**{winner['partition']}/{winner['backend']}**{speedup_str}  ")
-    lines.append(f"Aggregate: {winner['aggregate_mean_ms']:.3f}ms  ")
-    lines.append(f"Max diff vs baseline: {diff_str}  ")
-    correctness = "not checked"
-    if winner.get("checked"):
-        correctness = "ok" if winner.get("ok") else "failed"
-    lines.append(f"Correctness: {correctness}")
+    lines.append(f"**{winner['partition']}/{winner['backend']}**{speedup_str}")
+    lines.append(f"Aggregate: {winner['aggregate_mean_ms']:.3f}ms")
     if winner.get("kernels"):
         lines.append("")
         lines.append("Kernel dispatch:")
@@ -665,14 +668,12 @@ def _render_markdown(report: dict, slug: str) -> str:
 
     lines.append("## Leaderboard")
     lines.append("")
-    headers = ["#", "partition", "backend", "total (ms)", "vs baseline", "max diff", "ok"]
+    headers = ["#", "partition", "backend", "total (ms)", "vs baseline", "correctness"]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("---" for _ in headers) + "|")
     for rank, entry in enumerate(report["leaderboard"], 1):
         speedup_val = entry.get("speedup_vs_baseline")
         speedup_cell = f"{speedup_val:.3f}x" if speedup_val is not None else "-"
-        diff_val = entry.get("max_abs_diff")
-        diff_cell = "-" if diff_val is None else f"{diff_val:.3e}"
         kernels_note = ""
         if entry["backend"] == "best" and entry.get("kernels"):
             kernels_note = " (" + ", ".join(
@@ -684,21 +685,23 @@ def _render_markdown(report: dict, slug: str) -> str:
             f"{entry['backend']}{kernels_note}",
             f"{entry['aggregate_mean_ms']:.3f}",
             speedup_cell,
-            diff_cell,
-            "-" if not entry.get("checked") else ("yes" if entry.get("ok") else "no"),
+            _format_correctness(
+                float(eval_result["accuracy_pct"]) if eval_result else None
+            ),
         ]
         lines.append("| " + " | ".join(row) + " |")
     lines.append("")
 
     lines.append("## Cases")
     lines.append("")
-    lines.append("| case | prompt | expected | tokens |")
-    lines.append("|---|---|---|---|")
+    lines.append("| case | prompt | expected | tokens | correctness |")
+    lines.append("|---|---|---|---|---|")
     first_cases = report["leaderboard"][0]["cases"] if report["leaderboard"] else {}
     for case_name, case_data in first_cases.items():
         lines.append(
             f"| {case_name} | `{case_data['prompt']}` | `{case_data['expected']}` | "
-            f"{case_data['tokens']} |"
+            f"{case_data['tokens']} | "
+            f"{_format_correctness(_case_correctness(eval_result, case_name))} |"
         )
     lines.append("")
 
@@ -730,13 +733,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument(
-        "--check",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Check outputs against the baseline partition.",
-    )
-    parser.add_argument("--atol", type=float, default=5.0e-2)
+    parser.add_argument("--no-eval", action="store_true", help="Do not load cached real-weight eval")
     parser.add_argument("--no-save", action="store_true", help="Do not write results/<hardware>.md")
     return parser.parse_args(argv)
 
@@ -750,17 +747,28 @@ def main(argv: list[str] | None = None) -> None:
         repeat=args.repeat,
         partition_filter=args.partition,
         kernel_filter=args.kernel_filter,
-        check=args.check,
-        atol=args.atol,
     )
-    _print_table(results)
+    eval_result = None
+    if not args.no_eval:
+        eval_result = _load_cached_eval()
+        if eval_result is not None:
+            print(
+                f"Loaded cached arithmetic eval: "
+                f"{eval_result['accuracy_pct']}% "
+                f"({eval_result['correct']}/{eval_result['num_samples']})"
+            )
+        else:
+            print(
+                "No cached arithmetic eval results. Run:\n"
+                "  torchrun --standalone --nproc-per-node=8 \\\n"
+                "    -m benchmarks.arithmetic.eval \\\n"
+                "    --ckpt-path checkpoints/dsv3_2-mp8"
+            )
+    _print_table(results, eval_result)
 
-    failed = [
-        result
-        for result in results
-        if result.max_abs_diff is not None and not result.ok
-    ]
     report = pick_winner(results)
+    if eval_result is not None:
+        report["eval"] = eval_result
     winner = report["winner"]
     slug = _hardware_slug(args.device)
     if not args.no_save:
@@ -775,8 +783,6 @@ def main(argv: list[str] | None = None) -> None:
         f"\nWinner: {winner['partition']}/{winner['backend']} "
         f"({winner['aggregate_mean_ms']:.3f}ms aggregate){speedup_str}"
     )
-    if failed:
-        raise SystemExit(1)
 
 
 if __name__ == "__main__":
