@@ -762,24 +762,26 @@ def main(argv: list[str] | None = None) -> None:
             )
     _print_table(results, eval_result)
 
-    report = pick_winner(results)
-    if eval_result is not None:
-        report["eval"] = eval_result
-    winner = report["winner"]
     slug = _hardware_slug(args.device)
-    if not args.no_save:
-        model_name = report["model"]
-        results_dir = BENCHMARK_DIR / "results" / model_name
-        results_dir.mkdir(parents=True, exist_ok=True)
-        results_path = results_dir / f"{slug}.md"
-        results_path.write_text(_render_markdown(report, slug))
-        print(f"Saved to {results_path}")
-    speedup = winner.get("speedup_vs_baseline")
-    speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
-    print(
-        f"\nWinner: {winner['partition']}/{winner['backend']} "
-        f"({winner['aggregate_mean_ms']:.3f}ms aggregate){speedup_str}"
-    )
+    models_in_results = sorted(set(r.model for r in results))
+    for model_name in models_in_results:
+        model_results = [r for r in results if r.model == model_name]
+        report = pick_winner(model_results)
+        if eval_result is not None:
+            report["eval"] = eval_result
+        winner = report["winner"]
+        if not args.no_save:
+            results_dir = BENCHMARK_DIR / "results" / model_name
+            results_dir.mkdir(parents=True, exist_ok=True)
+            results_path = results_dir / f"{slug}.md"
+            results_path.write_text(_render_markdown(report, slug))
+            print(f"Saved to {results_path}")
+        speedup = winner.get("speedup_vs_baseline")
+        speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
+        print(
+            f"\n[{model_name}] Winner: {winner['partition']}/{winner['backend']} "
+            f"({winner['aggregate_mean_ms']:.3f}ms aggregate){speedup_str}"
+        )
 
 
 if __name__ == "__main__":
