@@ -122,7 +122,7 @@ def apply_rotary_emb(
 
 def hadamard_transform(x: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1]
-    return (x.float() @ H[:d, :d].float() * (d ** -0.5)).type_as(x)
+    return (x.float() @ H[:d, :d].to(x.device).float() * (d ** -0.5)).type_as(x)
 
 
 def build_hadamard_matrix(dim: int, device: torch.device) -> torch.Tensor:
