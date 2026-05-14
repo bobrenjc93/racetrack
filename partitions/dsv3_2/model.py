@@ -31,6 +31,9 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return (x_float * scale * weight.float()).to(orig_dtype)
 
 
+_INV_FREQ_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 def rope_cache(
     positions: torch.Tensor,
     rotary_dim: int,
@@ -42,10 +45,13 @@ def rope_cache(
         raise ValueError(f"rotary_dim must be even, got {rotary_dim}")
     device = positions.device
     half = rotary_dim // 2
-    inv_freq = 1.0 / (
-        base
-        ** (torch.arange(0, half, device=device, dtype=torch.float32) / max(half, 1))
-    )
+    cache_key = (half, base, str(device))
+    if cache_key not in _INV_FREQ_CACHE:
+        _INV_FREQ_CACHE[cache_key] = 1.0 / (
+            base
+            ** (torch.arange(0, half, device=device, dtype=torch.float32) / max(half, 1))
+        )
+    inv_freq = _INV_FREQ_CACHE[cache_key]
     freqs = positions.float().unsqueeze(-1) * inv_freq.unsqueeze(0)
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
@@ -109,12 +115,14 @@ def causal_attention(
     v: torch.Tensor,
     *,
     softmax_scale: float | None = None,
+    causal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
     scores = torch.einsum("thd,shd->hts", q.float(), k.float()) * scale
-    tokens = q.shape[0]
-    mask = torch.ones(tokens, tokens, device=q.device, dtype=torch.bool).tril()
-    scores = scores.masked_fill(~mask.unsqueeze(0), -float("inf"))
+    if causal_mask is None:
+        tokens = q.shape[0]
+        causal_mask = torch.ones(tokens, tokens, device=q.device, dtype=torch.bool).tril()
+    scores = scores.masked_fill(~causal_mask.unsqueeze(0), -float("inf"))
     probs = torch.softmax(scores, dim=-1).to(v.dtype)
     return torch.einsum("hts,shd->thd", probs, v)
 
@@ -525,13 +533,12 @@ class RoutedMoE(nn.Module):
         topk_weights = torch.softmax(topk_logits, dim=-1).to(x.dtype)
 
         out = torch.zeros_like(x)
-        for slot in range(self.config.num_experts_per_tok):
-            slot_ids = topk_ids[:, slot]
-            slot_weights = topk_weights[:, slot].unsqueeze(-1)
-            for expert_id, expert in enumerate(self.experts):
-                mask = slot_ids == expert_id
-                if bool(mask.any()):
-                    out[mask] += expert(x[mask]) * slot_weights[mask]
+        for expert_id, expert in enumerate(self.experts):
+            weight = torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
+            for slot in range(self.config.num_experts_per_tok):
+                selected = (topk_ids[:, slot] == expert_id).unsqueeze(-1).to(x.dtype)
+                weight = weight + selected * topk_weights[:, slot : slot + 1]
+            out = out + expert(x) * weight
 
         if self.shared is not None:
             out = out + self.shared(x)
@@ -567,7 +574,7 @@ class FlattenedMLAAttention(nn.Module):
         )
         self.o_proj = nn.Linear(config.num_attention_heads * self.v_head_dim, config.hidden_size, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor, causal_mask: torch.Tensor | None = None) -> torch.Tensor:
         config = self.config
         qkv = self.fused_qkv_a_proj(hidden_states)
         q_c, kv_c, k_pe = qkv.split(
@@ -615,7 +622,7 @@ class FlattenedMLAAttention(nn.Module):
         kv = self.kv_b_proj(kv_c).view(tokens, heads, self.nope_dim + self.v_head_dim)
         k_nope, v = kv.split([self.nope_dim, self.v_head_dim], dim=-1)
         k = torch.cat((k_nope, k_pe.unsqueeze(1).expand(-1, heads, -1)), dim=-1)
-        attn_out = causal_attention(q, k, v)
+        attn_out = causal_attention(q, k, v, causal_mask=causal_mask)
         return self.o_proj(attn_out.reshape(tokens, heads * self.v_head_dim))
 
 
@@ -691,11 +698,12 @@ class FlattenedDeepSeekBlock(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
+        causal_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.config.hc_mult <= 1:
             residual = hidden_states
             x = self.attn_norm(hidden_states)
-            hidden_states = residual + self.attn(x, positions)
+            hidden_states = residual + self.attn(x, positions, causal_mask)
             residual = hidden_states
             x = self.ffn_norm(hidden_states)
             hidden_states = residual + self.ffn(x, input_ids)
@@ -704,7 +712,7 @@ class FlattenedDeepSeekBlock(nn.Module):
         residual = hidden_states
         x = self._hc_head(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm(x)
-        x = self.attn(x, positions)
+        x = self.attn(x, positions, causal_mask)
         hidden_states = hc_post(x, residual, x, self.attn_stream_scale)
 
         residual = hidden_states
@@ -746,6 +754,12 @@ class FlattenedDeepSeekModel(nn.Module):
                 self.register_parameter("hc_head_base", None)
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             self._reset_extra_parameters()
+        max_t = 8192
+        self.register_buffer(
+            "_causal_mask",
+            torch.ones(max_t, max_t, dtype=torch.bool).tril(),
+            persistent=False,
+        )
 
     def _reset_extra_parameters(self) -> None:
         if self.config.hc_mult > 1:
@@ -779,11 +793,13 @@ class FlattenedDeepSeekModel(nn.Module):
             positions = positions.reshape(-1).to(device=flat_input_ids.device, dtype=torch.long)
 
         hidden_states = self.embed_tokens(flat_input_ids)
+        tokens = flat_input_ids.numel()
+        causal_mask = self._causal_mask[:tokens, :tokens]
         if self.config.hc_mult > 1:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, positions, flat_input_ids)
+            hidden_states = layer(hidden_states, positions, flat_input_ids, causal_mask)
 
         if self.config.hc_mult > 1:
             if self.dispatcher is None:

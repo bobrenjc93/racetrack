@@ -106,11 +106,11 @@ def apply_rotary_emb(
 
 def hadamard_transform(x: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1]
-    return (x.float() @ H[:d, :d].to(x.device).float() * (d ** -0.5)).type_as(x)
+    return (x.float() @ H[:d, :d].float() * (d ** -0.5)).type_as(x)
 
 
-def build_hadamard_matrix(dim: int, device: torch.device) -> torch.Tensor:
-    H = torch.tensor([[1.0]], device=device)
+def build_hadamard_matrix(dim: int) -> torch.Tensor:
+    H = torch.tensor([[1.0]])
     while H.shape[0] < dim:
         H = torch.cat([
             torch.cat([H, H], dim=1),
@@ -508,7 +508,7 @@ class Indexer(nn.Module):
 
         self.register_buffer(
             "hadamard_matrix",
-            build_hadamard_matrix(self.head_dim, torch.device("cpu")),
+            build_hadamard_matrix(self.head_dim),
             persistent=False,
         )
         self.register_buffer(
@@ -733,11 +733,12 @@ class RoutedMoE(nn.Module):
         x = x.view(-1, self.config.hidden_size)
         weights, indices = self.gate(x)
         y = torch.zeros_like(x, dtype=torch.float32)
-        for i, expert in enumerate(self.experts):
-            idx, top = torch.where(indices == i)
-            if idx.numel() == 0:
-                continue
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        for expert_id, expert in enumerate(self.experts):
+            weight = torch.zeros(x.shape[0], 1, device=x.device, dtype=weights.dtype)
+            for slot in range(self.config.num_experts_per_tok):
+                selected = (indices[:, slot] == expert_id).unsqueeze(-1).to(weights.dtype)
+                weight = weight + selected * weights[:, slot : slot + 1]
+            y = y + expert(x) * weight
         if self.shared is not None:
             y = y + self.shared(x)
         return y.type_as(x).view(shape)
@@ -807,6 +808,11 @@ class FlattenedDeepSeekModel(nn.Module):
             ),
             persistent=False,
         )
+        self.register_buffer(
+            "_causal_mask",
+            torch.full((config.max_seq_len, config.max_seq_len), float("-inf")).triu_(1),
+            persistent=False,
+        )
 
     @property
     def backend_status(self) -> dict[str, str]:
@@ -832,16 +838,11 @@ class FlattenedDeepSeekModel(nn.Module):
             )
         else:
             positions = positions.reshape(-1).to(device=flat_input_ids.device, dtype=torch.long)
-            start_pos = positions[0].item()
 
         h = self.embed_tokens(flat_input_ids).unsqueeze(0)
 
         freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen].to(h.device)
-        mask = (
-            torch.full((seqlen, seqlen), float("-inf"), device=h.device).triu_(1)
-            if seqlen > 1
-            else None
-        )
+        mask = self._causal_mask[:seqlen, :seqlen] if seqlen > 1 else None
 
         residual = None
         for layer in self.layers:

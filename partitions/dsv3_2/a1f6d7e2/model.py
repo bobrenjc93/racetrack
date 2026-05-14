@@ -43,6 +43,9 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return (x_float * scale * weight.float()).to(orig_dtype)
 
 
+_INV_FREQ_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 def rope_cache(
     positions: torch.Tensor,
     rotary_dim: int,
@@ -54,10 +57,13 @@ def rope_cache(
         raise ValueError(f"rotary_dim must be even, got {rotary_dim}")
     device = positions.device
     half = rotary_dim // 2
-    inv_freq = 1.0 / (
-        base
-        ** (torch.arange(0, half, device=device, dtype=torch.float32) / max(half, 1))
-    )
+    cache_key = (half, base, str(device))
+    if cache_key not in _INV_FREQ_CACHE:
+        _INV_FREQ_CACHE[cache_key] = 1.0 / (
+            base
+            ** (torch.arange(0, half, device=device, dtype=torch.float32) / max(half, 1))
+        )
+    inv_freq = _INV_FREQ_CACHE[cache_key]
     freqs = positions.float().unsqueeze(-1) * inv_freq.unsqueeze(0)
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
@@ -121,12 +127,14 @@ def causal_attention(
     v: torch.Tensor,
     *,
     softmax_scale: float | None = None,
+    causal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
     scores = torch.einsum("thd,shd->hts", q.float(), k.float()) * scale
-    tokens = q.shape[0]
-    mask = torch.ones(tokens, tokens, device=q.device, dtype=torch.bool).tril()
-    scores = scores.masked_fill(~mask.unsqueeze(0), -float("inf"))
+    if causal_mask is None:
+        tokens = q.shape[0]
+        causal_mask = torch.ones(tokens, tokens, device=q.device, dtype=torch.bool).tril()
+    scores = scores.masked_fill(~causal_mask.unsqueeze(0), -float("inf"))
     probs = torch.softmax(scores, dim=-1).to(v.dtype)
     return torch.einsum("hts,shd->thd", probs, v)
 
@@ -522,13 +530,12 @@ class RoutedMoE(nn.Module):
         topk_weights = torch.softmax(topk_logits, dim=-1).to(x.dtype)
 
         out = torch.zeros_like(x)
-        for slot in range(self.config.num_experts_per_tok):
-            slot_ids = topk_ids[:, slot]
-            slot_weights = topk_weights[:, slot].unsqueeze(-1)
-            for expert_id, expert in enumerate(self.experts):
-                mask = slot_ids == expert_id
-                if bool(mask.any()):
-                    out[mask] += expert(x[mask]) * slot_weights[mask]
+        for expert_id, expert in enumerate(self.experts):
+            weight = torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
+            for slot in range(self.config.num_experts_per_tok):
+                selected = (topk_ids[:, slot] == expert_id).unsqueeze(-1).to(x.dtype)
+                weight = weight + selected * topk_weights[:, slot : slot + 1]
+            out = out + expert(x) * weight
 
         if self.shared is not None:
             out = out + self.shared(x)

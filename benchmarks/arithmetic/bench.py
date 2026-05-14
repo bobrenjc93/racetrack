@@ -230,23 +230,16 @@ def _time_forward(
     _sync(device)
 
     if device.type == "cuda":
-        use_graph = True
-        try:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                output = model(input_ids, positions)
-        except Exception:
-            use_graph = False
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = model(input_ids, positions)
 
         times: list[float] = []
         for _ in range(repeat):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            if use_graph:
-                graph.replay()
-            else:
-                output = model(input_ids, positions)
+            graph.replay()
             end.record()
             torch.cuda.synchronize(device)
             times.append(float(start.elapsed_time(end)))
