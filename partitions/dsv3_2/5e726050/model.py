@@ -26,10 +26,11 @@ PARTITION_NOTES = (
 
 FUSED_OP_GRAPH = {
     "fused_attn_norm_qkv": ["attn_norm", "qkv_proj", "split_qkv"],
-    "fused_q_proj_rope": ["rms_norm_q", "q_b_proj", "rope_q", "cat_q"],
-    "fused_kv_proj_assemble": ["rms_norm_kv", "rope_kpe", "kv_b_proj", "split_kv", "cat_k"],
+    "fused_qkv_proj_rope": [
+        "rms_norm_q", "q_b_proj", "rope_q", "cat_q",
+        "rms_norm_kv", "rope_kpe", "kv_b_proj", "split_kv", "cat_k",
+    ],
     "fused_residual_norm": ["res_add_attn", "ffn_norm"],
-    "fused_swiglu": ["swiglu"],
 }
 
 Fallback = Callable[..., Any]
@@ -119,28 +120,10 @@ def fused_attn_norm_qkv(
     return q_c, kv_c, k_pe
 
 
-def fused_q_proj_rope(
+def fused_qkv_proj_rope(
     q_c: torch.Tensor,
     q_norm_weight: torch.Tensor,
     q_b_weight: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    eps: float,
-    num_heads: int,
-    head_dim: int,
-    nope_dim: int,
-    rope_dim: int,
-    rope_base: float,
-) -> torch.Tensor:
-    q_c = rms_norm(q_c, q_norm_weight, eps)
-    tokens = q_c.shape[0]
-    q = F.linear(q_c, q_b_weight).view(tokens, num_heads, head_dim)
-    q_nope, q_pe = q.split([nope_dim, rope_dim], dim=-1)
-    q_pe = apply_rope(q_pe, positions, rotary_dim=rope_dim, base=rope_base)
-    return torch.cat((q_nope, q_pe), dim=-1)
-
-
-def fused_kv_proj_assemble(
     kv_c: torch.Tensor,
     kv_norm_weight: torch.Tensor,
     kv_b_weight: torch.Tensor,
@@ -149,17 +132,27 @@ def fused_kv_proj_assemble(
     *,
     eps: float,
     num_heads: int,
+    head_dim: int,
     nope_dim: int,
+    rope_dim: int,
     v_head_dim: int,
     rope_base: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = q_c.shape[0]
+
+    q_c = rms_norm(q_c, q_norm_weight, eps)
+    q = F.linear(q_c, q_b_weight).view(tokens, num_heads, head_dim)
+    q_nope, q_pe = q.split([nope_dim, rope_dim], dim=-1)
+    q_pe = apply_rope(q_pe, positions, rotary_dim=rope_dim, base=rope_base)
+    q = torch.cat((q_nope, q_pe), dim=-1)
+
     kv_c = rms_norm(kv_c, kv_norm_weight, eps)
     k_pe = apply_rope(k_pe, positions, base=rope_base)
-    tokens = kv_c.shape[0]
     kv = F.linear(kv_c, kv_b_weight).view(tokens, num_heads, nope_dim + v_head_dim)
     k_nope, v = kv.split([nope_dim, v_head_dim], dim=-1)
     k = torch.cat((k_nope, k_pe.unsqueeze(1).expand(-1, num_heads, -1)), dim=-1)
-    return k, v
+
+    return q, k, v
 
 
 def causal_attention(
@@ -664,43 +657,27 @@ class FlattenedMLAAttention(nn.Module):
             )
 
         if self.dispatcher is None:
-            q = fused_q_proj_rope(
+            q, k, v = fused_qkv_proj_rope(
                 q_c, self.q_a_layernorm_weight, self.q_b_proj.weight,
-                positions,
-                eps=config.rms_norm_eps,
-                num_heads=heads, head_dim=config.head_dim,
-                nope_dim=self.nope_dim,
-                rope_dim=config.qk_rope_head_dim,
-                rope_base=config.rope_base,
-            )
-        else:
-            q = self.dispatcher.call(
-                "fused_q_proj_rope", fused_q_proj_rope,
-                q_c, self.q_a_layernorm_weight, self.q_b_proj.weight,
-                positions,
-                eps=config.rms_norm_eps,
-                num_heads=heads, head_dim=config.head_dim,
-                nope_dim=self.nope_dim,
-                rope_dim=config.qk_rope_head_dim,
-                rope_base=config.rope_base,
-            )
-
-        if self.dispatcher is None:
-            k, v = fused_kv_proj_assemble(
                 kv_c, self.kv_a_layernorm_weight, self.kv_b_proj.weight,
                 k_pe, positions,
                 eps=config.rms_norm_eps,
-                num_heads=heads, nope_dim=self.nope_dim,
+                num_heads=heads, head_dim=config.head_dim,
+                nope_dim=self.nope_dim,
+                rope_dim=config.qk_rope_head_dim,
                 v_head_dim=config.head_dim,
                 rope_base=config.rope_base,
             )
         else:
-            k, v = self.dispatcher.call(
-                "fused_kv_proj_assemble", fused_kv_proj_assemble,
+            q, k, v = self.dispatcher.call(
+                "fused_qkv_proj_rope", fused_qkv_proj_rope,
+                q_c, self.q_a_layernorm_weight, self.q_b_proj.weight,
                 kv_c, self.kv_a_layernorm_weight, self.kv_b_proj.weight,
                 k_pe, positions,
                 eps=config.rms_norm_eps,
-                num_heads=heads, nope_dim=self.nope_dim,
+                num_heads=heads, head_dim=config.head_dim,
+                nope_dim=self.nope_dim,
+                rope_dim=config.qk_rope_head_dim,
                 v_head_dim=config.head_dim,
                 rope_base=config.rope_base,
             )

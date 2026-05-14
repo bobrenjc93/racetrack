@@ -71,25 +71,52 @@ def _rope_cache(positions, rotary_dim, *, base, dtype):
     return torch.cos(freqs).to(dtype), torch.sin(freqs).to(dtype)
 
 
-def fused_q_proj_rope(
-    q_c, q_norm_weight, q_b_weight, positions,
-    *, eps, num_heads, head_dim, nope_dim, rope_dim, rope_base, fallback,
-):
-    del fallback
-    q_c = _triton_rms_norm(q_c, q_norm_weight, eps)
-    tokens = q_c.shape[0]
-    q = F.linear(q_c, q_b_weight).view(tokens, num_heads, head_dim)
-    q_nope, q_pe = q.split([nope_dim, rope_dim], dim=-1)
+def _triton_rope_2d(x, positions, rope_base):
+    x_c = x.contiguous()
+    rotary_dim = x_c.shape[-1]
+    cos, sin = _rope_cache(positions, rotary_dim, base=rope_base, dtype=x_c.dtype)
+    out = torch.empty_like(x_c)
+    _rope_kernel[(x_c.shape[0],)](
+        x_c, cos.contiguous(), sin.contiguous(), out,
+        rotary_dim, x_c.stride(0), num_warps=1,
+    )
+    return out
 
-    cos, sin = _rope_cache(positions, rope_dim, base=rope_base, dtype=q_pe.dtype)
+
+def _triton_rope_3d(x, positions, num_heads, rope_dim, rope_base):
     half = rope_dim // 2
-    # Expand cos/sin [T, half] → [T*H, half] so the kernel can index by flat row
+    cos, sin = _rope_cache(positions, rope_dim, base=rope_base, dtype=x.dtype)
     cos_flat = cos.unsqueeze(1).expand(-1, num_heads, -1).reshape(-1, half).contiguous()
     sin_flat = sin.unsqueeze(1).expand(-1, num_heads, -1).reshape(-1, half).contiguous()
-    q_pe_flat = q_pe.reshape(-1, rope_dim).contiguous()
-    out_pe = torch.empty_like(q_pe_flat)
-    _rope_kernel[(q_pe_flat.shape[0],)](
-        q_pe_flat, cos_flat, sin_flat, out_pe,
+    x_flat = x.reshape(-1, rope_dim).contiguous()
+    out = torch.empty_like(x_flat)
+    _rope_kernel[(x_flat.shape[0],)](
+        x_flat, cos_flat, sin_flat, out,
         rope_dim, rope_dim, num_warps=1,
     )
-    return torch.cat((q_nope, out_pe.view_as(q_pe)), dim=-1)
+    return out.view_as(x)
+
+
+def fused_qkv_proj_rope(
+    q_c, q_norm_weight, q_b_weight,
+    kv_c, kv_norm_weight, kv_b_weight,
+    k_pe, positions,
+    *, eps, num_heads, head_dim, nope_dim, rope_dim, v_head_dim, rope_base,
+    fallback,
+):
+    del fallback
+    tokens = q_c.shape[0]
+
+    q_c = _triton_rms_norm(q_c, q_norm_weight, eps)
+    q = F.linear(q_c, q_b_weight).view(tokens, num_heads, head_dim)
+    q_nope, q_pe = q.split([nope_dim, rope_dim], dim=-1)
+    q_pe = _triton_rope_3d(q_pe, positions, num_heads, rope_dim, rope_base)
+    q = torch.cat((q_nope, q_pe), dim=-1)
+
+    kv_c = _triton_rms_norm(kv_c, kv_norm_weight, eps)
+    k_pe = _triton_rope_2d(k_pe, positions, rope_base)
+    kv = F.linear(kv_c, kv_b_weight).view(tokens, num_heads, nope_dim + v_head_dim)
+    k_nope, v = kv.split([nope_dim, v_head_dim], dim=-1)
+    k = torch.cat((k_nope, k_pe.unsqueeze(1).expand(-1, num_heads, -1)), dim=-1)
+
+    return q, k, v

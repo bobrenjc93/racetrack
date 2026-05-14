@@ -27,7 +27,6 @@ PARTITION_NOTES = (
 FUSED_OP_GRAPH = {
     "fused_norm_rope": ["rms_norm_q", "rms_norm_kv", "rope_kpe"],
     "fused_residual_norm": ["res_add_attn", "ffn_norm"],
-    "fused_swiglu": ["swiglu"],
 }
 
 Fallback = Callable[..., Any]
