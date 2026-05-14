@@ -265,7 +265,7 @@ def _build_graph(
         name="ops",
         format="png",
         graph_attr={
-            "rankdir": "LR",
+            "rankdir": "TB",
             "bgcolor": "white",
             "fontname": "Helvetica",
             "fontsize": "16",
