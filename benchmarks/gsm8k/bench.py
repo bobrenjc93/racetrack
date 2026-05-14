@@ -179,37 +179,45 @@ def run(
                 model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
 
                 dispatcher = getattr(model, "dispatcher", None)
+                backend_results: list[Result] = []
 
-                for case_name, tokens in CASES:
-                    input_ids = torch.arange(tokens, device=device, dtype=torch.long) % 4096
-                    positions = torch.arange(tokens, device=device, dtype=torch.long)
+                try:
+                    for case_name, tokens in CASES:
+                        input_ids = torch.arange(tokens, device=device, dtype=torch.long) % 4096
+                        positions = torch.arange(tokens, device=device, dtype=torch.long)
 
-                    times = _time_forward(
-                        model, input_ids, positions,
-                        warmup=warmup, repeat=repeat, device=device,
-                    )
-                    mean_ms = sum(times) / len(times)
+                        times = _time_forward(
+                            model, input_ids, positions,
+                            warmup=warmup, repeat=repeat, device=device,
+                        )
+                        mean_ms = sum(times) / len(times)
 
-                    status = "native"
-                    kernel_map = None
-                    if dispatcher is not None and backend != "torch":
-                        kernel_map = _discover_kernel_map(dispatcher, backend)
+                        status = "native"
+                        kernel_map = None
+                        if dispatcher is not None and backend != "torch":
+                            kernel_map = _discover_kernel_map(dispatcher, backend)
 
-                    results.append(Result(
-                        model=model_name,
-                        partition=partition,
-                        backend=backend,
-                        backend_status=status,
-                        case=case_name,
-                        tokens=tokens,
-                        device=str(device),
-                        dtype=str(dtype).replace("torch.", ""),
-                        mean_ms=mean_ms,
-                        min_ms=min(times),
-                        max_ms=max(times),
-                        tokens_per_second=tokens / (mean_ms / 1000.0),
-                        kernels=kernel_map,
-                    ))
+                        backend_results.append(Result(
+                            model=model_name,
+                            partition=partition,
+                            backend=backend,
+                            backend_status=status,
+                            case=case_name,
+                            tokens=tokens,
+                            device=str(device),
+                            dtype=str(dtype).replace("torch.", ""),
+                            mean_ms=mean_ms,
+                            min_ms=min(times),
+                            max_ms=max(times),
+                            tokens_per_second=tokens / (mean_ms / 1000.0),
+                            kernels=kernel_map,
+                        ))
+                except RuntimeError as exc:
+                    if not str(exc).startswith("No available "):
+                        raise
+                    print(f"Skipping {model_name}/{partition}/{backend}: {exc}")
+                else:
+                    results.extend(backend_results)
 
                 del model
                 _sync(device)
@@ -407,13 +415,13 @@ def _render_markdown(report: dict, slug: str) -> str:
 
     lines.append(f"# GSM8K Benchmark: {slug}")
     lines.append("")
-    lines.append(f"**GPU**: {hw.get('gpu', 'N/A')} x{hw.get('gpu_count', 1)}  ")
-    lines.append(f"**CUDA**: {hw.get('cuda', 'N/A')}  ")
-    lines.append(f"**PyTorch**: {hw.get('torch', 'N/A')}  ")
-    lines.append(f"**dtype**: {report.get('dtype', 'N/A')}  ")
+    lines.append(f"**GPU**: {hw.get('gpu', 'N/A')} x{hw.get('gpu_count', 1)}")
+    lines.append(f"**CUDA**: {hw.get('cuda', 'N/A')}")
+    lines.append(f"**PyTorch**: {hw.get('torch', 'N/A')}")
+    lines.append(f"**dtype**: {report.get('dtype', 'N/A')}")
     lines.append(f"**Date**: {report.get('timestamp', 'N/A')}")
     if eval_result:
-        lines.append(f"**Eval model**: {eval_result['model']}  ")
+        lines.append(f"**Eval model**: {eval_result['model']}")
         lines.append(
             f"**GSM8K accuracy**: {eval_result['accuracy_pct']}% "
             f"({eval_result['correct']}/{eval_result['num_samples']})"
@@ -424,7 +432,7 @@ def _render_markdown(report: dict, slug: str) -> str:
     lines.append("")
     speedup = winner.get("speedup_vs_baseline")
     speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
-    lines.append(f"**{winner['partition']}/{winner['backend']}**{speedup_str}  ")
+    lines.append(f"**{winner['partition']}/{winner['backend']}**{speedup_str}")
     lines.append(f"Aggregate: {winner['aggregate_mean_ms']:.1f}ms")
     if winner.get("kernels"):
         lines.append("")

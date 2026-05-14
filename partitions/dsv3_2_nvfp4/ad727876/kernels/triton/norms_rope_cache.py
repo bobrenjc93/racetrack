@@ -14,6 +14,43 @@ except Exception:
     BACKEND_AVAILABLE = False
 
 
+_FLOAT_TENSOR_CACHE = {}
+
+
+def _cached_float_tensor(tensor):
+    if tensor.dtype == torch.float32:
+        return tensor
+    if torch.is_grad_enabled():
+        return tensor.float()
+    key = (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.device),
+        getattr(tensor, "_version", 0),
+    )
+    cached = _FLOAT_TENSOR_CACHE.get(key)
+    if cached is None:
+        cached = tensor.float().contiguous()
+        _FLOAT_TENSOR_CACHE[key] = cached
+    return cached
+
+
+def _hadamard_transform(x, H):
+    d = x.shape[-1]
+    return (x.float() @ _cached_float_tensor(H)[:d, :d] * (d ** -0.5)).type_as(x)
+
+
+def _act_quant_unit_scale(x, block_size, act_quant):
+    if x.size(-1) % block_size == 0:
+        return act_quant(x, block_size)
+    try:
+        return x.contiguous().to(torch.float8_e4m3fn), None
+    except RuntimeError:
+        return x.float(), None
+
+
 if BACKEND_AVAILABLE:
 
     @triton.jit
@@ -153,7 +190,7 @@ def fused_norms_rope_cache(
     ) if False else None
 
     from partitions.dsv3_2_nvfp4.ad727876.model import (
-        apply_rotary_emb, layer_norm, hadamard_transform, act_quant,
+        apply_rotary_emb, act_quant,
     )
 
     k_pe_roped = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, interleaved=True)
@@ -166,9 +203,12 @@ def fused_norms_rope_cache(
     )
     idx_k_pe = apply_rotary_emb(idx_k_pe.unsqueeze(2), freqs_cis, interleaved=False).squeeze(2)
     idx_k = torch.cat([idx_k_pe, idx_k_nope], dim=-1)
-    idx_k = hadamard_transform(idx_k, H)
-    idx_k_fp8, idx_k_scale = act_quant(idx_k, block_size)
+    idx_k = _hadamard_transform(idx_k, H)
+    idx_k_fp8, idx_k_scale = _act_quant_unit_scale(idx_k, block_size, act_quant)
     idx_k_cache[:bsz, start_pos:end_pos] = idx_k_fp8.float()
-    idx_k_scale_cache[:bsz, start_pos:end_pos] = idx_k_scale
+    if idx_k_scale is None:
+        idx_k_scale_cache[:bsz, start_pos:end_pos] = 1.0
+    else:
+        idx_k_scale_cache[:bsz, start_pos:end_pos] = idx_k_scale
 
     return qr
