@@ -51,6 +51,8 @@ def _stream(device: torch.device):
 
 if BACKEND_AVAILABLE:
 
+    BLOCK_SIZE = 256
+
     @cute.kernel
     def _rms_norm_kernel(
         x: cute.Tensor,
@@ -61,16 +63,34 @@ if BACKEND_AVAILABLE:
         eps: cutlass.Float32,
     ):
         row, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        smem_ptr = cute.arch.alloc_smem(cutlass.Float32, BLOCK_SIZE)
         if row < rows:
-            sum_sq = cutlass.Float32(0.0)
-            for col in cutlass.range(cols):
+            local_sum = cutlass.Float32(0.0)
+            col = tid
+            while col < cols:
                 value = x[row, col].to(cutlass.Float32)
-                sum_sq += value * value
-            scale = cute.math.rsqrt(sum_sq / cols + eps)
-            for col in cutlass.range(cols):
+                local_sum += value * value
+                col += BLOCK_SIZE
+            cute.arch.store(smem_ptr + tid, local_sum)
+            cute.arch.sync_threads()
+            stride = BLOCK_SIZE // 2
+            while stride > 0:
+                if tid < stride:
+                    a = cute.arch.load(smem_ptr + tid, cutlass.Float32)
+                    b = cute.arch.load(smem_ptr + tid + stride, cutlass.Float32)
+                    cute.arch.store(smem_ptr + tid, a + b)
+                cute.arch.sync_threads()
+                stride = stride // 2
+            total = cute.arch.load(smem_ptr, cutlass.Float32)
+            scale = cute.math.rsqrt(total / cols + eps)
+            cute.arch.sync_threads()
+            col = tid
+            while col < cols:
                 value = x[row, col].to(cutlass.Float32)
                 w = weight[col].to(cutlass.Float32)
                 out[row, col] = (value * scale * w).to(out.element_type)
+                col += BLOCK_SIZE
 
     @cute.jit
     def _rms_norm_host(
@@ -84,7 +104,7 @@ if BACKEND_AVAILABLE:
     ):
         _rms_norm_kernel(x, weight, out, rows, cols, eps).launch(
             grid=[rows, 1, 1],
-            block=[1, 1, 1],
+            block=[BLOCK_SIZE, 1, 1],
             stream=stream,
         )
 
@@ -98,15 +118,18 @@ if BACKEND_AVAILABLE:
         rotary_dim: cutlass.Int32,
     ):
         row, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
         if row < rows:
             half = rotary_dim // 2
-            for col in cutlass.range(half):
+            col = tid
+            while col < half:
                 c = cos[row, col]
                 s = sin[row, col]
                 x1 = x[row, col]
                 x2 = x[row, col + half]
                 out[row, col] = x1 * c - x2 * s
                 out[row, col + half] = x2 * c + x1 * s
+                col += BLOCK_SIZE
 
     @cute.jit
     def _rope_host(
@@ -120,7 +143,111 @@ if BACKEND_AVAILABLE:
     ):
         _rope_kernel(x, cos, sin, out, rows, rotary_dim).launch(
             grid=[rows, 1, 1],
-            block=[1, 1, 1],
+            block=[BLOCK_SIZE, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def _residual_norm_kernel(
+        residual: cute.Tensor,
+        update: cute.Tensor,
+        weight: cute.Tensor,
+        out_hidden: cute.Tensor,
+        out_normed: cute.Tensor,
+        rows: cutlass.Int32,
+        cols: cutlass.Int32,
+        eps: cutlass.Float32,
+    ):
+        row, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        smem_ptr = cute.arch.alloc_smem(cutlass.Float32, BLOCK_SIZE)
+        if row < rows:
+            local_sum = cutlass.Float32(0.0)
+            col = tid
+            while col < cols:
+                hidden = (
+                    residual[row, col].to(cutlass.Float32)
+                    + update[row, col].to(cutlass.Float32)
+                )
+                out_hidden[row, col] = hidden.to(out_hidden.element_type)
+                local_sum += hidden * hidden
+                col += BLOCK_SIZE
+            cute.arch.store(smem_ptr + tid, local_sum)
+            cute.arch.sync_threads()
+            stride = BLOCK_SIZE // 2
+            while stride > 0:
+                if tid < stride:
+                    a = cute.arch.load(smem_ptr + tid, cutlass.Float32)
+                    b = cute.arch.load(smem_ptr + tid + stride, cutlass.Float32)
+                    cute.arch.store(smem_ptr + tid, a + b)
+                cute.arch.sync_threads()
+                stride = stride // 2
+            total = cute.arch.load(smem_ptr, cutlass.Float32)
+            scale = cute.math.rsqrt(total / cols + eps)
+            cute.arch.sync_threads()
+            col = tid
+            while col < cols:
+                hidden = out_hidden[row, col].to(cutlass.Float32)
+                w = weight[col].to(cutlass.Float32)
+                out_normed[row, col] = (hidden * scale * w).to(out_normed.element_type)
+                col += BLOCK_SIZE
+
+    @cute.jit
+    def _silu(value):
+        return value / (cutlass.Float32(1.0) + cute.math.exp(-value))
+
+    @cute.kernel
+    def _swiglu_kernel(
+        gate: cute.Tensor,
+        up: cute.Tensor,
+        out: cute.Tensor,
+        n_elements: cutlass.Int32,
+        cols: cutlass.Int32,
+    ):
+        bid, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        idx = bid * BLOCK_SIZE + tid
+        if idx < n_elements:
+            row = idx // cols
+            col = idx - row * cols
+            gate_value = gate[row, col].to(cutlass.Float32)
+            up_value = up[row, col].to(cutlass.Float32)
+            out[row, col] = (_silu(gate_value) * up_value).to(out.element_type)
+
+    @cute.jit
+    def _residual_norm_host(
+        residual: cute.Tensor,
+        update: cute.Tensor,
+        weight: cute.Tensor,
+        out_hidden: cute.Tensor,
+        out_normed: cute.Tensor,
+        rows: cutlass.Int32,
+        cols: cutlass.Int32,
+        eps: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        _residual_norm_kernel(
+            residual, update, weight, out_hidden, out_normed,
+            rows, cols, eps,
+        ).launch(
+            grid=[rows, 1, 1],
+            block=[BLOCK_SIZE, 1, 1],
+            stream=stream,
+        )
+
+    @cute.jit
+    def _swiglu_host(
+        gate: cute.Tensor,
+        up: cute.Tensor,
+        out: cute.Tensor,
+        n_elements: cutlass.Int32,
+        cols: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        n_blocks = (n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
+        _swiglu_kernel(gate, up, out, n_elements, cols).launch(
+            grid=[n_blocks, 1, 1],
+            block=[BLOCK_SIZE, 1, 1],
             stream=stream,
         )
 
@@ -132,7 +259,7 @@ def _compiled_rms_norm(
 ):
     _cutlass_dtype(x.dtype)
     rows, cols = x.shape
-    key = ("rms_norm", str(x.device), x.dtype, rows, cols)
+    key = ("rms_norm_v2", str(x.device), x.dtype, rows, cols)
     if key not in _COMPILE_CACHE:
         stream = _stream(x.device)
         _COMPILE_CACHE[key] = cute.compile(
@@ -167,6 +294,56 @@ def _compiled_rope(
             _cute_tensor(out),
             cutlass.Int32(rows),
             cutlass.Int32(rotary_dim),
+            stream,
+        )
+    return _COMPILE_CACHE[key]
+
+
+def _compiled_residual_norm(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    weight: torch.Tensor,
+    out_hidden: torch.Tensor,
+    out_normed: torch.Tensor,
+):
+    _cutlass_dtype(residual.dtype)
+    rows, cols = residual.shape
+    key = ("fused_residual_norm_v2", str(residual.device), residual.dtype, rows, cols)
+    if key not in _COMPILE_CACHE:
+        stream = _stream(residual.device)
+        _COMPILE_CACHE[key] = cute.compile(
+            _residual_norm_host,
+            _cute_tensor(residual),
+            _cute_tensor(update),
+            _cute_tensor(weight),
+            _cute_tensor(out_hidden),
+            _cute_tensor(out_normed),
+            cutlass.Int32(rows),
+            cutlass.Int32(cols),
+            cutlass.Float32(1.0e-6),
+            stream,
+        )
+    return _COMPILE_CACHE[key]
+
+
+def _compiled_swiglu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    out: torch.Tensor,
+):
+    _cutlass_dtype(gate.dtype)
+    rows, cols = gate.shape
+    n_elements = rows * cols
+    key = ("fused_swiglu_v2", str(gate.device), gate.dtype, rows, cols)
+    if key not in _COMPILE_CACHE:
+        stream = _stream(gate.device)
+        _COMPILE_CACHE[key] = cute.compile(
+            _swiglu_host,
+            _cute_tensor(gate),
+            _cute_tensor(up),
+            _cute_tensor(out),
+            cutlass.Int32(n_elements),
+            cutlass.Int32(cols),
             stream,
         )
     return _COMPILE_CACHE[key]
@@ -256,3 +433,77 @@ def fused_norm_rope(
         _rms_norm_cutedsl(kv_c, kv_weight, eps),
         _apply_rope_cutedsl(k_pe, positions, rope_base=rope_base),
     )
+
+
+def fused_residual_norm(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    eps: float,
+    fallback,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del fallback
+    _require_cutedsl_cuda(residual, update, norm_weight)
+    if residual.dim() != 2 or update.dim() != 2:
+        raise RuntimeError("CUTEDSL fused_residual_norm expects 2D tensors")
+    if residual.shape != update.shape:
+        raise RuntimeError("CUTEDSL residual and update shapes must match")
+    if norm_weight.dim() != 1 or norm_weight.shape[0] != residual.shape[-1]:
+        raise RuntimeError("CUTEDSL norm weight shape must match hidden dimension")
+    residual = residual.contiguous()
+    update = update.contiguous()
+    norm_weight = norm_weight.contiguous()
+    out_hidden = torch.empty_like(residual)
+    out_normed = torch.empty_like(residual)
+    rows, cols = residual.shape
+    compiled = _compiled_residual_norm(
+        residual,
+        update,
+        norm_weight,
+        out_hidden,
+        out_normed,
+    )
+    stream = _stream(residual.device)
+    compiled(
+        _cute_tensor(residual),
+        _cute_tensor(update),
+        _cute_tensor(norm_weight),
+        _cute_tensor(out_hidden),
+        _cute_tensor(out_normed),
+        cutlass.Int32(rows),
+        cutlass.Int32(cols),
+        cutlass.Float32(float(eps)),
+        stream,
+    )
+    return out_hidden, out_normed
+
+
+def fused_swiglu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    fallback,
+) -> torch.Tensor:
+    del fallback
+    _require_cutedsl_cuda(gate, up)
+    if gate.dim() != 2 or up.dim() != 2:
+        raise RuntimeError("CUTEDSL fused_swiglu expects 2D tensors")
+    if gate.shape != up.shape:
+        raise RuntimeError("CUTEDSL fused_swiglu inputs must have matching shapes")
+    gate = gate.contiguous()
+    up = up.contiguous()
+    out = torch.empty_like(gate)
+    rows, cols = gate.shape
+    n_elements = rows * cols
+    compiled = _compiled_swiglu(gate, up, out)
+    stream = _stream(gate.device)
+    compiled(
+        _cute_tensor(gate),
+        _cute_tensor(up),
+        _cute_tensor(out),
+        cutlass.Int32(n_elements),
+        cutlass.Int32(cols),
+        stream,
+    )
+    return out

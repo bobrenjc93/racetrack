@@ -149,14 +149,24 @@ def run(
     dtype_str: str = "auto",
     warmup: int = 10,
     repeat: int = 30,
+    partition_filter: str = "all",
+    backend_filter: str = "all",
 ) -> list[Result]:
     device = torch.device(device_str)
     dtype = _resolve_dtype(dtype_str, device)
 
     results: list[Result] = []
     for model_name in MODELS:
-        for partition in _discover_partitions(model_name):
-            backends = ["torch"] if partition == "baseline" else list(BACKENDS)
+        all_partitions = _discover_partitions(model_name)
+        if partition_filter != "all":
+            all_partitions = [p for p in all_partitions if p in partition_filter.split(",")]
+            if not all_partitions:
+                raise KeyError(f"No partitions matched filter {partition_filter!r}")
+        for partition in all_partitions:
+            if backend_filter == "all":
+                backends = ["torch"] if partition == "baseline" else list(BACKENDS)
+            else:
+                backends = backend_filter.split(",")
             for backend in backends:
                 os.environ["RACETRACK_KERNEL_BACKEND"] = backend
                 module = _load_partition_module(model_name, partition)
@@ -472,6 +482,8 @@ def main() -> None:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
+    parser.add_argument("--partition", default="all", help="all, baseline, or comma-separated hashes")
+    parser.add_argument("--backend", default="all", help="all, or comma-separated: torch,triton,cutedsl,helion")
     parser.add_argument("--no-eval", action="store_true", help="Skip GSM8K accuracy eval")
     args = parser.parse_args()
 
@@ -494,7 +506,7 @@ def main() -> None:
                   "    -m benchmarks.gsm8k.eval \\\n"
                   "    --ckpt-path checkpoints/dsv3_2-mp8")
 
-    results = run(args.device, args.dtype, args.warmup, args.repeat)
+    results = run(args.device, args.dtype, args.warmup, args.repeat, args.partition, args.backend)
     _print_table(results)
 
     report = pick_winner(results)
