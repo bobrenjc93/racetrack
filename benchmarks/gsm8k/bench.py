@@ -28,7 +28,7 @@ from pathlib import Path
 import torch
 
 BENCHMARK_DIR = Path(__file__).parent
-MODELS = ("dsv3_2",)
+MODELS = ("dsv3_2", "dsv3_2_nvfp4")
 BACKENDS = ("torch", "triton", "cutedsl", "helion")
 
 CASES: list[tuple[str, int]] = [
@@ -514,8 +514,9 @@ def main() -> None:
         report["eval"] = eval_result
     winner = report["winner"]
     slug = _hardware_slug(args.device)
-    results_dir = BENCHMARK_DIR / "results"
-    results_dir.mkdir(exist_ok=True)
+    model_name = report["model"]
+    results_dir = BENCHMARK_DIR / "results" / model_name
+    results_dir.mkdir(parents=True, exist_ok=True)
     results_path = results_dir / f"{slug}.md"
     md = _render_markdown(report, slug)
     results_path.write_text(md)

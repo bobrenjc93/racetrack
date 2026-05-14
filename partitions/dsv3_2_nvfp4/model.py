@@ -54,7 +54,7 @@ def layer_norm(
     dim: int,
     eps: float,
 ) -> torch.Tensor:
-    return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
+    return F.layer_norm(x.float(), (dim,), weight.float(), bias.float(), eps).type_as(x)
 
 
 def precompute_freqs_cis(
@@ -560,7 +560,7 @@ class Indexer(nn.Module):
         self.k_cache[:bsz, start_pos:end_pos] = k_fp8.float()
         self.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
 
-        weights = self.weights_proj(x.float()) * self.n_heads ** -0.5
+        weights = F.linear(x.float(), self.weights_proj.weight.float()) * self.n_heads ** -0.5
         weights = (weights.unsqueeze(-1) * q_scale * self.softmax_scale).squeeze(-1)
 
         k_s = self.k_scale_cache[:bsz, :end_pos].squeeze(-1).contiguous()

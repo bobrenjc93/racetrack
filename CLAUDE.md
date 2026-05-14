@@ -15,8 +15,8 @@ benchmark workload.
   backend-specific implementation of a dispatchable op. Each file exports
   `BACKEND_AVAILABLE: bool` and one or more op functions.
 - **Benchmark**: `benchmarks/<name>/` -- a folder with `bench.py` (runner)
-  and `results/<hardware>.json` (results per hardware config, e.g.
-  `results/8xh100.json`). Run with `python -m benchmarks.<name>.bench`.
+  and `results/<model>/<hardware>.md` (results per model + hardware config,
+  e.g. `results/dsv3_2/8xh100.md`). Run with `python -m benchmarks.<name>.bench`.
 
 ## Creating a new partition
 
@@ -84,9 +84,9 @@ python -m racetrack.bench --partition all --kernel-filter all --benchmark smoke
 ```
 
 After a benchmark run:
-- `benchmarks/<name>/results/<hardware>.json` has the winner, full leaderboard,
-  baseline comparison, and hardware info. The hardware slug is auto-detected
-  (e.g., `8xh100.json`). These files are committed.
+- `benchmarks/<name>/results/<model>/<hardware>.md` has the winner, full
+  leaderboard, baseline comparison, and hardware info. The hardware slug is
+  auto-detected (e.g., `results/dsv3_2/8xh100.md`). These files are committed.
 - `partitions/<model>/<hash>/kernels/best.json` is a runtime cache for per-op
   backend winners (gitignored, not committed -- hardware-specific).
 
@@ -102,7 +102,7 @@ The workflow for improving performance:
    - Create a new partition with different fusion boundaries
    - Write better kernel implementations for existing ops
 5. Re-run the benchmark
-6. Commit `results/<hardware>.json` when a partition beats baseline
+6. Commit `results/<model>/<hardware>.md` when a partition beats baseline
 
 ## Partition files are self-contained
 

@@ -29,7 +29,7 @@ from pathlib import Path
 import torch
 
 BENCHMARK_DIR = Path(__file__).parent
-MODELS = ("dsv3_2",)
+MODELS = ("dsv3_2", "dsv3_2_nvfp4")
 CONCRETE_BACKENDS = ("triton", "cutedsl", "helion")
 KERNEL_FILTERS = (
     "available",
@@ -768,8 +768,9 @@ def main(argv: list[str] | None = None) -> None:
     winner = report["winner"]
     slug = _hardware_slug(args.device)
     if not args.no_save:
-        results_dir = BENCHMARK_DIR / "results"
-        results_dir.mkdir(exist_ok=True)
+        model_name = report["model"]
+        results_dir = BENCHMARK_DIR / "results" / model_name
+        results_dir.mkdir(parents=True, exist_ok=True)
         results_path = results_dir / f"{slug}.md"
         results_path.write_text(_render_markdown(report, slug))
         print(f"Saved to {results_path}")

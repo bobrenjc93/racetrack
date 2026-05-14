@@ -16,7 +16,7 @@ from benchmarks import get_cases
 
 CONCRETE_KERNEL_BACKENDS = ("triton", "cutedsl", "helion")
 BACKENDS = ("torch", "triton", "cutedsl", "helion", "best", "all")
-MODELS = ("dsv3_2",)
+MODELS = ("dsv3_2", "dsv3_2_nvfp4")
 
 
 @dataclass

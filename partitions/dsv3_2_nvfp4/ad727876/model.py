@@ -70,7 +70,7 @@ def layer_norm(
     dim: int,
     eps: float,
 ) -> torch.Tensor:
-    return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
+    return F.layer_norm(x.float(), (dim,), weight.float(), bias.float(), eps).type_as(x)
 
 
 def precompute_freqs_cis(
