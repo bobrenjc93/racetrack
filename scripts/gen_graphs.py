@@ -26,49 +26,44 @@ PARTITIONS_DIR = PROJECT_ROOT / "partitions" / "dsv3_2"
 
 # ── Graph definition ─────────────────────────────────────────────────────
 #
-# Each node: (id, label, category)
-# Categories control color: "io", "linear", "norm", "rope", "attn",
-#                            "moe", "activation", "residual", "misc"
+# Each node: (id, label)
+# All nodes are drawn as uniform light-gray boxes.
 
 NODES = [
-    ("input_ids",        "input_ids",                "io"),
-    ("embed",            "Embedding",                "linear"),
-    ("layer_start",      "× num_layers",             "misc"),
-    ("attn_norm",        "RMSNorm\n(attn_norm)",     "norm"),
-    ("qkv_proj",         "Linear\n(fused_qkv_a)",    "linear"),
-    ("split_qkv",        "split →\nq_c, kv_c, k_pe", "misc"),
-    ("rms_norm_q",       "RMSNorm\n(q_c)",           "norm"),
-    ("rms_norm_kv",      "RMSNorm\n(kv_c)",          "norm"),
-    ("rope_kpe",         "RoPE\n(k_pe)",             "rope"),
-    ("q_b_proj",         "Linear\n(q_b_proj)",       "linear"),
-    ("rope_q",           "RoPE\n(q_pe)",             "rope"),
-    ("cat_q",            "cat → q",                  "misc"),
-    ("kv_b_proj",        "Linear\n(kv_b_proj)",      "linear"),
-    ("split_kv",         "split →\nk_nope, v",       "misc"),
-    ("cat_k",            "cat → k",                  "misc"),
-    ("causal_attn",      "causal_attention\n(einsum + mask\n+ softmax + einsum)", "attn"),
-    ("o_proj",           "Linear\n(o_proj)",          "linear"),
-    ("res_add_attn",     "residual add",             "residual"),
-    ("ffn_norm",         "RMSNorm\n(ffn_norm)",      "norm"),
-    ("gate_router",      "Linear\n(gate / router)",  "moe"),
-    ("topk_softmax",     "topk + softmax",           "moe"),
-    ("expert_start",     "× per expert",             "misc"),
-    ("w1_proj",          "Linear (w1)\ngate proj",   "linear"),
-    ("w3_proj",          "Linear (w3)\nup proj",     "linear"),
-    ("swiglu",           "SiLU(gate) × up\n(swiglu)", "activation"),
-    ("w2_proj",          "Linear (w2)\ndown proj",   "linear"),
-    ("expert_end",       "expert sum",               "misc"),
-    ("res_add_ffn",      "residual add",             "residual"),
-    ("layer_end",        "end layer",                "misc"),
-    ("final_norm",       "RMSNorm\n(final)",         "norm"),
-    ("lm_head",          "Linear\n(lm_head)",        "linear"),
-    ("logits",           "logits",                   "io"),
+    ("input_ids",        "input_ids"),
+    ("embed",            "Embedding"),
+    ("attn_norm",        "Attn RMS"),
+    ("qkv_proj",         "QKV A Proj"),
+    ("split_qkv",        "Split"),
+    ("rms_norm_q",       "Q RMS"),
+    ("rms_norm_kv",      "KV C RMS"),
+    ("rope_kpe",         "KV RoPE"),
+    ("q_b_proj",         "Q B Proj"),
+    ("rope_q",           "Q RoPE"),
+    ("cat_q",            "Cat Q"),
+    ("kv_b_proj",        "KV B Proj"),
+    ("split_kv",         "Split KV"),
+    ("cat_k",            "Cat K"),
+    ("causal_attn",      "Causal Attention"),
+    ("o_proj",           "O Proj"),
+    ("res_add_attn",     "Add + Residual"),
+    ("ffn_norm",         "FFN RMS"),
+    ("gate_router",      "Gate Router"),
+    ("topk_softmax",     "TopK + Softmax"),
+    ("w1_proj",          "W1 (gate)"),
+    ("w3_proj",          "W3 (up)"),
+    ("swiglu",           "SwiGLU"),
+    ("w2_proj",          "W2 (down)"),
+    ("expert_sum",       "Expert Sum"),
+    ("res_add_ffn",      "Add + Residual"),
+    ("final_norm",       "Final RMS"),
+    ("lm_head",          "LM Head"),
+    ("logits",           "logits"),
 ]
 
 EDGES = [
     ("input_ids",    "embed"),
-    ("embed",        "layer_start"),
-    ("layer_start",  "attn_norm"),
+    ("embed",        "attn_norm"),
     ("attn_norm",    "qkv_proj"),
     ("qkv_proj",     "split_qkv"),
     ("split_qkv",   "rms_norm_q"),
@@ -83,102 +78,96 @@ EDGES = [
     ("rope_kpe",    "cat_k"),
     ("cat_q",       "causal_attn"),
     ("cat_k",       "causal_attn"),
-    ("split_kv",    "causal_attn", "v"),
+    ("split_kv",    "causal_attn"),
     ("causal_attn", "o_proj"),
     ("o_proj",      "res_add_attn"),
-    ("layer_start", "res_add_attn", "residual"),
+    ("embed",       "res_add_attn"),
     ("res_add_attn","ffn_norm"),
     ("ffn_norm",    "gate_router"),
-    ("ffn_norm",    "expert_start"),
     ("gate_router", "topk_softmax"),
-    ("topk_softmax","expert_start"),
-    ("expert_start","w1_proj"),
-    ("expert_start","w3_proj"),
+    ("topk_softmax","w1_proj"),
+    ("topk_softmax","w3_proj"),
+    ("ffn_norm",    "w1_proj"),
+    ("ffn_norm",    "w3_proj"),
     ("w1_proj",     "swiglu"),
     ("w3_proj",     "swiglu"),
     ("swiglu",      "w2_proj"),
-    ("w2_proj",     "expert_end"),
-    ("expert_end",  "res_add_ffn"),
-    ("res_add_attn","res_add_ffn", "residual"),
-    ("res_add_ffn", "layer_end"),
-    ("layer_end",   "final_norm"),
+    ("w2_proj",     "expert_sum"),
+    ("expert_sum",  "res_add_ffn"),
+    ("res_add_attn","res_add_ffn"),
+    ("res_add_ffn", "final_norm"),
     ("final_norm",  "lm_head"),
     ("lm_head",     "logits"),
 ]
 
-CATEGORY_COLORS = {
-    "io":         ("#E8F5E9", "#2E7D32"),
-    "linear":     ("#E3F2FD", "#1565C0"),
-    "norm":       ("#FFF3E0", "#E65100"),
-    "rope":       ("#F3E5F5", "#6A1B9A"),
-    "attn":       ("#FCE4EC", "#AD1457"),
-    "moe":        ("#E0F7FA", "#00695C"),
-    "activation": ("#FFF9C4", "#F57F17"),
-    "residual":   ("#EFEBE9", "#4E342E"),
-    "misc":       ("#F5F5F5", "#616161"),
-}
-
-# ── Fused-op → node groups ───────────────────────────────────────────────
+# ── Fused-op cluster styling ──────────────────────────────────────────────
 #
-# Maps dispatcher op names to the set of graph node IDs they fuse together.
-# The script draws a colored cluster box around each group.
-
-FUSED_OP_NODES = {
-    "fused_norm_rope": {
-        "label": "fused_norm_rope\n(2× RMSNorm + RoPE)",
-        "color": "#D32F2F",
-        "nodes": ["rms_norm_q", "rms_norm_kv", "rope_kpe"],
-    },
-    "fused_residual_norm": {
-        "label": "fused_residual_norm\n(residual add + RMSNorm)",
-        "color": "#1976D2",
-        "nodes": ["res_add_attn", "ffn_norm"],
-    },
-    "fused_swiglu": {
-        "label": "fused_swiglu\n(SiLU × up)",
-        "color": "#388E3C",
-        "nodes": ["swiglu"],
-    },
-    "hc_head": {
-        "label": "hc_head\n(hydra-head mixing)",
-        "color": "#7B1FA2",
-        "nodes": [],
-    },
-}
+# The mapping from fused op → graph node IDs lives in each partition's
+# model.py as FUSED_OP_GRAPH.  The script reads that dict and draws a
+# colored cluster box around each group.
 
 CLUSTER_COLORS = [
-    "#D32F2F", "#1976D2", "#388E3C", "#F57C00",
+    "#CC0000", "#1976D2", "#2E7D32", "#E65100",
     "#7B1FA2", "#00838F", "#C62828", "#283593",
 ]
 
+NODE_IDS = {nid for nid, _ in NODES}
 
-def _detect_dispatched_ops(model_py: Path) -> list[str]:
-    """Parse a partition model.py and return a list of dispatcher op names.
+
+def _read_fused_op_graph(model_py: Path) -> dict[str, list[str]]:
+    """Read FUSED_OP_GRAPH from a partition model.py.
 
     If the partition delegates to partition_common (which uses the 3336cdbd
-    model), follow that chain to find the actual dispatched ops.
+    model), follow that chain to read from the base partition.
     """
     if not model_py.exists():
-        return []
+        return {}
     text = model_py.read_text()
-    ops = sorted(set(re.findall(r'dispatcher\.call\(\s*["\'](\w+)["\']', text)))
-    if ops:
-        return ops
+
+    graph = _parse_fused_op_graph(text)
+    if graph:
+        return graph
+
     if "partition_common" in text:
         base_model = PARTITIONS_DIR / "3336cdbd" / "model.py"
         if base_model.exists():
-            base_text = base_model.read_text()
-            return sorted(
-                set(re.findall(r'dispatcher\.call\(\s*["\'](\w+)["\']', base_text))
-            )
-    return []
+            return _parse_fused_op_graph(base_model.read_text())
+
+    return {}
+
+
+def _parse_fused_op_graph(text: str) -> dict[str, list[str]]:
+    """Extract FUSED_OP_GRAPH dict from Python source text."""
+    m = re.search(
+        r"FUSED_OP_GRAPH\s*=\s*(\{.*?\})\s*\n",
+        text,
+        re.DOTALL,
+    )
+    if not m:
+        return {}
+    try:
+        result = eval(m.group(1))  # noqa: S307
+    except Exception:
+        return {}
+    if not isinstance(result, dict):
+        return {}
+    for op_name, nodes in result.items():
+        for nid in nodes:
+            if nid not in NODE_IDS:
+                print(f"  WARNING: FUSED_OP_GRAPH[{op_name!r}] references "
+                      f"unknown node {nid!r}")
+    return result
 
 
 def _build_graph(
     title: str,
-    fused_ops: list[str] | None = None,
+    fused_op_graph: dict[str, list[str]] | None = None,
     partition_notes: str = "",
 ) -> graphviz.Digraph:
+    full_label = title
+    if partition_notes:
+        full_label = f"{title}\n{partition_notes}"
+
     g = graphviz.Digraph(
         name="ops",
         format="png",
@@ -186,114 +175,72 @@ def _build_graph(
             "rankdir": "TB",
             "bgcolor": "white",
             "fontname": "Helvetica",
-            "fontsize": "14",
-            "label": title,
+            "fontsize": "16",
+            "label": full_label,
             "labelloc": "t",
             "labeljust": "c",
-            "pad": "0.5",
-            "nodesep": "0.4",
-            "ranksep": "0.5",
+            "pad": "0.4",
+            "nodesep": "0.5",
+            "ranksep": "0.6",
             "dpi": "150",
+            "splines": "true",
         },
         node_attr={
             "fontname": "Helvetica",
-            "fontsize": "11",
-            "style": "filled,rounded",
+            "fontsize": "12",
+            "style": "filled",
             "shape": "box",
-            "margin": "0.15,0.08",
+            "fillcolor": "#F0F0F0",
+            "color": "#888888",
+            "penwidth": "1.0",
+            "margin": "0.12,0.06",
         },
         edge_attr={
             "fontname": "Helvetica",
             "fontsize": "9",
-            "color": "#424242",
-            "arrowsize": "0.7",
+            "color": "#555555",
+            "arrowsize": "0.8",
         },
     )
 
-    if partition_notes:
-        g.attr(
-            label=f"{title}\n{partition_notes}",
-        )
+    node_lookup = {nid: nlabel for nid, nlabel in NODES}
 
     fused_node_set: set[str] = set()
-    active_fusions: dict[str, dict] = {}
-    if fused_ops:
-        for op_name in fused_ops:
-            info = FUSED_OP_NODES.get(op_name)
-            if info and info["nodes"]:
-                active_fusions[op_name] = info
-                fused_node_set.update(info["nodes"])
+    if fused_op_graph:
+        for nodes in fused_op_graph.values():
+            fused_node_set.update(nodes)
 
-    cluster_membership: dict[str, str] = {}
-    for op_name, info in active_fusions.items():
-        for node_id in info["nodes"]:
-            cluster_membership[node_id] = op_name
+        for i, (op_name, nodes) in enumerate(fused_op_graph.items()):
+            if not nodes:
+                continue
+            color = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
+            kernel_num = i + 1
+            cluster_label = f"Fused Kernel {kernel_num}: {op_name}"
 
-    for i, (op_name, info) in enumerate(active_fusions.items()):
-        color = info.get("color", CLUSTER_COLORS[i % len(CLUSTER_COLORS)])
-        with g.subgraph(name=f"cluster_{op_name}") as sub:
-            sub.attr(
-                label=info["label"],
-                style="dashed,rounded,bold",
-                color=color,
-                fontcolor=color,
-                fontsize="12",
-                fontname="Helvetica Bold",
-                penwidth="2.5",
-                margin="16",
-            )
-            for node_id in info["nodes"]:
-                label = None
-                category = None
-                for nid, nlabel, ncat in NODES:
-                    if nid == node_id:
-                        label = nlabel
-                        category = ncat
-                        break
-                if label is None:
-                    continue
-                fill, border = CATEGORY_COLORS.get(category, ("#FFFFFF", "#000000"))
-                sub.node(
-                    node_id,
-                    label=label,
-                    fillcolor=fill,
-                    color=border,
-                    penwidth="1.5",
+            with g.subgraph(name=f"cluster_{op_name}") as sub:
+                sub.attr(
+                    label=cluster_label,
+                    style="bold,rounded",
+                    color=color,
+                    fontcolor=color,
+                    fontsize="16",
+                    fontname="Helvetica Bold",
+                    penwidth="3.0",
+                    margin="20",
+                    labeljust="l",
                 )
+                for node_id in nodes:
+                    if node_id not in node_lookup:
+                        continue
+                    sub.node(node_id, label=node_lookup[node_id])
 
-    for node_id, label, category in NODES:
+    for node_id, label in NODES:
         if node_id in fused_node_set:
             continue
-        fill, border = CATEGORY_COLORS.get(category, ("#FFFFFF", "#000000"))
-        if category == "misc":
-            g.node(
-                node_id,
-                label=label,
-                shape="plaintext",
-                style="",
-                fillcolor="transparent",
-                fontcolor="#9E9E9E",
-                fontsize="10",
-            )
-        else:
-            g.node(
-                node_id,
-                label=label,
-                fillcolor=fill,
-                color=border,
-                penwidth="1.5",
-            )
+        g.node(node_id, label=label)
 
-    for edge in EDGES:
-        src, dst = edge[0], edge[1]
-        edge_label = edge[2] if len(edge) > 2 else ""
-        attrs = {}
-        if edge_label:
-            attrs["label"] = f"  {edge_label}  "
-            attrs["fontcolor"] = "#9E9E9E"
-            attrs["style"] = "dashed"
-            attrs["color"] = "#BDBDBD"
-        g.edge(src, dst, **attrs)
+    for src, dst in EDGES:
+        g.edge(src, dst)
 
     return g
 
@@ -330,15 +277,14 @@ def generate_partition_graph(partition_dir: Path) -> Path | None:
     if not model_py.exists():
         return None
 
-    ops = _detect_dispatched_ops(model_py)
-    display_ops = [op for op in ops if FUSED_OP_NODES.get(op, {}).get("nodes")]
-    if not display_ops:
-        print(f"  {partition_dir.name} → skipped (no graphable fused ops)")
+    fused_op_graph = _read_fused_op_graph(model_py)
+    if not fused_op_graph:
+        print(f"  {partition_dir.name} → skipped (no FUSED_OP_GRAPH)")
         return None
 
     notes = _read_partition_notes(model_py)
     title = f"DeepSeek V3.2 — Partition {partition_dir.name}"
-    g = _build_graph(title, fused_ops=display_ops, partition_notes=notes)
+    g = _build_graph(title, fused_op_graph=fused_op_graph, partition_notes=notes)
 
     out = partition_dir / "graph"
     g.render(str(out), cleanup=True)

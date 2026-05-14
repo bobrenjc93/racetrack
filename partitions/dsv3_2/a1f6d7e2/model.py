@@ -21,6 +21,13 @@ PARTITION_NOTES = (
     "shape of the monolithic attention path introduced in vLLM PR 38595."
 )
 
+# Graph node IDs covered by each fused op.  Used by scripts/gen_graphs.py
+# to draw cluster boxes.  Available node IDs are listed in that script's
+# NODES table.
+FUSED_OP_GRAPH = {
+    "fused_norm_rope": ["rms_norm_q", "rms_norm_kv", "rope_kpe"],
+}
+
 Fallback = Callable[..., Any]
 
 
