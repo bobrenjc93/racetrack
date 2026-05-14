@@ -51,6 +51,15 @@ benchmark workload.
 5. Add `PARTITION_HASH` and `PARTITION_NOTES` constants at the top explaining
    what this partition changes vs baseline.
 
+6. Add a `FUSED_OP_GRAPH` dict mapping each fused op name to the list of
+   graph node IDs it covers (see existing partitions for examples), then
+   regenerate graphs:
+   ```bash
+   python scripts/gen_graphs.py
+   ```
+   This produces `graph.png` for every partition and baseline. Always commit
+   the generated `graph.png` alongside the new partition.
+
 ## Writing kernels
 
 Each kernel file lives at `kernels/<backend>/<name>.py` (e.g.,
