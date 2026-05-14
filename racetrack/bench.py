@@ -15,7 +15,18 @@ from benchmarks import get_cases
 
 
 CONCRETE_KERNEL_BACKENDS = ("triton", "cutedsl", "helion")
-BACKENDS = ("torch", "triton", "cutedsl", "helion", "best", "all")
+TORCH_COMPILE_BACKEND = "torch.compile"
+TORCH_COMPILE_ALIASES = {TORCH_COMPILE_BACKEND, "torch_compile"}
+BACKENDS = (
+    "torch",
+    TORCH_COMPILE_BACKEND,
+    "torch_compile",
+    "triton",
+    "cutedsl",
+    "helion",
+    "best",
+    "all",
+)
 MODELS = ("dsv3_2", "dsv3_2_nvfp4")
 
 
@@ -115,6 +126,36 @@ def _load_model(model_name: str, partition: str):
     return importlib.import_module(f"partitions.{model_name}.{partition}.model")
 
 
+def _normalize_backend_name(backend: str) -> str:
+    backend = backend.strip().lower()
+    if backend in TORCH_COMPILE_ALIASES:
+        return TORCH_COMPILE_BACKEND
+    if backend == "cutedl":
+        return "cutedsl"
+    return backend
+
+
+def _env_backend(backend: str) -> str:
+    return "torch" if backend == TORCH_COMPILE_BACKEND else backend
+
+
+def _compile_model_if_requested(model: torch.nn.Module, backend: str) -> torch.nn.Module:
+    if backend != TORCH_COMPILE_BACKEND:
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile is not available in this PyTorch build")
+    return torch.compile(model)
+
+
+def _cleanup_compile_state(device: torch.device) -> None:
+    dynamo = getattr(torch, "_dynamo", None)
+    reset = getattr(dynamo, "reset", None)
+    if callable(reset):
+        reset()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
     if partition_filter == "baseline":
         return ["baseline"]
@@ -132,12 +173,15 @@ def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
 
 
 def _backend_list(kernel_filter: str, partition: str) -> list[str]:
+    kernel_filter = _normalize_backend_name(kernel_filter)
     if partition == "baseline":
+        if kernel_filter == "all":
+            return ["torch", TORCH_COMPILE_BACKEND]
+        if kernel_filter == TORCH_COMPILE_BACKEND:
+            return [TORCH_COMPILE_BACKEND]
         return ["torch"]
     if kernel_filter == "all":
         return list(CONCRETE_KERNEL_BACKENDS)
-    if kernel_filter == "cutedl":
-        return ["cutedsl"]
     if kernel_filter not in BACKENDS:
         known = ", ".join((*BACKENDS, "all", "cutedl"))
         raise KeyError(f"Unknown kernel filter {kernel_filter!r}. Known: {known}")
@@ -167,11 +211,14 @@ def _benchmark_backend(
     check: bool,
     atol: float,
 ) -> BenchResult:
-    os.environ["RACETRACK_KERNEL_BACKEND"] = backend
+    os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
     module = _load_model(model_name, partition)
     model = module.build_model().to(device=device, dtype=dtype).eval()
     status_map = getattr(model, "backend_status", {"torch": "native"})
-    backend_status = status_map.get(backend, "native")
+    backend_status = (
+        "compiled" if backend == TORCH_COMPILE_BACKEND else status_map.get(backend, "native")
+    )
+    model = _compile_model_if_requested(model, backend)
     output, times = _time_forward(
         model,
         input_ids,
@@ -209,6 +256,9 @@ def _benchmark_backend(
     )
     del model, output
     _sync(device)
+    if backend == TORCH_COMPILE_BACKEND:
+        _cleanup_compile_state(device)
+        _sync(device)
     return result
 
 
@@ -398,7 +448,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--kernel-filter",
         default="all",
-        help="torch, triton, cutedsl/cutedl, helion, best, or all",
+        help="torch, torch.compile, triton, cutedsl/cutedl, helion, best, or all",
     )
     parser.add_argument("--benchmark", default="smoke", help="smoke, decode_128, prefill_512, prefill_2048, or all")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")

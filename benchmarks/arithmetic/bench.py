@@ -30,11 +30,15 @@ import torch
 
 BENCHMARK_DIR = Path(__file__).parent
 MODELS = ("dsv3_2", "dsv3_2_nvfp4")
+TORCH_COMPILE_BACKEND = "torch.compile"
+TORCH_COMPILE_ALIASES = {TORCH_COMPILE_BACKEND, "torch_compile"}
 CONCRETE_BACKENDS = ("triton", "cutedsl", "helion")
 KERNEL_FILTERS = (
     "available",
     "all",
     "torch",
+    TORCH_COMPILE_BACKEND,
+    "torch_compile",
     "triton",
     "cutedsl",
     "cutedl",
@@ -126,6 +130,36 @@ def _load_partition_module(model_name: str, partition: str):
     return importlib.import_module(f"partitions.{model_name}.{partition}.model")
 
 
+def _normalize_backend_name(backend: str) -> str:
+    backend = backend.strip().lower()
+    if backend in TORCH_COMPILE_ALIASES:
+        return TORCH_COMPILE_BACKEND
+    if backend == "cutedl":
+        return "cutedsl"
+    return backend
+
+
+def _env_backend(backend: str) -> str:
+    return "torch" if backend == TORCH_COMPILE_BACKEND else backend
+
+
+def _compile_model_if_requested(model: torch.nn.Module, backend: str) -> torch.nn.Module:
+    if backend != TORCH_COMPILE_BACKEND:
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile is not available in this PyTorch build")
+    return torch.compile(model)
+
+
+def _cleanup_compile_state(device: torch.device) -> None:
+    dynamo = getattr(torch, "_dynamo", None)
+    reset = getattr(dynamo, "reset", None)
+    if callable(reset):
+        reset()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
     if partition_filter == "baseline":
         return ["baseline"]
@@ -163,10 +197,13 @@ def _backend_list(
     kernel_filter: str,
     device: torch.device,
 ) -> list[str]:
+    kernel_filter = _normalize_backend_name(kernel_filter)
     if partition == "baseline":
+        if kernel_filter in ("all", "available"):
+            return ["torch", TORCH_COMPILE_BACKEND]
+        if kernel_filter == TORCH_COMPILE_BACKEND:
+            return [TORCH_COMPILE_BACKEND]
         return ["torch"]
-    if kernel_filter == "cutedl":
-        kernel_filter = "cutedsl"
     if kernel_filter == "all":
         return ["torch", *CONCRETE_BACKENDS]
     if kernel_filter == "available":
@@ -279,11 +316,14 @@ def _benchmark_backend(
     warmup: int,
     repeat: int,
 ) -> Result:
-    os.environ["RACETRACK_KERNEL_BACKEND"] = backend
+    os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
     module = _load_partition_module(model_name, partition)
     model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
     status_map = getattr(model, "backend_status", {"torch": "native"})
-    backend_status = status_map.get(backend, "native")
+    backend_status = (
+        "compiled" if backend == TORCH_COMPILE_BACKEND else status_map.get(backend, "native")
+    )
+    model = _compile_model_if_requested(model, backend)
 
     output, times = _time_forward(
         model,
@@ -323,6 +363,9 @@ def _benchmark_backend(
     )
     del model, output
     _sync(device)
+    if backend == TORCH_COMPILE_BACKEND:
+        _cleanup_compile_state(device)
+        _sync(device)
     return result
 
 
@@ -391,7 +434,7 @@ def _single_backend_mixed_plan(status: str) -> str | None:
 
 def _discover_dispatched_ops(results: list[Result], partition: str) -> list[str]:
     for result in results:
-        if result.partition != partition or result.backend == "torch":
+        if result.partition != partition or result.backend in ("torch", TORCH_COMPILE_BACKEND):
             continue
         module = _load_partition_module(result.model, partition)
         model = module.build_model(**MODEL_OVERRIDES)
@@ -731,7 +774,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--kernel-filter",
         default="torch",
         choices=KERNEL_FILTERS,
-        help="available, all, torch, triton, cutedsl/cutedl, helion, or best",
+        help="available, all, torch, torch.compile, triton, cutedsl/cutedl, helion, or best",
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)

@@ -29,7 +29,11 @@ import torch
 
 BENCHMARK_DIR = Path(__file__).parent
 MODELS = ("dsv3_2", "dsv3_2_nvfp4")
-BACKENDS = ("torch", "triton", "cutedsl", "helion")
+TORCH_COMPILE_BACKEND = "torch.compile"
+TORCH_COMPILE_ALIASES = {TORCH_COMPILE_BACKEND, "torch_compile"}
+CONCRETE_BACKENDS = ("triton", "cutedsl", "helion")
+PARTITION_BACKENDS = ("torch", *CONCRETE_BACKENDS)
+BASELINE_BACKENDS = ("torch", TORCH_COMPILE_BACKEND)
 
 CASES: list[tuple[str, int]] = [
     ("prefill_512", 512),
@@ -70,6 +74,36 @@ def _load_partition_module(model_name: str, partition: str):
     if partition == "baseline":
         return importlib.import_module(f"partitions.{model_name}.model")
     return importlib.import_module(f"partitions.{model_name}.{partition}.model")
+
+
+def _normalize_backend_name(backend: str) -> str:
+    backend = backend.strip().lower()
+    if backend in TORCH_COMPILE_ALIASES:
+        return TORCH_COMPILE_BACKEND
+    if backend == "cutedl":
+        return "cutedsl"
+    return backend
+
+
+def _env_backend(backend: str) -> str:
+    return "torch" if backend == TORCH_COMPILE_BACKEND else backend
+
+
+def _compile_model_if_requested(model: torch.nn.Module, backend: str) -> torch.nn.Module:
+    if backend != TORCH_COMPILE_BACKEND:
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("torch.compile is not available in this PyTorch build")
+    return torch.compile(model)
+
+
+def _cleanup_compile_state(device: torch.device) -> None:
+    dynamo = getattr(torch, "_dynamo", None)
+    reset = getattr(dynamo, "reset", None)
+    if callable(reset):
+        reset()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _discover_partitions(model_name: str) -> list[str]:
@@ -170,13 +204,22 @@ def run(
                 raise KeyError(f"No partitions matched filter {partition_filter!r}")
         for partition in all_partitions:
             if backend_filter == "all":
-                backends = ["torch"] if partition == "baseline" else list(BACKENDS)
+                backends = (
+                    list(BASELINE_BACKENDS)
+                    if partition == "baseline"
+                    else list(PARTITION_BACKENDS)
+                )
             else:
-                backends = backend_filter.split(",")
+                backends = [
+                    _normalize_backend_name(backend)
+                    for backend in backend_filter.split(",")
+                    if backend.strip()
+                ]
             for backend in backends:
-                os.environ["RACETRACK_KERNEL_BACKEND"] = backend
+                os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
                 module = _load_partition_module(model_name, partition)
                 model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
+                model = _compile_model_if_requested(model, backend)
 
                 dispatcher = getattr(model, "dispatcher", None)
                 backend_results: list[Result] = []
@@ -192,9 +235,9 @@ def run(
                         )
                         mean_ms = sum(times) / len(times)
 
-                        status = "native"
+                        status = "compiled" if backend == TORCH_COMPILE_BACKEND else "native"
                         kernel_map = None
-                        if dispatcher is not None and backend != "torch":
+                        if dispatcher is not None and backend in CONCRETE_BACKENDS:
                             kernel_map = _discover_kernel_map(dispatcher, backend)
 
                         backend_results.append(Result(
@@ -221,6 +264,9 @@ def run(
 
                 del model
                 _sync(device)
+                if backend == TORCH_COMPILE_BACKEND:
+                    _cleanup_compile_state(device)
+                    _sync(device)
 
     return results
 
@@ -291,7 +337,7 @@ def _build_combo_entry(
 
 def _discover_dispatched_ops(results: list[Result], partition: str) -> list[str]:
     for r in results:
-        if r.partition != partition or r.backend == "torch":
+        if r.partition != partition or r.backend in ("torch", TORCH_COMPILE_BACKEND):
             continue
         module = _load_partition_module(r.model, partition)
         model = module.build_model(**MODEL_OVERRIDES)
@@ -497,7 +543,11 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--partition", default="all", help="all, baseline, or comma-separated hashes")
-    parser.add_argument("--backend", default="all", help="all, or comma-separated: torch,triton,cutedsl,helion")
+    parser.add_argument(
+        "--backend",
+        default="all",
+        help="all, or comma-separated: torch,torch.compile,triton,cutedsl,helion",
+    )
     parser.add_argument("--no-eval", action="store_true", help="Skip GSM8K accuracy eval")
     args = parser.parse_args()
 
