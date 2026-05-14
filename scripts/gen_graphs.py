@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate op-flow graphs for the baseline model and each partition.
+Generate op-flow graphs for baseline models and their partitions.
 
 Outputs:
-  partitions/dsv3_2/graph.png           -- baseline op flow
-  partitions/dsv3_2/<hash>/graph.png    -- partition op flow with fused-kernel boxes
+  partitions/<model>/graph.png           -- baseline op flow
+  partitions/<model>/<hash>/graph.png    -- partition op flow with fused-kernel boxes
 
 Usage:
   python scripts/gen_graphs.py                 # generate all graphs
-  python scripts/gen_graphs.py 3336cdbd        # generate only that partition (+ baseline)
-  python scripts/gen_graphs.py --baseline-only # baseline only
+  python scripts/gen_graphs.py 3336cdbd        # generate only that partition (+ baselines)
+  python scripts/gen_graphs.py --baseline-only # baselines only
 """
 
 from __future__ import annotations
@@ -21,15 +21,11 @@ from pathlib import Path
 import graphviz
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PARTITIONS_DIR = PROJECT_ROOT / "partitions" / "dsv3_2"
 
 
-# ── Graph definition ─────────────────────────────────────────────────────
-#
-# Each node: (id, label)
-# All nodes are drawn as uniform light-gray boxes.
+# ── dsv3_2 graph ─────────────────────────────────────────────────────────
 
-NODES = [
+NODES_DSV3_2 = [
     ("input_ids",        "input_ids"),
     ("embed",            "Embedding"),
     ("attn_norm",        "Attn RMS"),
@@ -61,7 +57,7 @@ NODES = [
     ("logits",           "logits"),
 ]
 
-EDGES = [
+EDGES_DSV3_2 = [
     ("input_ids",    "embed"),
     ("embed",        "attn_norm"),
     ("attn_norm",    "qkv_proj"),
@@ -100,49 +96,149 @@ EDGES = [
     ("lm_head",     "logits"),
 ]
 
-# ── Fused-op cluster styling ──────────────────────────────────────────────
-#
-# The mapping from fused op → graph node IDs lives in each partition's
-# model.py as FUSED_OP_GRAPH.  The script reads that dict and draws a
-# colored cluster box around each group.
+
+# ── dsv3_2_nvfp4 graph ──────────────────────────────────────────────────
+
+NODES_NVFP4 = [
+    ("input_ids",         "input_ids"),
+    ("embed",             "Embedding"),
+    ("ar_add_rms",        "AR + Add + RMS"),
+    ("qkv_a_proj",        "QKV A Proj"),
+    ("indexer_k_proj",    "Indexer K"),
+    ("q_rms",             "Q RMS"),
+    ("q_b_proj",          "Q B Proj"),
+    ("q_rope",            "Q RoPE"),
+    ("cat_q",             "Cat"),
+    ("q_quant_fp8",       "Q Quantize FP8"),
+    ("kv_c_rms",          "KV C RMS"),
+    ("kv_rope",           "KV RoPE"),
+    ("kv_quant_fp8",      "KV Quant FP8"),
+    ("mla_cache",         "MLA Cache"),
+    ("indexer_ln",        "LayerNorm"),
+    ("indexer_rope",      "RoPE"),
+    ("indexer_quant_fp8", "Quantize FP8"),
+    ("indexer_cache",     "Indexer Cache"),
+    ("indexer_w",         "Indexer W"),
+    ("indexer_q_proj",    "Indexer Q Proj"),
+    ("indexer_q_rope",    "Indexer Q RoPE"),
+    ("indexer_q_fp8",     "Indexer Q FP8"),
+    ("w_uk_t",            "W_UK_T"),
+    ("indexer_w_scale",   "Indexer W scale"),
+    ("indexer_mqa",       "Indexer MQA"),
+    ("logits_topk",       "Logits Top K"),
+    ("topk_page_idx",     "Top K Page Indices"),
+    ("mla",               "MLA"),
+    ("w_uv",              "W_UV"),
+    ("o_proj",            "O Proj"),
+    ("ffn_norm",          "FFN RMS"),
+    ("gate_router",       "Gate Router"),
+    ("topk_softmax",      "TopK + Softmax"),
+    ("w1_proj",           "W1 (gate)"),
+    ("w3_proj",           "W3 (up)"),
+    ("swiglu",            "SwiGLU"),
+    ("w2_proj",           "W2 (down)"),
+    ("expert_sum",        "Expert Sum"),
+    ("res_add_ffn",       "Add + Residual"),
+    ("final_norm",        "Final RMS"),
+    ("lm_head",           "LM Head"),
+    ("logits",            "logits"),
+]
+
+EDGES_NVFP4 = [
+    ("input_ids",         "embed"),
+    ("embed",             "ar_add_rms"),
+    ("ar_add_rms",        "qkv_a_proj"),
+    ("qkv_a_proj",        "q_rms"),
+    ("qkv_a_proj",        "kv_c_rms"),
+    ("qkv_a_proj",        "kv_rope"),
+    ("ar_add_rms",        "indexer_k_proj"),
+    ("indexer_k_proj",    "indexer_ln"),
+    ("indexer_ln",        "indexer_rope"),
+    ("indexer_rope",      "indexer_quant_fp8"),
+    ("indexer_quant_fp8", "indexer_cache"),
+    ("q_rms",             "q_b_proj"),
+    ("q_rms",             "indexer_q_proj"),
+    ("q_b_proj",          "q_rope"),
+    ("q_rope",            "cat_q"),
+    ("cat_q",             "q_quant_fp8"),
+    ("kv_c_rms",          "kv_quant_fp8"),
+    ("kv_rope",           "kv_quant_fp8"),
+    ("kv_quant_fp8",      "mla_cache"),
+    ("indexer_q_proj",    "indexer_q_rope"),
+    ("indexer_q_rope",    "indexer_q_fp8"),
+    ("indexer_q_fp8",     "indexer_w_scale"),
+    ("ar_add_rms",        "indexer_w"),
+    ("indexer_w",         "indexer_w_scale"),
+    ("indexer_w_scale",   "indexer_mqa"),
+    ("indexer_cache",     "indexer_mqa"),
+    ("indexer_mqa",       "logits_topk"),
+    ("logits_topk",       "topk_page_idx"),
+    ("q_rms",             "w_uk_t"),
+    ("w_uk_t",            "mla"),
+    ("q_quant_fp8",       "mla"),
+    ("mla_cache",         "mla"),
+    ("topk_page_idx",     "mla"),
+    ("mla",               "w_uv"),
+    ("w_uv",              "o_proj"),
+    ("o_proj",            "ffn_norm"),
+    ("embed",             "ffn_norm"),
+    ("ffn_norm",          "gate_router"),
+    ("gate_router",       "topk_softmax"),
+    ("topk_softmax",      "w1_proj"),
+    ("topk_softmax",      "w3_proj"),
+    ("ffn_norm",          "w1_proj"),
+    ("ffn_norm",          "w3_proj"),
+    ("w1_proj",           "swiglu"),
+    ("w3_proj",           "swiglu"),
+    ("swiglu",            "w2_proj"),
+    ("w2_proj",           "expert_sum"),
+    ("expert_sum",        "res_add_ffn"),
+    ("o_proj",            "res_add_ffn"),
+    ("res_add_ffn",       "final_norm"),
+    ("final_norm",        "lm_head"),
+    ("lm_head",           "logits"),
+]
+
+
+# ── Model registry ──────────────────────────────────────────────────────
+
+MODEL_GRAPHS: dict[str, dict] = {
+    "dsv3_2": {
+        "dir": PROJECT_ROOT / "partitions" / "dsv3_2",
+        "nodes": NODES_DSV3_2,
+        "edges": EDGES_DSV3_2,
+        "title": "DeepSeek V3.2",
+    },
+    "dsv3_2_nvfp4": {
+        "dir": PROJECT_ROOT / "partitions" / "dsv3_2_nvfp4",
+        "nodes": NODES_NVFP4,
+        "edges": EDGES_NVFP4,
+        "title": "DeepSeek V3.2 NVFP4",
+    },
+}
 
 CLUSTER_COLORS = [
-    "#CC0000", "#1976D2", "#2E7D32", "#E65100",
+    "#CC0000", "#E65100", "#2E7D32", "#1976D2",
     "#7B1FA2", "#00838F", "#C62828", "#283593",
 ]
 
-NODE_IDS = {nid for nid, _ in NODES}
 
-
-def _read_fused_op_graph(model_py: Path) -> dict[str, list[str]]:
-    """Read FUSED_OP_GRAPH from a partition model.py.
-
-    If the partition delegates to partition_common (which uses the 3336cdbd
-    model), follow that chain to read from the base partition.
-    """
+def _read_fused_op_graph(model_py: Path, model_dir: Path) -> dict[str, list[str]]:
     if not model_py.exists():
         return {}
     text = model_py.read_text()
-
     graph = _parse_fused_op_graph(text)
     if graph:
         return graph
-
     if "partition_common" in text:
-        base_model = PARTITIONS_DIR / "3336cdbd" / "model.py"
+        base_model = model_dir / "3336cdbd" / "model.py"
         if base_model.exists():
             return _parse_fused_op_graph(base_model.read_text())
-
     return {}
 
 
 def _parse_fused_op_graph(text: str) -> dict[str, list[str]]:
-    """Extract FUSED_OP_GRAPH dict from Python source text."""
-    m = re.search(
-        r"FUSED_OP_GRAPH\s*=\s*(\{.*?\})\s*\n",
-        text,
-        re.DOTALL,
-    )
+    m = re.search(r"FUSED_OP_GRAPH\s*=\s*(\{.*?\})\s*\n", text, re.DOTALL)
     if not m:
         return {}
     try:
@@ -151,16 +247,13 @@ def _parse_fused_op_graph(text: str) -> dict[str, list[str]]:
         return {}
     if not isinstance(result, dict):
         return {}
-    for op_name, nodes in result.items():
-        for nid in nodes:
-            if nid not in NODE_IDS:
-                print(f"  WARNING: FUSED_OP_GRAPH[{op_name!r}] references "
-                      f"unknown node {nid!r}")
     return result
 
 
 def _build_graph(
     title: str,
+    nodes: list[tuple[str, str]],
+    edges: list[tuple[str, str]],
     fused_op_graph: dict[str, list[str]] | None = None,
     partition_notes: str = "",
 ) -> graphviz.Digraph:
@@ -203,15 +296,15 @@ def _build_graph(
         },
     )
 
-    node_lookup = {nid: nlabel for nid, nlabel in NODES}
+    node_lookup = {nid: nlabel for nid, nlabel in nodes}
 
     fused_node_set: set[str] = set()
     if fused_op_graph:
-        for nodes in fused_op_graph.values():
-            fused_node_set.update(nodes)
+        for fnodes in fused_op_graph.values():
+            fused_node_set.update(fnodes)
 
-        for i, (op_name, nodes) in enumerate(fused_op_graph.items()):
-            if not nodes:
+        for i, (op_name, fnodes) in enumerate(fused_op_graph.items()):
+            if not fnodes:
                 continue
             color = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
             kernel_num = i + 1
@@ -229,17 +322,17 @@ def _build_graph(
                     margin="20",
                     labeljust="l",
                 )
-                for node_id in nodes:
+                for node_id in fnodes:
                     if node_id not in node_lookup:
                         continue
                     sub.node(node_id, label=node_lookup[node_id])
 
-    for node_id, label in NODES:
+    for node_id, label in nodes:
         if node_id in fused_node_set:
             continue
         g.node(node_id, label=label)
 
-    for src, dst in EDGES:
+    for src, dst in edges:
         g.edge(src, dst)
 
     return g
@@ -251,8 +344,7 @@ def _read_partition_notes(model_py: Path) -> str:
     text = model_py.read_text()
     m = re.search(
         r'PARTITION_NOTES\s*=\s*\(\s*((?:"[^"]*"\s*)+)\)',
-        text,
-        re.DOTALL,
+        text, re.DOTALL,
     )
     if not m:
         m = re.search(r'PARTITION_NOTES\s*=\s*"([^"]*)"', text)
@@ -263,29 +355,34 @@ def _read_partition_notes(model_py: Path) -> str:
     return "".join(parts)
 
 
-def generate_baseline_graph() -> Path:
-    g = _build_graph("DeepSeek V3.2 — Baseline Op Flow")
-    out = PARTITIONS_DIR / "graph"
+def generate_baseline_graph(model_name: str, info: dict) -> Path:
+    g = _build_graph(
+        f"{info['title']} — Baseline Op Flow",
+        info["nodes"], info["edges"],
+    )
+    out = info["dir"] / "graph"
     g.render(str(out), cleanup=True)
-    dest = PARTITIONS_DIR / "graph.png"
-    print(f"  baseline → {dest}")
+    dest = info["dir"] / "graph.png"
+    print(f"  {model_name} baseline → {dest}")
     return dest
 
 
-def generate_partition_graph(partition_dir: Path) -> Path | None:
+def generate_partition_graph(
+    partition_dir: Path, info: dict,
+) -> Path | None:
     model_py = partition_dir / "model.py"
     if not model_py.exists():
         return None
-
-    fused_op_graph = _read_fused_op_graph(model_py)
+    fused_op_graph = _read_fused_op_graph(model_py, info["dir"])
     if not fused_op_graph:
         print(f"  {partition_dir.name} → skipped (no FUSED_OP_GRAPH)")
         return None
-
     notes = _read_partition_notes(model_py)
-    title = f"DeepSeek V3.2 — Partition {partition_dir.name}"
-    g = _build_graph(title, fused_op_graph=fused_op_graph, partition_notes=notes)
-
+    title = f"{info['title']} — Partition {partition_dir.name}"
+    g = _build_graph(
+        title, info["nodes"], info["edges"],
+        fused_op_graph=fused_op_graph, partition_notes=notes,
+    )
     out = partition_dir / "graph"
     g.render(str(out), cleanup=True)
     dest = partition_dir / "graph.png"
@@ -299,21 +396,23 @@ def main() -> None:
     targets = [a for a in args if not a.startswith("--")]
 
     print("Generating op-flow graphs...")
-    generate_baseline_graph()
 
-    if baseline_only:
-        return
-
-    for child in sorted(PARTITIONS_DIR.iterdir()):
-        if not child.is_dir():
+    for model_name, info in MODEL_GRAPHS.items():
+        if not info["dir"].is_dir():
             continue
-        if child.name.startswith("_"):
+        generate_baseline_graph(model_name, info)
+        if baseline_only:
             continue
-        if targets and child.name not in targets:
-            continue
-        if not (child / "model.py").exists():
-            continue
-        generate_partition_graph(child)
+        for child in sorted(info["dir"].iterdir()):
+            if not child.is_dir():
+                continue
+            if child.name.startswith("_"):
+                continue
+            if targets and child.name not in targets:
+                continue
+            if not (child / "model.py").exists():
+                continue
+            generate_partition_graph(child, info)
 
     print("Done.")
 
