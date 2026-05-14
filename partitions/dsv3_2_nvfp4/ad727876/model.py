@@ -24,14 +24,12 @@ PARTITION_NOTES = (
 )
 
 FUSED_OP_GRAPH = {
-    "fused_ar_rms_qkv_proj": ["ar_add_rms", "qkv_a_proj", "indexer_k_proj"],
-    "fused_indexer_k_path": ["indexer_ln", "indexer_rope", "indexer_quant_fp8", "indexer_cache"],
+    "fused_ar_rms_qkv_proj": ["qkv_a_proj", "indexer_k_proj", "indexer_w"],
+    "fused_indexer_k_path": ["kv_c_rms", "kv_rope", "kv_quant_fp8", "mla_cache", "q_rms", "indexer_ln", "indexer_rope", "indexer_quant_fp8", "indexer_cache"],
     "fused_q_indexer_score": [
-        "q_rms", "q_b_proj", "indexer_w", "indexer_q_proj",
-        "indexer_q_rope", "indexer_q_fp8", "w_uk_t",
-        "indexer_w_scale", "indexer_mqa",
+        "q_b_proj", "indexer_q_proj", "w_uk_t",
     ],
-    "fused_q_rope_quant": ["q_rope", "cat_q", "q_quant_fp8"],
+    "fused_q_rope_quant": ["q_rope", "cat_q", "q_quant_fp8", "indexer_q_rope", "indexer_q_fp8", "indexer_w_scale"],
 }
 
 Fallback = Callable[..., Any]
@@ -207,129 +205,135 @@ def causal_attention(
 # ---------------------------------------------------------------------------
 
 
-def fused_ar_rms_qkv_proj(
-    x: torch.Tensor,
-    residual: torch.Tensor | None,
-    norm_weight: torch.Tensor,
+def fused_qkv_proj(
+    normed_x: torch.Tensor,
     wq_a_weight: torch.Tensor,
     wkv_a_weight: torch.Tensor,
     indexer_wk_weight: torch.Tensor,
+    indexer_wp_weight: torch.Tensor,
     *,
-    eps: float,
     q_lora_rank: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if residual is not None:
-        hidden = x.float() + residual.float()
-    else:
-        hidden = x.float()
-    dtype = x.dtype
-    var = hidden.square().mean(dim=-1, keepdim=True)
-    normed = (norm_weight.float() * hidden * torch.rsqrt(var + eps)).to(dtype)
-    residual_out = hidden.to(dtype)
-    qkv = F.linear(normed, torch.cat([wq_a_weight, wkv_a_weight], dim=0))
-    total = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    qkv = F.linear(normed_x, torch.cat([wq_a_weight, wkv_a_weight], dim=0))
     q_c = qkv[..., :q_lora_rank]
     kv_c = qkv[..., q_lora_rank:q_lora_rank + kv_lora_rank]
-    k_pe = qkv[..., q_lora_rank + kv_lora_rank:total]
-    indexer_k = F.linear(normed, indexer_wk_weight)
-    return residual_out, normed, q_c, kv_c, k_pe, indexer_k
+    k_pe = qkv[..., q_lora_rank + kv_lora_rank:]
+    indexer_k = F.linear(normed_x, indexer_wk_weight)
+    indexer_w = F.linear(normed_x.float(), indexer_wp_weight.float())
+    return q_c, kv_c, k_pe, indexer_k, indexer_w
 
 
-def fused_indexer_k_path(
-    k: torch.Tensor,
-    ln_weight: torch.Tensor,
-    ln_bias: torch.Tensor,
+def fused_norms_rope_cache(
+    q_c: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    kv_c: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    k_pe: torch.Tensor,
+    indexer_k: torch.Tensor,
+    idx_ln_weight: torch.Tensor,
+    idx_ln_bias: torch.Tensor,
     freqs_cis: torch.Tensor,
     H: torch.Tensor,
-    k_cache: torch.Tensor,
-    k_scale_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    pe_cache: torch.Tensor,
+    idx_k_cache: torch.Tensor,
+    idx_k_scale_cache: torch.Tensor,
     *,
-    ln_dim: int,
-    ln_eps: float,
+    eps: float,
+    idx_ln_dim: int,
+    idx_ln_eps: float,
     rope_head_dim: int,
     start_pos: int,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    k = layer_norm(k, ln_weight, ln_bias, ln_dim, ln_eps)
-    k_pe, k_nope = torch.split(k, [rope_head_dim, k.shape[-1] - rope_head_dim], dim=-1)
-    k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, interleaved=False).squeeze(2)
-    k = torch.cat([k_pe, k_nope], dim=-1)
-    k = hadamard_transform(k, H)
-    k_fp8, k_scale = act_quant(k, block_size)
-    bsz, seqlen = k_fp8.shape[0], k_fp8.shape[1]
+) -> torch.Tensor:
+    bsz, seqlen = q_c.shape[0], q_c.shape[1]
     end_pos = start_pos + seqlen
-    k_cache[:bsz, start_pos:end_pos] = k_fp8.float()
-    k_scale_cache[:bsz, start_pos:end_pos] = k_scale
-    return k_fp8, k_scale
+
+    qr = rms_norm(q_c, q_norm_weight, eps)
+    kv_c_normed = rms_norm(kv_c, kv_norm_weight, eps)
+    k_pe_roped = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, interleaved=True)
+
+    kv_cache[:bsz, start_pos:end_pos] = kv_c_normed
+    pe_cache[:bsz, start_pos:end_pos] = k_pe_roped.squeeze(2)
+
+    idx_k = layer_norm(indexer_k, idx_ln_weight, idx_ln_bias, idx_ln_dim, idx_ln_eps)
+    idx_k_pe, idx_k_nope = torch.split(
+        idx_k, [rope_head_dim, idx_k.shape[-1] - rope_head_dim], dim=-1,
+    )
+    idx_k_pe = apply_rotary_emb(idx_k_pe.unsqueeze(2), freqs_cis, interleaved=False).squeeze(2)
+    idx_k = torch.cat([idx_k_pe, idx_k_nope], dim=-1)
+    idx_k = hadamard_transform(idx_k, H)
+    idx_k_fp8, idx_k_scale = act_quant(idx_k, block_size)
+    idx_k_cache[:bsz, start_pos:end_pos] = idx_k_fp8.float()
+    idx_k_scale_cache[:bsz, start_pos:end_pos] = idx_k_scale
+
+    return qr
 
 
-def fused_q_indexer_score(
+def fused_q_indexer_proj(
     qr: torch.Tensor,
-    normed_x: torch.Tensor,
     wq_b_weight: torch.Tensor,
     idx_wq_b_weight: torch.Tensor,
-    idx_weights_proj_weight: torch.Tensor,
     wkv_b_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    H: torch.Tensor,
-    k_cache: torch.Tensor,
-    k_scale_cache: torch.Tensor,
     *,
-    eps: float,
     n_heads: int,
     qk_head_dim: int,
     qk_nope_head_dim: int,
     kv_lora_rank: int,
     idx_n_heads: int,
     idx_head_dim: int,
-    rope_head_dim: int,
-    softmax_scale: float,
-    idx_softmax_scale: float,
-    start_pos: int,
-    end_pos: int,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz, seqlen, _ = qr.shape
 
-    # MLA Q B projection
     q = F.linear(qr, wq_b_weight).view(bsz, seqlen, n_heads, qk_head_dim)
     q_nope, q_pe = torch.split(q, [qk_nope_head_dim, qk_head_dim - qk_nope_head_dim], dim=-1)
 
-    # Absorbed W_UK_T for MLA decode
     wkv_b = wkv_b_weight.view(n_heads, -1, kv_lora_rank)
     q_nope_absorbed = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :qk_nope_head_dim])
 
-    # Indexer Q path
     idx_q = F.linear(qr, idx_wq_b_weight).view(bsz, seqlen, idx_n_heads, idx_head_dim)
-    idx_q_pe, idx_q_nope = torch.split(idx_q, [rope_head_dim, idx_head_dim - rope_head_dim], dim=-1)
+
+    return q_nope, q_nope_absorbed, q_pe, idx_q
+
+
+def fused_q_rope_indexer_score(
+    q_pe: torch.Tensor,
+    idx_q: torch.Tensor,
+    indexer_w: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    H: torch.Tensor,
+    idx_k_cache: torch.Tensor,
+    idx_k_scale_cache: torch.Tensor,
+    *,
+    rope_head_dim: int,
+    idx_n_heads: int,
+    idx_softmax_scale: float,
+    end_pos: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bsz, seqlen = q_pe.shape[0], q_pe.shape[1]
+
+    q_pe = apply_rotary_emb(q_pe, freqs_cis, interleaved=True)
+
+    idx_q_pe, idx_q_nope = torch.split(
+        idx_q, [rope_head_dim, idx_q.shape[-1] - rope_head_dim], dim=-1,
+    )
     idx_q_pe = apply_rotary_emb(idx_q_pe, freqs_cis, interleaved=False)
     idx_q = torch.cat([idx_q_pe, idx_q_nope], dim=-1)
     idx_q = hadamard_transform(idx_q, H)
     idx_q_fp8, idx_q_scale = act_quant(idx_q, block_size)
 
-    # Indexer W + scale
-    weights = F.linear(normed_x.float(), idx_weights_proj_weight.float()) * idx_n_heads ** -0.5
+    weights = indexer_w * idx_n_heads ** -0.5
     weights = (weights.unsqueeze(-1) * idx_q_scale * idx_softmax_scale).squeeze(-1)
 
-    # Indexer MQA scoring
-    k_s = k_scale_cache[:bsz, :end_pos].squeeze(-1).contiguous()
-    k_cached = k_cache[:bsz, :end_pos].contiguous()
+    k_s = idx_k_scale_cache[:bsz, :end_pos].squeeze(-1).contiguous()
+    k_cached = idx_k_cache[:bsz, :end_pos].contiguous()
     index_score = fp8_index(idx_q_fp8.float(), weights, k_cached, k_s)
     topk_indices = index_score.topk(min(end_pos, seqlen * 2), dim=-1)[1]
 
-    return q_nope, q_nope_absorbed, q_pe, topk_indices
-
-
-def fused_q_rope_quant(
-    q_pe: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    *,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q_pe = apply_rotary_emb(q_pe, freqs_cis, interleaved=True)
-    return q_pe
+    return q_pe, topk_indices
 
 
 # ---------------------------------------------------------------------------
@@ -760,112 +764,75 @@ class FlattenedMLAAttention(nn.Module):
 
     def forward(
         self,
-        normed_x: torch.Tensor,
         q_c: torch.Tensor,
         kv_c: torch.Tensor,
         k_pe: torch.Tensor,
         indexer_k: torch.Tensor,
+        indexer_w: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        bsz, seqlen, _ = normed_x.size()
+        bsz, seqlen = q_c.shape[0], q_c.shape[1]
         end_pos = start_pos + seqlen
         config = self.config
+        _call = self.dispatcher.call if self.dispatcher else lambda _, fb, *a, **kw: fb(*a, **kw)
 
-        qr = self.q_norm(q_c)
+        # Kernel 2: Q RMS + KV C RMS + KV RoPE + MLA Cache +
+        #           Indexer LN + Indexer RoPE + Indexer Quant FP8 + Indexer Cache
+        qr = _call(
+            "fused_norms_rope_cache", fused_norms_rope_cache,
+            q_c, self.q_norm.weight,
+            kv_c, self.kv_norm.weight,
+            k_pe, indexer_k,
+            self.indexer.k_norm.weight, self.indexer.k_norm.bias,
+            freqs_cis, self.indexer.hadamard_matrix,
+            self.kv_cache, self.pe_cache,
+            self.indexer.k_cache, self.indexer.k_scale_cache,
+            eps=config.rms_norm_eps,
+            idx_ln_dim=self.indexer.head_dim, idx_ln_eps=self.indexer.k_norm.eps,
+            rope_head_dim=config.qk_rope_head_dim,
+            start_pos=start_pos, block_size=config.block_size,
+        )
 
-        # Kernel 2: Indexer K path (LayerNorm + RoPE + FP8 quant + cache)
-        if self.dispatcher is None:
-            fused_indexer_k_path(
-                indexer_k,
-                self.indexer.k_norm.weight, self.indexer.k_norm.bias,
-                freqs_cis, self.indexer.hadamard_matrix,
-                self.indexer.k_cache, self.indexer.k_scale_cache,
-                ln_dim=self.indexer.head_dim, ln_eps=self.indexer.k_norm.eps,
-                rope_head_dim=config.qk_rope_head_dim,
-                start_pos=start_pos, block_size=config.block_size,
-            )
-        else:
-            self.dispatcher.call(
-                "fused_indexer_k_path", fused_indexer_k_path,
-                indexer_k,
-                self.indexer.k_norm.weight, self.indexer.k_norm.bias,
-                freqs_cis, self.indexer.hadamard_matrix,
-                self.indexer.k_cache, self.indexer.k_scale_cache,
-                ln_dim=self.indexer.head_dim, ln_eps=self.indexer.k_norm.eps,
-                rope_head_dim=config.qk_rope_head_dim,
-                start_pos=start_pos, block_size=config.block_size,
-            )
+        # Kernel 3: Q B Proj + Indexer Q Proj + W_UK_T
+        q_nope, q_nope_absorbed, q_pe, idx_q = _call(
+            "fused_q_indexer_proj", fused_q_indexer_proj,
+            qr,
+            self.wq_b.weight, self.indexer.wq_b.weight,
+            self.wkv_b.weight,
+            n_heads=self.n_heads, qk_head_dim=self.qk_head_dim,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            idx_n_heads=self.indexer.n_heads,
+            idx_head_dim=self.indexer.head_dim,
+        )
 
-        # Kernel 3: Q/Indexer scoring + W_UK_T
-        if self.dispatcher is None:
-            q_nope, q_nope_absorbed, q_pe, topk_indices = fused_q_indexer_score(
-                qr, normed_x,
-                self.wq_b.weight, self.indexer.wq_b.weight,
-                self.indexer.weights_proj.weight,
-                self.wkv_b.weight,
-                freqs_cis, self.indexer.hadamard_matrix,
-                self.indexer.k_cache, self.indexer.k_scale_cache,
-                eps=config.rms_norm_eps,
-                n_heads=self.n_heads, qk_head_dim=self.qk_head_dim,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                kv_lora_rank=self.kv_lora_rank,
-                idx_n_heads=self.indexer.n_heads,
-                idx_head_dim=self.indexer.head_dim,
-                rope_head_dim=config.qk_rope_head_dim,
-                softmax_scale=self.softmax_scale,
-                idx_softmax_scale=self.indexer.softmax_scale,
-                start_pos=start_pos, end_pos=end_pos,
-                block_size=config.block_size,
-            )
-        else:
-            q_nope, q_nope_absorbed, q_pe, topk_indices = self.dispatcher.call(
-                "fused_q_indexer_score", fused_q_indexer_score,
-                qr, normed_x,
-                self.wq_b.weight, self.indexer.wq_b.weight,
-                self.indexer.weights_proj.weight,
-                self.wkv_b.weight,
-                freqs_cis, self.indexer.hadamard_matrix,
-                self.indexer.k_cache, self.indexer.k_scale_cache,
-                eps=config.rms_norm_eps,
-                n_heads=self.n_heads, qk_head_dim=self.qk_head_dim,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                kv_lora_rank=self.kv_lora_rank,
-                idx_n_heads=self.indexer.n_heads,
-                idx_head_dim=self.indexer.head_dim,
-                rope_head_dim=config.qk_rope_head_dim,
-                softmax_scale=self.softmax_scale,
-                idx_softmax_scale=self.indexer.softmax_scale,
-                start_pos=start_pos, end_pos=end_pos,
-                block_size=config.block_size,
-            )
+        # Kernel 4: Q RoPE + Cat + Indexer Q RoPE + Indexer Q FP8 + Indexer W scale
+        q_pe, topk_indices = _call(
+            "fused_q_rope_indexer_score", fused_q_rope_indexer_score,
+            q_pe, idx_q, indexer_w,
+            freqs_cis, self.indexer.hadamard_matrix,
+            self.indexer.k_cache, self.indexer.k_scale_cache,
+            rope_head_dim=config.qk_rope_head_dim,
+            idx_n_heads=self.indexer.n_heads,
+            idx_softmax_scale=self.indexer.softmax_scale,
+            end_pos=end_pos, block_size=config.block_size,
+        )
 
-        # Kernel 4: Q RoPE
-        if self.dispatcher is None:
-            q_pe = fused_q_rope_quant(q_pe, freqs_cis, block_size=config.block_size)
-        else:
-            q_pe = self.dispatcher.call(
-                "fused_q_rope_quant", fused_q_rope_quant,
-                q_pe, freqs_cis, block_size=config.block_size,
-            )
-
-        # KV norm + RoPE + cache (not fused — these are simple ops)
-        kv_c = self.kv_norm(kv_c)
-        k_pe_roped = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, interleaved=True)
-        self.kv_cache[:bsz, start_pos:end_pos] = kv_c
-        self.pe_cache[:bsz, start_pos:end_pos] = k_pe_roped.squeeze(2)
+        kv_c_normed = self.kv_cache[:bsz, start_pos:end_pos]
+        k_pe_roped = self.pe_cache[:bsz, start_pos:end_pos].unsqueeze(2)
 
         if mask is not None:
             q = torch.cat([q_nope, q_pe], dim=-1)
-            kv_expanded = self.wkv_b(kv_c)
+            kv_expanded = self.wkv_b(kv_c_normed)
             kv_expanded = kv_expanded.view(bsz, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv_expanded, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe_roped.expand(-1, -1, self.n_heads, -1)], dim=-1)
 
             scores = torch.einsum("bshd,bthd->bsht", q.float(), k.float()) * self.softmax_scale
             index_mask = torch.full(
-                (bsz, seqlen, seqlen), float("-inf"), device=normed_x.device,
+                (bsz, seqlen, seqlen), float("-inf"), device=q.device,
             ).scatter_(-1, topk_indices, 0)
             scores = scores + (index_mask + mask).unsqueeze(2)
             scores = scores.softmax(dim=-1).to(v.dtype)
@@ -877,7 +844,7 @@ class FlattenedMLAAttention(nn.Module):
             ) * self.softmax_scale
 
             index_mask = torch.full(
-                (bsz, 1, end_pos), float("-inf"), device=normed_x.device,
+                (bsz, 1, end_pos), float("-inf"), device=q_pe.device,
             ).scatter_(-1, topk_indices, 0)
             scores = scores + index_mask.unsqueeze(2)
             scores = scores.softmax(dim=-1)
@@ -982,30 +949,29 @@ class FlattenedDeepSeekBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         config = self.config
 
-        # Kernel 1: AR + Add + RMS + QKV A Proj + Indexer K
-        if self.dispatcher is None:
-            residual_out, normed, q_c, kv_c, k_pe, indexer_k = fused_ar_rms_qkv_proj(
-                x, residual, self.attn_norm.weight,
-                self.attn.wq_a.weight, self.attn.wkv_a.weight,
-                self.attn.indexer.wk.weight,
-                eps=config.rms_norm_eps,
-                q_lora_rank=config.q_lora_rank,
-                kv_lora_rank=config.kv_lora_rank,
-                qk_rope_head_dim=config.qk_rope_head_dim,
-            )
+        # AR + Add + RMS (outside all fusion boxes)
+        if residual is None:
+            normed_x, residual_out = self.attn_norm(x), x
         else:
-            residual_out, normed, q_c, kv_c, k_pe, indexer_k = self.dispatcher.call(
-                "fused_ar_rms_qkv_proj", fused_ar_rms_qkv_proj,
-                x, residual, self.attn_norm.weight,
-                self.attn.wq_a.weight, self.attn.wkv_a.weight,
-                self.attn.indexer.wk.weight,
-                eps=config.rms_norm_eps,
-                q_lora_rank=config.q_lora_rank,
-                kv_lora_rank=config.kv_lora_rank,
-                qk_rope_head_dim=config.qk_rope_head_dim,
-            )
+            normed_x, residual_out = self.attn_norm(x, residual)
 
-        x = self.attn(normed, q_c, kv_c, k_pe, indexer_k, start_pos, freqs_cis, mask)
+        # Kernel 1: QKV A Proj + Indexer K + Indexer W
+        _call = self.dispatcher.call if self.dispatcher else lambda _, fb, *a, **kw: fb(*a, **kw)
+        q_c, kv_c, k_pe, indexer_k, indexer_w = _call(
+            "fused_qkv_proj", fused_qkv_proj,
+            normed_x,
+            self.attn.wq_a.weight, self.attn.wkv_a.weight,
+            self.attn.indexer.wk.weight,
+            self.attn.indexer.weights_proj.weight,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+        )
+
+        x = self.attn(
+            q_c, kv_c, k_pe, indexer_k, indexer_w,
+            start_pos, freqs_cis, mask,
+        )
         x, residual = self.ffn_norm(x, residual_out)
         x = self.ffn(x)
         return x, residual
