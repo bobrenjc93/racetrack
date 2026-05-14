@@ -69,6 +69,40 @@ if BACKEND_AVAILABLE:
             out[tile_t, tile_h + half] = (x2 * cos + x1 * sin).to(x.dtype)
         return out
 
+    @helion.kernel(autotune_effort=_autotune_effort())
+    def _residual_norm_kernel(
+        residual: torch.Tensor,
+        update: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        out_hidden = torch.empty_like(residual)
+        out_normed = torch.empty_like(residual)
+        tokens, _hidden = residual.size()
+        for tile_t in hl.tile(tokens):
+            hidden = residual[tile_t, :].to(torch.float32) + update[tile_t, :].to(torch.float32)
+            out_hidden[tile_t, :] = hidden.to(residual.dtype)
+            variance = torch.mean(hidden * hidden, dim=1)
+            scale = torch.rsqrt(variance + eps).view(tile_t, 1)
+            out_normed[tile_t, :] = (
+                hidden * scale * weight[:].to(torch.float32)
+            ).to(residual.dtype)
+        return out_hidden, out_normed
+
+    @helion.kernel(autotune_effort=_autotune_effort())
+    def _swiglu_kernel(
+        gate: torch.Tensor,
+        up: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.empty_like(gate)
+        rows, cols = gate.size()
+        for tile_r, tile_c in hl.tile([rows, cols]):
+            gate_values = gate[tile_r, tile_c].to(torch.float32)
+            up_values = up[tile_r, tile_c].to(torch.float32)
+            silu_gate = gate_values * torch.sigmoid(gate_values)
+            out[tile_r, tile_c] = (silu_gate * up_values).to(gate.dtype)
+        return out
+
 
 def fused_norm_rope(
     q_c: torch.Tensor,
@@ -93,3 +127,42 @@ def fused_norm_rope(
         _rms_norm_kernel(kv_c.contiguous(), kv_weight.contiguous(), eps),
         _rope_kernel(k_pe.contiguous(), positions.contiguous(), math.log(rope_base)),
     )
+
+
+def fused_residual_norm(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    eps: float,
+    fallback,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del fallback
+    _require_helion_cuda(residual, update, norm_weight)
+    if residual.dim() != 2 or update.dim() != 2:
+        raise RuntimeError("Helion fused_residual_norm expects 2D tensors")
+    if residual.shape != update.shape:
+        raise RuntimeError("Helion residual and update shapes must match")
+    if norm_weight.dim() != 1 or norm_weight.shape[0] != residual.shape[-1]:
+        raise RuntimeError("Helion norm weight shape must match hidden dimension")
+    return _residual_norm_kernel(
+        residual.contiguous(),
+        update.contiguous(),
+        norm_weight.contiguous(),
+        eps,
+    )
+
+
+def fused_swiglu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    fallback,
+) -> torch.Tensor:
+    del fallback
+    _require_helion_cuda(gate, up)
+    if gate.dim() != 2:
+        raise RuntimeError("Helion fused_swiglu expects 2D tensors")
+    if gate.shape != up.shape:
+        raise RuntimeError("Helion fused_swiglu inputs must have matching shapes")
+    return _swiglu_kernel(gate.contiguous(), up.contiguous())

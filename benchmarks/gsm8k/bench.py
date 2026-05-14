@@ -32,9 +32,9 @@ MODELS = ("dsv3_2",)
 BACKENDS = ("torch", "triton", "cutedsl", "helion")
 
 CASES: list[tuple[str, int]] = [
-    ("prefill_128", 128),
     ("prefill_512", 512),
     ("prefill_2048", 2048),
+    ("prefill_4096", 4096),
 ]
 
 MODEL_OVERRIDES: dict[str, int | float | str] = {

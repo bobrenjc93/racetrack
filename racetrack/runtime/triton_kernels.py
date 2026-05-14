@@ -49,6 +49,55 @@ if BACKEND_AVAILABLE:
         tl.store(out + row + offsets, x1 * c - x2 * s)
         tl.store(out + row + offsets + half, x2 * c + x1 * s)
 
+    @triton.jit
+    def _residual_norm_kernel(
+        residual,
+        update,
+        weight,
+        out_hidden,
+        out_normed,
+        eps: tl.constexpr,
+        cols: tl.constexpr,
+        residual_stride_t: tl.constexpr,
+        update_stride_t: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        token = tl.program_id(0)
+        offsets = tl.arange(0, block_size)
+        mask = offsets < cols
+        r = tl.load(
+            residual + token * residual_stride_t + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        u = tl.load(
+            update + token * update_stride_t + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
+        hidden = r + u
+        tl.store(out_hidden + token * cols + offsets, hidden, mask=mask)
+        variance = tl.sum(hidden * hidden, axis=0) / cols
+        scale = tl.rsqrt(variance + eps)
+        tl.store(out_normed + token * cols + offsets, hidden * scale * w, mask=mask)
+
+    @triton.jit
+    def _swiglu_kernel(
+        gate,
+        up,
+        out,
+        n_elements: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * block_size + tl.arange(0, block_size)
+        mask = offsets < n_elements
+        gate_values = tl.load(gate + offsets, mask=mask, other=0.0).to(tl.float32)
+        up_values = tl.load(up + offsets, mask=mask, other=0.0).to(tl.float32)
+        silu_gate = gate_values * tl.sigmoid(gate_values)
+        tl.store(out + offsets, silu_gate * up_values, mask=mask)
+
 
 def _rms_norm_triton(
     x: torch.Tensor,
@@ -130,3 +179,73 @@ def fused_norm_rope(
         _rms_norm_triton(kv_c, kv_weight, eps),
         _apply_rope_triton(k_pe.contiguous(), positions, rope_base=rope_base),
     )
+
+
+def fused_residual_norm(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    eps: float,
+    fallback,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del fallback
+    if not BACKEND_AVAILABLE:
+        raise RuntimeError("Triton backend requested, but triton is not installed")
+    if residual.device.type != "cuda":
+        raise RuntimeError("Triton fused_residual_norm requires CUDA tensors")
+    if residual.dim() != 2 or update.dim() != 2:
+        raise RuntimeError("Triton fused_residual_norm expects 2D tensors")
+    if residual.shape != update.shape:
+        raise RuntimeError("Triton residual and update shapes must match")
+    if norm_weight.dim() != 1 or norm_weight.shape[0] != residual.shape[-1]:
+        raise RuntimeError("Triton norm weight shape must match hidden dimension")
+    tokens, cols = residual.shape
+    block_size = triton.next_power_of_2(cols)
+    residual_c = residual.contiguous()
+    update_c = update.contiguous()
+    out_hidden = torch.empty((tokens, cols), device=residual.device, dtype=residual.dtype)
+    out_normed = torch.empty((tokens, cols), device=residual.device, dtype=residual.dtype)
+    _residual_norm_kernel[(tokens,)](
+        residual_c,
+        update_c,
+        norm_weight.contiguous(),
+        out_hidden,
+        out_normed,
+        float(eps),
+        cols,
+        residual_c.stride(0),
+        update_c.stride(0),
+        block_size,
+        num_warps=8 if block_size >= 2048 else 4,
+    )
+    return out_hidden, out_normed
+
+
+def fused_swiglu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    *,
+    fallback,
+) -> torch.Tensor:
+    del fallback
+    if not BACKEND_AVAILABLE:
+        raise RuntimeError("Triton backend requested, but triton is not installed")
+    if gate.device.type != "cuda":
+        raise RuntimeError("Triton fused_swiglu requires CUDA tensors")
+    if gate.shape != up.shape:
+        raise RuntimeError("Triton fused_swiglu inputs must have matching shapes")
+    gate_c = gate.contiguous()
+    up_c = up.contiguous()
+    out = torch.empty_like(gate_c)
+    block_size = 1024
+    grid = (triton.cdiv(gate_c.numel(), block_size),)
+    _swiglu_kernel[grid](
+        gate_c,
+        up_c,
+        out,
+        gate_c.numel(),
+        block_size,
+        num_warps=4,
+    )
+    return out.view_as(gate)

@@ -41,17 +41,51 @@ def _cutlass_dtype(dtype: torch.dtype):
     raise RuntimeError(f"CUTEDSL backend does not support dtype {dtype}")
 
 
+_WEIGHT_CACHE: dict[int, Any] = {}
+
+
 def _cute_tensor(tensor: torch.Tensor):
     return from_dlpack(tensor.detach()).mark_layout_dynamic()
 
 
+def _cute_weight(tensor: torch.Tensor):
+    key = id(tensor)
+    if key not in _WEIGHT_CACHE:
+        _WEIGHT_CACHE[key] = from_dlpack(tensor.detach()).mark_layout_dynamic()
+    return _WEIGHT_CACHE[key]
+
+
+_STREAM_CACHE: dict[int, Any] = {}
+
+
 def _stream(device: torch.device):
-    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    stream_id = torch.cuda.current_stream(device).cuda_stream
+    if stream_id not in _STREAM_CACHE:
+        _STREAM_CACHE[stream_id] = cuda.CUstream(stream_id)
+    return _STREAM_CACHE[stream_id]
 
 
 if BACKEND_AVAILABLE:
 
-    BLOCK_SIZE = 256
+    BLOCK_SIZE = 1024
+    WARP_SIZE = 32
+    N_WARPS = BLOCK_SIZE // WARP_SIZE
+
+    @cute.jit
+    def _block_reduce_sum(val, tid, smem):
+        val = cute.arch.warp_reduction_sum(val)
+        warp_id = tid // WARP_SIZE
+        lane_id = tid - warp_id * WARP_SIZE
+        if lane_id == 0:
+            cute.arch.store(smem + warp_id, val)
+        cute.arch.sync_threads()
+        if warp_id == 0:
+            val = cute.arch.load(smem + lane_id, cutlass.Float32)
+            val = cute.arch.warp_reduction_sum(val)
+            if lane_id == 0:
+                cute.arch.store(smem, val)
+        cute.arch.sync_threads()
+        return cute.arch.load(smem, cutlass.Float32)
 
     @cute.kernel
     def _rms_norm_kernel(
@@ -64,7 +98,7 @@ if BACKEND_AVAILABLE:
     ):
         row, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
-        smem_ptr = cute.arch.alloc_smem(cutlass.Float32, BLOCK_SIZE)
+        smem = cute.arch.alloc_smem(cutlass.Float32, N_WARPS)
         if row < rows:
             local_sum = cutlass.Float32(0.0)
             col = tid
@@ -72,19 +106,8 @@ if BACKEND_AVAILABLE:
                 value = x[row, col].to(cutlass.Float32)
                 local_sum += value * value
                 col += BLOCK_SIZE
-            cute.arch.store(smem_ptr + tid, local_sum)
-            cute.arch.sync_threads()
-            stride = BLOCK_SIZE // 2
-            while stride > 0:
-                if tid < stride:
-                    a = cute.arch.load(smem_ptr + tid, cutlass.Float32)
-                    b = cute.arch.load(smem_ptr + tid + stride, cutlass.Float32)
-                    cute.arch.store(smem_ptr + tid, a + b)
-                cute.arch.sync_threads()
-                stride = stride // 2
-            total = cute.arch.load(smem_ptr, cutlass.Float32)
+            total = _block_reduce_sum(local_sum, tid, smem)
             scale = cute.math.rsqrt(total / cols + eps)
-            cute.arch.sync_threads()
             col = tid
             while col < cols:
                 value = x[row, col].to(cutlass.Float32)
@@ -160,7 +183,7 @@ if BACKEND_AVAILABLE:
     ):
         row, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
-        smem_ptr = cute.arch.alloc_smem(cutlass.Float32, BLOCK_SIZE)
+        smem = cute.arch.alloc_smem(cutlass.Float32, N_WARPS)
         if row < rows:
             local_sum = cutlass.Float32(0.0)
             col = tid
@@ -172,19 +195,8 @@ if BACKEND_AVAILABLE:
                 out_hidden[row, col] = hidden.to(out_hidden.element_type)
                 local_sum += hidden * hidden
                 col += BLOCK_SIZE
-            cute.arch.store(smem_ptr + tid, local_sum)
-            cute.arch.sync_threads()
-            stride = BLOCK_SIZE // 2
-            while stride > 0:
-                if tid < stride:
-                    a = cute.arch.load(smem_ptr + tid, cutlass.Float32)
-                    b = cute.arch.load(smem_ptr + tid + stride, cutlass.Float32)
-                    cute.arch.store(smem_ptr + tid, a + b)
-                cute.arch.sync_threads()
-                stride = stride // 2
-            total = cute.arch.load(smem_ptr, cutlass.Float32)
+            total = _block_reduce_sum(local_sum, tid, smem)
             scale = cute.math.rsqrt(total / cols + eps)
-            cute.arch.sync_threads()
             col = tid
             while col < cols:
                 hidden = out_hidden[row, col].to(cutlass.Float32)
@@ -265,7 +277,7 @@ def _compiled_rms_norm(
         _COMPILE_CACHE[key] = cute.compile(
             _rms_norm_host,
             _cute_tensor(x),
-            _cute_tensor(weight),
+            _cute_weight(weight),
             _cute_tensor(out),
             cutlass.Int32(rows),
             cutlass.Int32(cols),
@@ -315,7 +327,7 @@ def _compiled_residual_norm(
             _residual_norm_host,
             _cute_tensor(residual),
             _cute_tensor(update),
-            _cute_tensor(weight),
+            _cute_weight(weight),
             _cute_tensor(out_hidden),
             _cute_tensor(out_normed),
             cutlass.Int32(rows),
@@ -367,7 +379,7 @@ def _rms_norm_cutedsl(
     stream = _stream(x.device)
     compiled(
         _cute_tensor(x),
-        _cute_tensor(weight),
+        _cute_weight(weight),
         _cute_tensor(out),
         cutlass.Int32(rows),
         cutlass.Int32(cols),
@@ -468,7 +480,7 @@ def fused_residual_norm(
     compiled(
         _cute_tensor(residual),
         _cute_tensor(update),
-        _cute_tensor(norm_weight),
+        _cute_weight(norm_weight),
         _cute_tensor(out_hidden),
         _cute_tensor(out_normed),
         cutlass.Int32(rows),
