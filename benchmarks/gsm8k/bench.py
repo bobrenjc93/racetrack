@@ -32,7 +32,7 @@ MODELS = ("dsv3_2", "dsv3_2_nvfp4")
 TORCH_COMPILE_BACKEND = "torch.compile"
 TORCH_COMPILE_ALIASES = {TORCH_COMPILE_BACKEND, "torch_compile"}
 CONCRETE_BACKENDS = ("triton", "cutedsl", "helion")
-PARTITION_BACKENDS = ("torch", *CONCRETE_BACKENDS)
+PARTITION_BACKENDS = ("torch", TORCH_COMPILE_BACKEND, *CONCRETE_BACKENDS)
 BASELINE_BACKENDS = ("torch", TORCH_COMPILE_BACKEND)
 
 CASES: list[tuple[str, int]] = [
@@ -135,19 +135,20 @@ def _time_forward(
     _sync(device)
 
     if device.type == "cuda":
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            model(input_ids, positions)
+        with torch.cuda.device(device):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                model(input_ids, positions)
 
-        times: list[float] = []
-        for _ in range(repeat):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            graph.replay()
-            end.record()
-            torch.cuda.synchronize(device)
-            times.append(float(start.elapsed_time(end)))
+            times: list[float] = []
+            for _ in range(repeat):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                graph.replay()
+                end.record()
+                torch.cuda.synchronize(device)
+                times.append(float(start.elapsed_time(end)))
     else:
         times = []
         for _ in range(repeat):
@@ -219,6 +220,9 @@ def run(
                 os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
                 module = _load_partition_module(model_name, partition)
                 model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
+                # GSM8K prefill timing only needs the state consumed by the next-token head.
+                if hasattr(model, "prefill_last_hidden"):
+                    model.prefill_last_hidden = True
                 model = _compile_model_if_requested(model, backend)
 
                 dispatcher = getattr(model, "dispatcher", None)
@@ -373,8 +377,10 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
             key=lambda kv: sum(r.mean_ms for r in kv[1]),
         )
         backend_name, runs = best_backend
-        dispatched_ops = _discover_dispatched_ops(results, partition)
-        kernel_map = {op: backend_name for op in dispatched_ops} if dispatched_ops else None
+        kernel_map = None
+        if backend_name in CONCRETE_BACKENDS:
+            dispatched_ops = _discover_dispatched_ops(results, partition)
+            kernel_map = {op: backend_name for op in dispatched_ops} if dispatched_ops else None
         for r in runs:
             best_results.append(Result(
                 model=r.model,
