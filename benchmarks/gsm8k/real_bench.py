@@ -282,9 +282,6 @@ def run(
     backend_filter: str,
     require_pass: bool,
 ) -> dict:
-    if partition_model != "dsv3_2_nvfp4":
-        raise ValueError("Real GSM8K partition patching currently supports dsv3_2_nvfp4 only")
-
     model, tokenizer = _load_model_and_tokenizer(
         ckpt_path=ckpt_path,
         hf_token=hf_token,

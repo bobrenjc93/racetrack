@@ -4,7 +4,11 @@ import textwrap
 
 import torch
 
-from benchmarks.gsm8k.real_kernels import RealKernelRow, patch_real_model
+from benchmarks.gsm8k.real_kernels import (
+    RealKernelRow,
+    discover_real_kernel_rows,
+    patch_real_model,
+)
 from benchmarks.gsm8k.real_bench import ExampleResult, _render_markdown, _row_result
 from benchmarks.gsm8k.hf_model_loader import _slice_for_rank, run_post_load_transforms
 
@@ -67,6 +71,162 @@ def test_real_kernel_patcher_uses_real_module_weights(tmp_path) -> None:
     assert not hasattr(model.norm, "kernel_stats")
     assert not hasattr(model.mlp, "kernel_dispatcher")
     assert not hasattr(model.mlp, "kernel_stats")
+
+
+def test_dsv3_2_residual_norm_adapter_handles_legacy_kernel_contract(tmp_path) -> None:
+    kernel_dir = tmp_path / "kernels" / "triton"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "ops.py").write_text(
+        textwrap.dedent(
+            """
+            BACKEND_AVAILABLE = True
+
+            def fused_residual_norm(residual, update, weight, *, eps, fallback):
+                assert residual.dim() == 2
+                assert update.dim() == 2
+                hidden, normed = fallback(residual, update, weight, eps=eps)
+                return hidden, normed
+            """
+        )
+    )
+
+    from inference.model import RMSNorm
+
+    class Tiny(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.norm = RMSNorm(8)
+
+        def forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return self.norm(x, residual)
+
+    model = Tiny().float().eval()
+    with torch.no_grad():
+        model.norm.weight.normal_(mean=1.0, std=0.02)
+    x = torch.randn(2, 3, 8)
+    residual = torch.randn(2, 3, 8)
+    expected = model(x, residual)
+    row = RealKernelRow(
+        partition_model="dsv3_2",
+        partition="test",
+        backend="triton",
+        kernel_root=tmp_path / "kernels",
+        ops=("fused_residual_norm",),
+    )
+
+    with patch_real_model(model, row) as stats:
+        actual = model(x, residual)
+
+    assert stats.calls == {"fused_residual_norm": 1}
+    assert stats.used_partition_kernel
+    assert actual[0].shape == x.shape
+    assert actual[1].shape == x.shape
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
+def test_dsv3_2_swiglu_adapter_handles_legacy_kernel_contract(tmp_path) -> None:
+    kernel_dir = tmp_path / "kernels" / "triton"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "ops.py").write_text(
+        textwrap.dedent(
+            """
+            BACKEND_AVAILABLE = True
+
+            def fused_swiglu(gate, up, *, fallback):
+                assert gate.dim() == 2
+                assert up.dim() == 2
+                return fallback(gate, up)
+            """
+        )
+    )
+
+    from inference.model import MLP
+
+    model = MLP(8, 16).float().eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(mean=0.0, std=0.02)
+    x = torch.randn(2, 3, 8)
+    expected = model(x)
+    row = RealKernelRow(
+        partition_model="dsv3_2",
+        partition="test",
+        backend="triton",
+        kernel_root=tmp_path / "kernels",
+        ops=("fused_swiglu",),
+    )
+
+    with patch_real_model(model, row) as stats:
+        actual = model(x)
+
+    assert stats.calls == {"fused_swiglu": 1}
+    assert stats.used_partition_kernel
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_dsv3_2_real_rows_skip_helion_until_full_model_configs_exist() -> None:
+    rows = discover_real_kernel_rows(
+        partition_model="dsv3_2",
+        partition_filter="3336cdbd",
+        backend_filter="all",
+    )
+
+    assert rows
+    assert all(row.backend != "helion" for row in rows)
+    best_row = next(row for row in rows if row.backend == "best")
+    assert best_row.ops == ("fused_residual_norm", "fused_swiglu")
+
+
+def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
+    triton_dir = tmp_path / "kernels" / "triton"
+    helion_dir = tmp_path / "kernels" / "helion"
+    triton_dir.mkdir(parents=True)
+    helion_dir.mkdir(parents=True)
+    (tmp_path / "kernels" / "best.json").write_text('{"fused_swiglu": "helion"}\n')
+    (triton_dir / "ops.py").write_text(
+        textwrap.dedent(
+            """
+            BACKEND_AVAILABLE = True
+
+            def fused_swiglu(gate, up, *, fallback):
+                return fallback(gate, up)
+            """
+        )
+    )
+    (helion_dir / "ops.py").write_text(
+        textwrap.dedent(
+            """
+            BACKEND_AVAILABLE = True
+
+            def fused_swiglu(gate, up, *, fallback):
+                raise RuntimeError("helion should not run")
+            """
+        )
+    )
+
+    from inference.model import MLP
+
+    model = MLP(8, 16).float().eval()
+    x = torch.randn(2, 3, 8)
+    row = RealKernelRow(
+        partition_model="dsv3_2",
+        partition="test",
+        backend="best",
+        kernel_root=tmp_path / "kernels",
+        ops=("fused_swiglu",),
+    )
+
+    with patch_real_model(model, row, strict_kernel_use=False) as stats:
+        model(x)
+
+    selected = {
+        backend
+        for backends in stats.selected_backends.values()
+        for backend in backends
+    }
+    assert "helion" not in selected
 
 
 def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:

@@ -28,6 +28,9 @@ from racetrack.runtime.dispatch import KernelDispatcher
 
 SUPPORTED_OPS = frozenset({"fused_residual_norm", "fused_swiglu"})
 BACKENDS = ("torch", "triton", "cutedsl", "helion", "best")
+REAL_DISABLED_BACKENDS = {
+    "dsv3_2": frozenset({"helion"}),
+}
 
 
 @dataclass(frozen=True)
@@ -89,7 +92,8 @@ def discover_real_kernel_rows(
 
     for partition_dir in partitions:
         kernel_root = partition_dir / "kernels"
-        backends = _discover_backends(kernel_root)
+        concrete_backends = _discover_backends(kernel_root, partition_model)
+        backends = list(concrete_backends)
         if backend_filter != "all":
             wanted_backends = {
                 _normalize_backend_name(b)
@@ -102,9 +106,10 @@ def discover_real_kernel_rows(
             if not ops and backend != "best":
                 continue
             if backend == "best":
-                ops = tuple(sorted(_discover_supported_ops(kernel_root, "triton")
-                                   | _discover_supported_ops(kernel_root, "cutedsl")
-                                   | _discover_supported_ops(kernel_root, "helion")))
+                best_ops = set()
+                for candidate in concrete_backends:
+                    best_ops |= _discover_supported_ops(kernel_root, candidate)
+                ops = tuple(sorted(best_ops))
             if not ops:
                 continue
             rows.append(
@@ -128,10 +133,11 @@ def _normalize_backend_name(backend: str) -> str:
     return backend
 
 
-def _discover_backends(kernel_root: Path) -> list[str]:
+def _discover_backends(kernel_root: Path, partition_model: str) -> list[str]:
+    disabled = REAL_DISABLED_BACKENDS.get(partition_model, frozenset())
     backends = [
         backend for backend in ("triton", "cutedsl", "helion")
-        if (kernel_root / backend).is_dir()
+        if backend not in disabled and (kernel_root / backend).is_dir()
     ]
     if len(backends) > 1:
         backends.append("best")
@@ -160,7 +166,7 @@ def patch_real_model(
         yield PatchStats(calls={}, selected_backends={})
         return
 
-    dispatcher = KernelDispatcher(row.kernel_root)
+    dispatcher = _real_model_dispatcher(row)
     stats = PatchStats(
         calls={op_name: 0 for op_name in row.ops},
         selected_backends={},
@@ -202,7 +208,7 @@ def patch_real_model(
 def _patch_modules(
     model: torch.nn.Module,
     row: RealKernelRow,
-    dispatcher: KernelDispatcher,
+    dispatcher: Any,
     stats: PatchStats,
     originals: list[tuple[torch.nn.Module, str, bool, Any]],
 ) -> None:
@@ -217,7 +223,7 @@ def _patch_modules(
 
 def _attach_kernel(
     module: torch.nn.Module,
-    dispatcher: KernelDispatcher,
+    dispatcher: Any,
     stats: PatchStats,
     originals: list[tuple[torch.nn.Module, str, bool, Any]],
 ) -> None:
@@ -235,3 +241,105 @@ def _set_attr(
     original = getattr(module, name, None)
     originals.append((module, name, existed, original))
     setattr(module, name, value)
+
+
+def _real_model_dispatcher(row: RealKernelRow) -> Any:
+    dispatcher = KernelDispatcher(row.kernel_root)
+    disabled = REAL_DISABLED_BACKENDS.get(row.partition_model, frozenset())
+    if disabled:
+        dispatcher.BACKENDS = tuple(
+            backend for backend in dispatcher.BACKENDS
+            if backend not in disabled
+        )
+        dispatcher._best_fast_path = {
+            op_name: backend
+            for op_name, backend in dispatcher._best_fast_path.items()
+            if backend not in disabled
+        }
+    if row.partition_model == "dsv3_2":
+        return _Dsv3RealContractDispatcher(dispatcher)
+    return dispatcher
+
+
+class _Dsv3RealContractDispatcher:
+    """Adapts legacy dsv3_2 partition kernels to inference.model contracts."""
+
+    def __init__(self, dispatcher: KernelDispatcher) -> None:
+        self._dispatcher = dispatcher
+
+    @property
+    def _best_ops(self) -> dict[str, set[str]]:
+        return self._dispatcher._best_ops
+
+    def call(self, op_name: str, fallback, *args: Any, **kwargs: Any) -> Any:
+        if op_name == "fused_residual_norm":
+            return self._call_residual_norm(fallback, *args, **kwargs)
+        if op_name == "fused_swiglu":
+            return self._call_swiglu(fallback, *args, **kwargs)
+        return self._dispatcher.call(op_name, fallback, *args, **kwargs)
+
+    def _call_residual_norm(
+        self,
+        fallback,
+        update: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = update.shape
+        cols = shape[-1]
+        update_flat = update.contiguous().view(-1, cols)
+        residual_flat = residual.contiguous().view(-1, cols)
+
+        def legacy_fallback(
+            legacy_residual: torch.Tensor,
+            legacy_update: torch.Tensor,
+            legacy_weight: torch.Tensor,
+            *,
+            eps: float,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            normed, hidden = fallback(
+                legacy_update.view(shape),
+                legacy_residual.view(shape),
+                legacy_weight,
+                eps=eps,
+            )
+            return hidden.contiguous().view(-1, cols), normed.contiguous().view(-1, cols)
+
+        hidden, normed = self._dispatcher.call(
+            "fused_residual_norm",
+            legacy_fallback,
+            residual_flat,
+            update_flat,
+            weight,
+            eps=eps,
+        )
+        return normed.view(shape), hidden.view(shape)
+
+    def _call_swiglu(
+        self,
+        fallback,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+    ) -> torch.Tensor:
+        shape = gate.shape
+        cols = shape[-1]
+        gate_flat = gate.contiguous().view(-1, cols)
+        up_flat = up.contiguous().view(-1, cols)
+
+        def legacy_fallback(
+            legacy_gate: torch.Tensor,
+            legacy_up: torch.Tensor,
+        ) -> torch.Tensor:
+            return fallback(
+                legacy_gate.view(shape),
+                legacy_up.view(shape),
+            ).contiguous().view(-1, cols)
+
+        return self._dispatcher.call(
+            "fused_swiglu",
+            legacy_fallback,
+            gate_flat,
+            up_flat,
+        ).view(shape)
