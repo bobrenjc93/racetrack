@@ -332,6 +332,14 @@ def run(
         if row.backend == TORCH_COMPILE_BACKEND:
             try:
                 compiled_model = torch.compile(model)
+                if _is_rank0():
+                    print("  warmup (compiling) ...", flush=True)
+                _evaluate_row(
+                    compiled_model, tokenizer, dataset,
+                    max_new_tokens=max_new_tokens,
+                )
+                if _is_rank0():
+                    print("  timed run ...", flush=True)
                 outputs, total_ms = _evaluate_row(
                     compiled_model,
                     tokenizer,
