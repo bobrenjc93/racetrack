@@ -5,7 +5,7 @@ import textwrap
 import torch
 
 from benchmarks.gsm8k.real_kernels import RealKernelRow, patch_real_model
-from benchmarks.gsm8k.real_bench import ExampleResult, _row_result
+from benchmarks.gsm8k.real_bench import ExampleResult, _render_markdown, _row_result
 from benchmarks.gsm8k.hf_model_loader import _slice_for_rank, run_post_load_transforms
 
 
@@ -116,6 +116,64 @@ def test_real_row_validation_uses_extracted_answers_not_exact_tokens() -> None:
     assert result.accuracy_pct == 100.0
     assert result.answer_match == 1
     assert result.token_match == 0
+    assert result.max_abs_diff == 0.0
+
+
+def test_real_report_keeps_legacy_leaderboard_schema() -> None:
+    report = {
+        "model": "test-model",
+        "partition_model": "dsv3_2_nvfp4",
+        "hardware": {
+            "gpu": "test-gpu",
+            "gpu_count": 8,
+            "cuda": "test-cuda",
+            "torch": "test-torch",
+        },
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "samples": 1,
+        "max_new_tokens": 16,
+        "rows": [
+            {
+                "partition": "baseline",
+                "backend": "torch",
+                "ops": [],
+                "mean_ms": 10.0,
+                "total_ms": 10.0,
+                "accuracy_pct": 100.0,
+                "correct": 1,
+                "total": 1,
+                "validation": True,
+                "answer_match": 1,
+                "token_match": 1,
+                "max_abs_diff": 0.0,
+                "calls": {},
+                "selected_backends": {},
+            },
+            {
+                "partition": "test",
+                "backend": "best",
+                "ops": ["fused_swiglu"],
+                "mean_ms": 5.0,
+                "total_ms": 5.0,
+                "accuracy_pct": 100.0,
+                "correct": 1,
+                "total": 1,
+                "validation": True,
+                "answer_match": 1,
+                "token_match": 0,
+                "max_abs_diff": 0.0,
+                "calls": {"fused_swiglu": 1},
+                "selected_backends": {"fused_swiglu": ["triton"]},
+            },
+        ],
+    }
+
+    markdown = _render_markdown(report, "8xh100")
+
+    assert "| # | partition | backend | total (ms) | vs baseline | validation | max diff |" in markdown
+    assert "answer match" not in markdown
+    assert "token match" not in markdown
+    assert "| 1 | test | best (fused_swiglu=triton) | 5.0 | 2.000x | pass | 0.000e+00 |" in markdown
 
 
 def test_post_load_transform_hooks_run_once_per_module() -> None:

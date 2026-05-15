@@ -130,9 +130,8 @@ synthetic partition shape benchmark. The real runner loads the converted
 DeepSeek-V3.2 model-parallel checkpoint, evaluates the full baseline model,
 then patches compatible partition-local kernels into that same full model and
 requires every patched row to reproduce the baseline extracted numerical
-answer. Exact completion-token matching is reported separately as a diagnostic
-because optimized kernels may produce equivalent reasoning with the same final
-answer.
+answer. Exact completion-token matching is retained in JSON diagnostics because
+optimized kernels may produce equivalent reasoning with the same final answer.
 
 ```bash
 torchrun --standalone --nproc-per-node=8 \

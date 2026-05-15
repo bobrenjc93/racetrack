@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -42,6 +43,8 @@ from benchmarks.gsm8k.real_kernels import (
     patch_real_model,
 )
 
+ANSWER_ATOL = 1.0e-3
+
 
 @dataclass
 class ExampleResult:
@@ -64,6 +67,7 @@ class RowResult:
     validation: bool
     answer_match: int
     token_match: int
+    max_abs_diff: float
     calls: dict[str, int]
     selected_backends: dict[str, tuple[str, ...]]
 
@@ -223,10 +227,12 @@ def _row_result(
 ) -> RowResult:
     correct = sum(result.correct for result in outputs)
     total = len(outputs)
-    answer_match = sum(
-        _answers_match(result.predicted, baseline.predicted)
+    answer_diffs = [
+        _answer_abs_diff(result.predicted, baseline.predicted)
         for result, baseline in zip(outputs, baseline_outputs)
-    )
+    ]
+    answer_match = sum(diff <= ANSWER_ATOL for diff in answer_diffs)
+    max_abs_diff = max(answer_diffs, default=0.0)
     token_match = sum(
         result.completion_tokens == baseline.completion_tokens
         for result, baseline in zip(outputs, baseline_outputs)
@@ -243,15 +249,24 @@ def _row_result(
         validation=answer_match == total,
         answer_match=answer_match,
         token_match=token_match,
+        max_abs_diff=max_abs_diff,
         calls=dict(calls),
         selected_backends=dict(selected_backends or {}),
     )
 
 
-def _answers_match(left: float | None, right: float | None) -> bool:
+def _answer_abs_diff(left: float | None, right: float | None) -> float:
     if left is None or right is None:
-        return left is None and right is None
-    return abs(left - right) < 1.0e-3
+        return 0.0 if left is None and right is None else math.inf
+    return abs(left - right)
+
+
+def _format_diff(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if not math.isfinite(value):
+        return "inf"
+    return f"{value:.3e}"
 
 
 def run(
@@ -357,6 +372,7 @@ def run(
                 "validation": r.validation,
                 "answer_match": r.answer_match,
                 "token_match": r.token_match,
+                "max_abs_diff": r.max_abs_diff,
                 "calls": r.calls,
                 "selected_backends": {
                     op: list(backends)
@@ -372,8 +388,12 @@ def _render_markdown(report: dict, slug: str) -> str:
     hw = report["hardware"]
     rows = sorted(
         report["rows"],
-        key=lambda row: (not row["validation"], row["mean_ms"]),
+        key=lambda row: (not row["validation"], row["total_ms"]),
     )
+    baseline = next(row for row in report["rows"] if row["partition"] == "baseline")
+    baseline_ms = baseline["total_ms"]
+    winner = next((row for row in rows if row["validation"]), rows[0])
+    winner_speedup = baseline_ms / winner["total_ms"] if winner["total_ms"] else None
     lines = [
         f"# Real GSM8K E2E Benchmark: {slug}",
         "",
@@ -386,6 +406,16 @@ def _render_markdown(report: dict, slug: str) -> str:
         f"**Samples**: {report['samples']}",
         f"**Max new tokens**: {report['max_new_tokens']}",
         f"**Date**: {report['timestamp']}",
+        (
+            "**Validation**: extracted numerical answers are compared with "
+            "`baseline/torch`; `max diff` is the maximum absolute extracted-answer "
+            "difference."
+        ),
+        "",
+        "## Winner",
+        "",
+        _winner_line(winner, winner_speedup),
+        f"Aggregate: {winner['total_ms']:.1f}ms",
         "",
         "## Leaderboard",
         "",
@@ -394,45 +424,61 @@ def _render_markdown(report: dict, slug: str) -> str:
         "#",
         "partition",
         "backend",
-        "ops",
-        "accuracy",
+        "total (ms)",
+        "vs baseline",
         "validation",
-        "answer match",
-        "token match",
-        "mean ms/example",
-        "kernel calls",
-        "selected",
+        "max diff",
     ]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("---" for _ in headers) + "|")
     for rank, row in enumerate(rows, 1):
-        call_count = sum(row["calls"].values())
-        ops = ", ".join(row["ops"]) if row["ops"] else "baseline"
-        selected = "; ".join(
-            f"{op}={'+'.join(backends)}"
-            for op, backends in sorted(row.get("selected_backends", {}).items())
-        ) or "-"
+        speedup = baseline_ms / row["total_ms"] if row["total_ms"] else None
         lines.append(
             "| "
             + " | ".join(
                 [
                     str(rank),
                     row["partition"],
-                    row["backend"],
-                    ops,
-                    f"{row['accuracy_pct']:.1f}% ({row['correct']}/{row['total']})",
+                    _backend_cell(row),
+                    f"{row['total_ms']:.1f}",
+                    f"{speedup:.3f}x" if speedup is not None else "-",
                     "pass" if row["validation"] else "fail",
-                    f"{row['answer_match']}/{row['total']}",
-                    f"{row['token_match']}/{row['total']}",
-                    f"{row['mean_ms']:.1f}",
-                    str(call_count),
-                    selected,
+                    _format_diff(row.get("max_abs_diff")),
                 ]
             )
             + " |"
         )
     lines.append("")
+    lines.append("## Cases")
+    lines.append("")
+    case_diff = max((row.get("max_abs_diff", 0.0) for row in report["rows"]), default=0.0)
+    case_valid = all(row["validation"] for row in report["rows"])
+    sample_label = "sample" if report["samples"] == 1 else "samples"
+    lines.append(
+        f"- **gsm8k**: {report['samples']} {sample_label}, "
+        f"{'pass' if case_valid else 'fail'}, max diff {_format_diff(case_diff)}"
+    )
+    lines.append("")
+    lines.append("## Baseline reference")
+    lines.append("")
+    lines.append(f"- gsm8k: {baseline_ms:.1f}ms")
+    lines.append("")
     return "\n".join(lines)
+
+
+def _winner_line(row: dict, speedup: float | None) -> str:
+    speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
+    return f"**{row['partition']}/{_backend_cell(row)}**{speedup_str}"
+
+
+def _backend_cell(row: dict) -> str:
+    if row["backend"] != "best" or not row.get("selected_backends"):
+        return row["backend"]
+    kernels_note = ", ".join(
+        f"{op}={'+'.join(backends)}"
+        for op, backends in sorted(row["selected_backends"].items())
+    )
+    return f"{row['backend']} ({kernels_note})"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
