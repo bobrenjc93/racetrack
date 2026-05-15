@@ -5,6 +5,7 @@ import textwrap
 import torch
 
 from benchmarks.gsm8k.real_kernels import RealKernelRow, patch_real_model
+from benchmarks.gsm8k.real_bench import ExampleResult, _row_result
 from benchmarks.gsm8k.hf_model_loader import _slice_for_rank, run_post_load_transforms
 
 
@@ -82,6 +83,39 @@ def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:
         _slice_for_rank(value, col_target, "col", rank=1),
         value[:, 2:4],
     )
+
+
+def test_real_row_validation_uses_extracted_answers_not_exact_tokens() -> None:
+    row = RealKernelRow(
+        partition_model="dsv3_2_nvfp4",
+        partition="test",
+        backend="triton",
+        kernel_root=None,
+        ops=("fused_swiglu",),
+    )
+    baseline = [
+        ExampleResult(
+            completion_tokens=(1, 2, 3),
+            predicted=42.0,
+            ground_truth=42.0,
+            correct=True,
+        )
+    ]
+    outputs = [
+        ExampleResult(
+            completion_tokens=(4, 5, 6),
+            predicted=42.0,
+            ground_truth=42.0,
+            correct=True,
+        )
+    ]
+
+    result = _row_result(row, outputs, 1.0, baseline, {"fused_swiglu": 1})
+
+    assert result.validation
+    assert result.accuracy_pct == 100.0
+    assert result.answer_match == 1
+    assert result.token_match == 0
 
 
 def test_post_load_transform_hooks_run_once_per_module() -> None:

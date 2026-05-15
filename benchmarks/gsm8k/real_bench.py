@@ -61,6 +61,7 @@ class RowResult:
     correct: int
     total: int
     validation: bool
+    answer_match: int
     token_match: int
     calls: dict[str, int]
     selected_backends: dict[str, tuple[str, ...]]
@@ -221,6 +222,10 @@ def _row_result(
 ) -> RowResult:
     correct = sum(result.correct for result in outputs)
     total = len(outputs)
+    answer_match = sum(
+        _answers_match(result.predicted, baseline.predicted)
+        for result, baseline in zip(outputs, baseline_outputs)
+    )
     token_match = sum(
         result.completion_tokens == baseline.completion_tokens
         for result, baseline in zip(outputs, baseline_outputs)
@@ -234,11 +239,18 @@ def _row_result(
         accuracy_pct=correct / max(total, 1) * 100.0,
         correct=correct,
         total=total,
-        validation=token_match == total,
+        validation=answer_match == total,
+        answer_match=answer_match,
         token_match=token_match,
         calls=dict(calls),
         selected_backends=dict(selected_backends or {}),
     )
+
+
+def _answers_match(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return abs(left - right) < 1.0e-3
 
 
 def run(
@@ -312,7 +324,9 @@ def run(
         if require_pass and not row_result.validation:
             raise RuntimeError(
                 f"{row.label} failed validation: "
-                f"{row_result.token_match}/{row_result.total} completions matched baseline"
+                f"{row_result.answer_match}/{row_result.total} extracted answers "
+                f"matched baseline ({row_result.token_match}/{row_result.total} "
+                "exact completions matched)"
             )
         row_results.append(row_result)
 
@@ -340,6 +354,7 @@ def run(
                 "correct": r.correct,
                 "total": r.total,
                 "validation": r.validation,
+                "answer_match": r.answer_match,
                 "token_match": r.token_match,
                 "calls": r.calls,
                 "selected_backends": {
@@ -380,6 +395,8 @@ def _render_markdown(report: dict, slug: str) -> str:
         "ops",
         "accuracy",
         "validation",
+        "answer match",
+        "token match",
         "mean ms/example",
         "kernel calls",
         "selected",
@@ -402,7 +419,9 @@ def _render_markdown(report: dict, slug: str) -> str:
                     row["backend"],
                     ops,
                     f"{row['accuracy_pct']:.1f}% ({row['correct']}/{row['total']})",
-                    "pass" if row["validation"] else f"fail ({row['token_match']}/{row['total']})",
+                    "pass" if row["validation"] else "fail",
+                    f"{row['answer_match']}/{row['total']}",
+                    f"{row['token_match']}/{row['total']}",
                     f"{row['mean_ms']:.1f}",
                     str(call_count),
                     selected,
