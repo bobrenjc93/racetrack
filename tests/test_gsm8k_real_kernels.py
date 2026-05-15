@@ -183,6 +183,21 @@ def test_dsv3_2_real_rows_skip_helion_until_full_model_configs_exist() -> None:
     )
 
 
+def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
+    rows = discover_real_kernel_rows(
+        partition_model="dsv3_2_nvfp4",
+        partition_filter="cd91301b",
+        backend_filter="triton",
+    )
+
+    row = next(row for row in rows if row.partition == "cd91301b")
+    assert row.ops == (
+        "fused_full_topk_indexer",
+        "fused_residual_norm",
+        "fused_swiglu",
+    )
+
+
 def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
     triton_dir = tmp_path / "kernels" / "triton"
     helion_dir = tmp_path / "kernels" / "helion"
