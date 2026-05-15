@@ -22,6 +22,7 @@ except Exception:
 _COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 
 BLOCK_SIZE = 256
+MIN_CUTE_ROWS = 512
 
 
 def _cute_tensor(tensor: torch.Tensor):
@@ -102,7 +103,8 @@ if BACKEND_AVAILABLE:
 def fused_residual_norm(
     residual, update, norm_weight, *, eps, fallback,
 ):
-    del fallback
+    if residual.shape[0] < MIN_CUTE_ROWS:
+        return fallback(residual, update, norm_weight, eps=eps)
     residual_c = residual.contiguous()
     update_c = update.contiguous()
     weight_c = norm_weight.contiguous()

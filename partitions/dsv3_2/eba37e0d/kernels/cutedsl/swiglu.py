@@ -22,6 +22,7 @@ except Exception:
 _COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
 
 BLOCK_SIZE = 256
+MIN_CUTE_ROWS = 512
 
 
 def _cute_tensor(tensor: torch.Tensor):
@@ -72,7 +73,8 @@ if BACKEND_AVAILABLE:
 
 
 def fused_swiglu(gate, up, *, fallback):
-    del fallback
+    if gate.shape[0] < MIN_CUTE_ROWS:
+        return fallback(gate, up)
     gate_c = gate.contiguous()
     up_c = up.contiguous()
     out = torch.empty_like(gate_c)

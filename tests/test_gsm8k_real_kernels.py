@@ -183,6 +183,8 @@ def test_dsv3_2_real_rows_skip_helion_until_full_model_configs_exist() -> None:
         "fused_single_token_moe",
         "fused_swiglu",
     )
+    cutedsl_row = next(row for row in rows if row.backend == "cutedsl")
+    assert cutedsl_row.ops == best_row.ops
 
 
 def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
@@ -199,6 +201,14 @@ def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
         "fused_single_token_moe",
         "fused_swiglu",
     )
+
+    cutedsl_rows = discover_real_kernel_rows(
+        partition_model="dsv3_2_nvfp4",
+        partition_filter="cd91301b",
+        backend_filter="cutedsl",
+    )
+    cutedsl_row = next(row for row in cutedsl_rows if row.partition == "cd91301b")
+    assert cutedsl_row.ops == row.ops
 
 
 def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
