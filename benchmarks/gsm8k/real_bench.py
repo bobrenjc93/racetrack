@@ -330,15 +330,21 @@ def run(
         if _is_rank0():
             print(f"Row {row.label}: ops={','.join(row.ops)}", flush=True)
         if row.backend == TORCH_COMPILE_BACKEND:
-            compiled_model = torch.compile(model)
-            outputs, total_ms = _evaluate_row(
-                compiled_model,
-                tokenizer,
-                dataset,
-                max_new_tokens=max_new_tokens,
-            )
-            del compiled_model
-            _cleanup_compile_state()
+            try:
+                compiled_model = torch.compile(model)
+                outputs, total_ms = _evaluate_row(
+                    compiled_model,
+                    tokenizer,
+                    dataset,
+                    max_new_tokens=max_new_tokens,
+                )
+                del compiled_model
+                _cleanup_compile_state()
+            except Exception as exc:
+                if _is_rank0():
+                    print(f"Skipping {row.label}: {exc}", flush=True)
+                _cleanup_compile_state()
+                continue
             row_result = _row_result(
                 row, outputs, total_ms, baseline_outputs, {}, {},
             )
