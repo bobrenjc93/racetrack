@@ -123,6 +123,28 @@ The realistic runner checks both absolute and relative error:
 `diff <= atol + rtol * max_abs(reference)`. Defaults are `--atol 0.5` and
 `--rtol 1e-1`, which are intended for long bf16 recurrence checks.
 
+## Real GSM8K leaderboard
+
+Published GSM8K leaderboards should use the real-weight runner, not the
+synthetic partition shape benchmark. The real runner loads the converted
+DeepSeek-V3.2 model-parallel checkpoint, evaluates the full baseline model,
+then patches compatible partition-local kernels into that same full model and
+requires every patched row to reproduce the baseline generated completions.
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+  -m benchmarks.gsm8k.real_bench \
+  --ckpt-path checkpoints/dsv3_2-mp8 \
+  --samples 50
+```
+
+The runner requires a Hugging Face token via `--hf-token`, `HF_TOKEN`, or
+`hf_token=...` in `~/.env`. Rows are only emitted for partition kernels with a
+real-model adapter; unsupported synthetic-only fusions are excluded until they
+can be bound to checkpoint-backed `inference.model.Transformer` modules.
+If the converted checkpoint is not available, pass `--hf-direct` to stream the
+Hugging Face shards and slice the tensor-parallel weights on each rank.
+
 Example 8xH100 realistic-shape output:
 
 ```text

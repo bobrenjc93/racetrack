@@ -63,7 +63,8 @@ REAL_WEIGHT_UNSUPPORTED = (
     "checkpoint and the partition architecture still lacks full checkpoint "
     "coverage for the dense first layers and NVFP4/indexer weights. Use "
     "--dummy-weights for local synthetic optimization; do not publish those "
-    "numbers as GSM8K accuracy."
+    "numbers as GSM8K accuracy. Use benchmarks.gsm8k.real_bench for the "
+    "checkpoint-backed end-to-end leaderboard."
 )
 
 
