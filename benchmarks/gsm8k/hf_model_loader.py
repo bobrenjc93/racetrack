@@ -10,6 +10,7 @@ from typing import Literal
 import torch
 
 SLICE = Literal["full", "row", "col"]
+POST_LOAD_TRANSFORM_HOOKS = ("rebuild_derived_weights", "fuse_indexer_weights")
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,29 @@ def load_hf_sharded_weights(
                 _copy_into(assignment.target, value)
                 loaded += 1
     return loaded
+
+
+def run_post_load_transforms(
+    model: torch.nn.Module,
+    *,
+    hook_names: tuple[str, ...] = POST_LOAD_TRANSFORM_HOOKS,
+) -> list[str]:
+    """Run module hooks that rebuild derived tensors after checkpoint load.
+
+    A module may expose methods such as ``rebuild_derived_weights`` or
+    ``fuse_indexer_weights`` when some inference-time tensors are derived from
+    checkpoint parameters rather than stored directly in the checkpoint.
+    """
+    called: list[str] = []
+    for module_name, module in model.named_modules():
+        for hook_name in hook_names:
+            hook = getattr(module, hook_name, None)
+            if callable(hook):
+                hook()
+                label = module_name or module.__class__.__name__
+                called.append(f"{label}.{hook_name}")
+                break
+    return called
 
 
 def _copy_into(target: torch.Tensor, value: torch.Tensor) -> None:

@@ -541,6 +541,15 @@ class MLA(nn.Module):
         self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
         self.dequant_wkv_b = None
 
+    def rebuild_derived_weights(self):
+        """Rebuild inference-only tensors derived from loaded checkpoint weights."""
+        self.dequant_wkv_b = None
+        if self.wkv_b.scale is not None:
+            self.dequant_wkv_b = weight_dequant(self.wkv_b.weight, self.wkv_b.scale)
+
+    def fuse_indexer_weights(self):
+        self.rebuild_derived_weights()
+
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.

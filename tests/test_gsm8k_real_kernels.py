@@ -5,7 +5,7 @@ import textwrap
 import torch
 
 from benchmarks.gsm8k.real_kernels import RealKernelRow, patch_real_model
-from benchmarks.gsm8k.hf_model_loader import _slice_for_rank
+from benchmarks.gsm8k.hf_model_loader import _slice_for_rank, run_post_load_transforms
 
 
 def test_real_kernel_patcher_uses_real_module_weights(tmp_path) -> None:
@@ -76,3 +76,23 @@ def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:
         _slice_for_rank(value, col_target, "col", rank=1),
         value[:, 2:4],
     )
+
+
+def test_post_load_transform_hooks_run_once_per_module() -> None:
+    class Hooked(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.called: list[str] = []
+
+        def rebuild_derived_weights(self) -> None:
+            self.called.append("rebuild")
+
+        def fuse_indexer_weights(self) -> None:
+            self.called.append("fuse")
+
+    model = torch.nn.Sequential(Hooked())
+
+    called = run_post_load_transforms(model)
+
+    assert called == ["0.rebuild_derived_weights"]
+    assert model[0].called == ["rebuild"]

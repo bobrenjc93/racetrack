@@ -144,6 +144,9 @@ real-model adapter; unsupported synthetic-only fusions are excluded until they
 can be bound to checkpoint-backed `inference.model.Transformer` modules.
 If the converted checkpoint is not available, pass `--hf-direct` to stream the
 Hugging Face shards and slice the tensor-parallel weights on each rank.
+After loading weights, the runner calls module post-load hooks such as
+`rebuild_derived_weights()` or `fuse_indexer_weights()` so modules can rebuild
+inference-only fused tensors from checkpoint parameters.
 
 Example 8xH100 realistic-shape output:
 

@@ -90,7 +90,10 @@ def _load_model_and_tokenizer(
     from safetensors.torch import load_model
     from transformers import PreTrainedTokenizerFast
 
-    from benchmarks.gsm8k.hf_model_loader import load_hf_sharded_weights
+    from benchmarks.gsm8k.hf_model_loader import (
+        load_hf_sharded_weights,
+        run_post_load_transforms,
+    )
     from inference.model import ModelArgs, Transformer
 
     world_size = _world_size()
@@ -135,6 +138,9 @@ def _load_model_and_tokenizer(
         )
         if _is_rank0():
             print(f"Loaded {loaded} HF tensors for rank 0", flush=True)
+    transforms = run_post_load_transforms(model)
+    if transforms and _is_rank0():
+        print(f"Ran {len(transforms)} post-load model transforms", flush=True)
     model.eval()
 
     tokenizer_file = ckpt_path / "tokenizer.json"
