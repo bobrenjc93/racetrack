@@ -33,7 +33,8 @@ SUPPORTED_OPS = frozenset({
     "fused_single_token_moe",
     "fused_swiglu",
 })
-BACKENDS = ("torch", "triton", "cutedsl", "helion", "best")
+TORCH_COMPILE_BACKEND = "torch.compile"
+BACKENDS = ("torch", TORCH_COMPILE_BACKEND, "triton", "cutedsl", "helion", "best")
 REAL_DISABLED_BACKENDS = {
     "dsv3_2": frozenset({"helion"}),
 }
@@ -83,8 +84,23 @@ def discover_real_kernel_rows(
             backend="torch",
             kernel_root=None,
             ops=(),
-        )
+        ),
     ]
+    include_compile = backend_filter == "all" or any(
+        _normalize_backend_name(b) == TORCH_COMPILE_BACKEND
+        for b in backend_filter.split(",")
+        if b.strip()
+    )
+    if include_compile:
+        rows.append(
+            RealKernelRow(
+                partition_model=partition_model,
+                partition="baseline",
+                backend=TORCH_COMPILE_BACKEND,
+                kernel_root=None,
+                ops=(),
+            ),
+        )
     root = Path(__file__).resolve().parents[2] / "partitions" / partition_model
     partitions = sorted(
         p for p in root.iterdir()

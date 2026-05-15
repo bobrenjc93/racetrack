@@ -38,12 +38,22 @@ from benchmarks.gsm8k.eval import (
 )
 from benchmarks.gsm8k.hf_auth import require_hf_token
 from benchmarks.gsm8k.real_kernels import (
+    TORCH_COMPILE_BACKEND,
     RealKernelRow,
     discover_real_kernel_rows,
     patch_real_model,
 )
 
 ANSWER_ATOL = 1.0e-3
+
+
+def _cleanup_compile_state() -> None:
+    dynamo = getattr(torch, "_dynamo", None)
+    reset = getattr(dynamo, "reset", None)
+    if callable(reset):
+        reset()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 @dataclass
@@ -319,21 +329,35 @@ def run(
     for row in rows[1:]:
         if _is_rank0():
             print(f"Row {row.label}: ops={','.join(row.ops)}", flush=True)
-        with patch_real_model(model, row, strict_kernel_use=True) as stats:
+        if row.backend == TORCH_COMPILE_BACKEND:
+            compiled_model = torch.compile(model)
             outputs, total_ms = _evaluate_row(
-                model,
+                compiled_model,
                 tokenizer,
                 dataset,
                 max_new_tokens=max_new_tokens,
             )
-        row_result = _row_result(
-            row,
-            outputs,
-            total_ms,
-            baseline_outputs,
-            stats.calls,
-            stats.selected_backends,
-        )
+            del compiled_model
+            _cleanup_compile_state()
+            row_result = _row_result(
+                row, outputs, total_ms, baseline_outputs, {}, {},
+            )
+        else:
+            with patch_real_model(model, row, strict_kernel_use=True) as stats:
+                outputs, total_ms = _evaluate_row(
+                    model,
+                    tokenizer,
+                    dataset,
+                    max_new_tokens=max_new_tokens,
+                )
+            row_result = _row_result(
+                row,
+                outputs,
+                total_ms,
+                baseline_outputs,
+                stats.calls,
+                stats.selected_backends,
+            )
         if require_pass and not row_result.validation:
             raise RuntimeError(
                 f"{row.label} failed validation: "
@@ -387,7 +411,10 @@ def _render_markdown(report: dict, slug: str) -> str:
         report["rows"],
         key=lambda row: (not row["validation"], row["total_ms"]),
     )
-    baseline = next(row for row in report["rows"] if row["partition"] == "baseline")
+    baseline = next(
+        row for row in report["rows"]
+        if row["partition"] == "baseline" and row["backend"] == "torch"
+    )
     baseline_ms = baseline["total_ms"]
     winner = next((row for row in rows if row["validation"]), rows[0])
     winner_speedup = baseline_ms / winner["total_ms"] if winner["total_ms"] else None
