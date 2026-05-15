@@ -3,7 +3,8 @@
 This runner loads the checkpoint-backed ``inference.model.Transformer`` once,
 evaluates the baseline, and then evaluates full-model rows where compatible
 partition-local kernels are patched into the real model. Unlike
-``benchmarks.gsm8k.bench``, rows here generate GSM8K answers with real weights.
+``benchmarks.gsm8k.bench``, rows here generate GSM8K answers with real weights
+and validate the extracted numeric answer for each row.
 
 Run with torchrun so the DeepSeek checkpoint is loaded with model parallelism:
 
@@ -378,6 +379,7 @@ def _render_markdown(report: dict, slug: str) -> str:
         "",
         f"**Model**: {report['model']}",
         f"**Partition model**: {report['partition_model']}",
+        "**Rows**: real-model-compatible partition kernels only",
         f"**GPU**: {hw.get('gpu', 'N/A')} x{hw.get('gpu_count', 1)}",
         f"**CUDA**: {hw.get('cuda', 'N/A')}",
         f"**PyTorch**: {hw.get('torch', 'N/A')}",
@@ -480,7 +482,7 @@ def main(argv: list[str] | None = None) -> None:
     slug = _hardware_slug("cuda:0")
     output = args.output
     if output is None:
-        output = Path(__file__).parent / "results" / args.partition_model / f"{slug}-real.md"
+        output = Path(__file__).parent / "results" / args.partition_model / f"{slug}.md"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_render_markdown(report, slug))
     print(f"Saved markdown report to {output}")
