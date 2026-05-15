@@ -178,7 +178,9 @@ def test_dsv3_2_real_rows_skip_helion_until_full_model_configs_exist() -> None:
     best_row = next(row for row in rows if row.backend == "best")
     assert best_row.ops == (
         "fused_full_topk_indexer",
+        "fused_mlp_gate_up_proj",
         "fused_residual_norm",
+        "fused_single_token_moe",
         "fused_swiglu",
     )
 
@@ -359,6 +361,48 @@ def test_real_kernel_patcher_can_route_moe_forward(tmp_path) -> None:
     assert stats.calls == {"fused_single_token_moe": 1}
     assert stats.used_partition_kernel
     assert torch.equal(actual, x + 1)
+
+
+def test_real_kernel_patcher_can_route_mlp_gate_up_projection(tmp_path) -> None:
+    kernel_dir = tmp_path / "kernels" / "triton"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "ops.py").write_text(
+        textwrap.dedent(
+            """
+            BACKEND_AVAILABLE = True
+
+            def fused_mlp_gate_up_proj(
+                x, w1_weight, w1_scale, w3_weight, w3_scale, *, scale_fmt, fallback,
+            ):
+                return fallback(
+                    x, w1_weight, w1_scale, w3_weight, w3_scale, scale_fmt=scale_fmt,
+                )
+            """
+        )
+    )
+
+    from inference.model import MLP
+
+    model = MLP(8, 16).float().eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(mean=0.0, std=0.02)
+    x = torch.randn(2, 3, 8)
+    expected = model(x)
+    row = RealKernelRow(
+        partition_model="dsv3_2",
+        partition="test",
+        backend="triton",
+        kernel_root=tmp_path / "kernels",
+        ops=("fused_mlp_gate_up_proj",),
+    )
+
+    with patch_real_model(model, row) as stats:
+        actual = model(x)
+
+    assert stats.calls == {"fused_mlp_gate_up_proj": 1}
+    assert stats.used_partition_kernel
+    assert torch.equal(actual, expected)
 
 
 def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:

@@ -30,6 +30,7 @@ FUSED_OP_GRAPH = {
         "rms_norm_q", "q_b_proj", "rope_q", "cat_q",
         "rms_norm_kv", "rope_kpe", "kv_b_proj", "split_kv", "cat_k",
     ],
+    "fused_single_token_moe": ["gate_router", "topk_softmax", "expert_sum"],
     "fused_residual_norm": ["res_add_attn", "ffn_norm"],
 }
 

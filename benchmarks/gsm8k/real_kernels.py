@@ -28,6 +28,7 @@ from racetrack.runtime.dispatch import KernelDispatcher
 
 SUPPORTED_OPS = frozenset({
     "fused_full_topk_indexer",
+    "fused_mlp_gate_up_proj",
     "fused_residual_norm",
     "fused_single_token_moe",
     "fused_swiglu",
@@ -228,7 +229,9 @@ def _patch_modules(
             _attach_moe_kernel(module, dispatcher, stats, originals)
         if "fused_residual_norm" in row.ops and isinstance(module, real_model.RMSNorm):
             _attach_kernel(module, dispatcher, stats, originals)
-        if "fused_swiglu" in row.ops and isinstance(module, (real_model.MLP, real_model.Expert)):
+        if "fused_mlp_gate_up_proj" in row.ops and isinstance(module, real_model.MLP):
+            _attach_mlp_gate_up_kernel(module, row, dispatcher, stats, originals)
+        elif "fused_swiglu" in row.ops and isinstance(module, (real_model.MLP, real_model.Expert)):
             _attach_kernel(module, dispatcher, stats, originals)
 
 
@@ -380,6 +383,65 @@ def _attach_moe_kernel(
             return original_forward(hidden)
 
         return dispatcher.call(op_name, fallback, module, x)
+
+    _set_attr(module, "forward", forward, originals)
+
+
+def _attach_mlp_gate_up_kernel(
+    module: torch.nn.Module,
+    row: RealKernelRow,
+    dispatcher: Any,
+    stats: PatchStats,
+    originals: list[tuple[torch.nn.Module, str, bool, Any]],
+) -> None:
+    gate_up_op = "fused_mlp_gate_up_proj"
+    swiglu_op = "fused_swiglu"
+
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        from inference import model as real_model
+
+        stats.calls[gate_up_op] = stats.calls.get(gate_up_op, 0) + 1
+
+        def gate_up_fallback(
+            hidden: torch.Tensor,
+            w1_weight: torch.Tensor,
+            w1_scale: torch.Tensor | None,
+            w3_weight: torch.Tensor,
+            w3_scale: torch.Tensor | None,
+            *,
+            scale_fmt: str | None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del w1_scale, w3_scale
+            return (
+                real_model.linear(hidden, w1_weight, None, scale_fmt),
+                real_model.linear(hidden, w3_weight, None, scale_fmt),
+            )
+
+        gate, up = dispatcher.call(
+            gate_up_op,
+            gate_up_fallback,
+            x,
+            module.w1.weight,
+            module.w1.scale,
+            module.w3.weight,
+            module.w3.scale,
+            scale_fmt=module.w1.scale_fmt,
+        )
+
+        def swiglu_fallback(
+            gate_values: torch.Tensor,
+            up_values: torch.Tensor,
+        ) -> torch.Tensor:
+            return (
+                torch.nn.functional.silu(gate_values.float()) * up_values.float()
+            ).type_as(gate_values)
+
+        if swiglu_op in row.ops:
+            stats.calls[swiglu_op] = stats.calls.get(swiglu_op, 0) + 1
+            hidden = dispatcher.call(swiglu_op, swiglu_fallback, gate, up)
+        else:
+            hidden = swiglu_fallback(gate, up)
+        return module.w2(hidden.type_as(x))
 
     _set_attr(module, "forward", forward, originals)
 
