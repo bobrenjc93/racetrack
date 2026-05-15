@@ -18,7 +18,10 @@ MODEL_NAME = "dsv3_2"
 PARTITION_NOTES = (
     "Multi-kernel partition: fused_norm_rope (RMSNorm+RoPE), "
     "fused_residual_norm (residual add+RMSNorm), and fused_swiglu "
-    "(SiLU gate+elementwise mul). Reduces kernel launches by ~30%."
+    "(SiLU gate+elementwise mul). The real-model runner also uses a "
+    "lazy full-topk indexer fast path when the sequence length is within "
+    "index_topk, which is mathematically the same attention mask and can "
+    "rebuild the indexer k-cache before falling back on longer sequences."
 )
 
 # Graph node IDs covered by each fused op.  Used by scripts/gen_graphs.py
@@ -26,7 +29,9 @@ PARTITION_NOTES = (
 # NODES table.
 FUSED_OP_GRAPH = {
     "fused_norm_rope": ["rms_norm_q", "rms_norm_kv", "rope_kpe"],
+    "fused_full_topk_indexer": ["indexer_q_proj", "indexer_score", "indexer_topk"],
     "fused_residual_norm": ["res_add_attn", "ffn_norm"],
+    "fused_swiglu": ["swiglu"],
 }
 
 Fallback = Callable[..., Any]

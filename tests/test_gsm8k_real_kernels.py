@@ -176,7 +176,11 @@ def test_dsv3_2_real_rows_skip_helion_until_full_model_configs_exist() -> None:
     assert rows
     assert all(row.backend != "helion" for row in rows)
     best_row = next(row for row in rows if row.backend == "best")
-    assert best_row.ops == ("fused_residual_norm", "fused_swiglu")
+    assert best_row.ops == (
+        "fused_full_topk_indexer",
+        "fused_residual_norm",
+        "fused_swiglu",
+    )
 
 
 def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
@@ -227,6 +231,68 @@ def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
         for backend in backends
     }
     assert "helion" not in selected
+
+
+def test_real_kernel_patcher_can_route_indexer_forward(tmp_path) -> None:
+    kernel_dir = tmp_path / "kernels" / "triton"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "ops.py").write_text(
+        textwrap.dedent(
+            """
+            import torch
+
+            BACKEND_AVAILABLE = True
+
+            def fused_full_topk_indexer(indexer, x, qr, start_pos, freqs_cis, mask, *, fallback):
+                del fallback, indexer, qr, freqs_cis, mask
+                end_pos = start_pos + x.shape[1]
+                return torch.arange(end_pos, device=x.device).view(1, 1, end_pos).expand(
+                    x.shape[0], x.shape[1], end_pos,
+                )
+            """
+        )
+    )
+
+    from inference import model as real_model
+
+    class TinyIndexer(real_model.Indexer):
+        def __init__(self) -> None:
+            torch.nn.Module.__init__(self)
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            qr: torch.Tensor,
+            start_pos: int,
+            freqs_cis: torch.Tensor,
+            mask: torch.Tensor | None,
+        ) -> torch.Tensor:
+            raise AssertionError("fallback should not run")
+
+    class Tiny(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.indexer = TinyIndexer()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.indexer(x, x, 2, torch.empty(3, 2), None)
+
+    model = Tiny()
+    row = RealKernelRow(
+        partition_model="dsv3_2",
+        partition="test",
+        backend="triton",
+        kernel_root=tmp_path / "kernels",
+        ops=("fused_full_topk_indexer",),
+    )
+
+    with patch_real_model(model, row) as stats:
+        topk = model(torch.randn(1, 3, 4))
+
+    assert stats.calls == {"fused_full_topk_indexer": 1}
+    assert stats.used_partition_kernel
+    assert topk.shape == (1, 3, 5)
+    assert torch.equal(topk[0, 0], torch.arange(5))
 
 
 def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:
