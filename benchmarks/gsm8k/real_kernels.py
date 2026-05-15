@@ -29,6 +29,7 @@ from racetrack.runtime.dispatch import KernelDispatcher
 SUPPORTED_OPS = frozenset({
     "fused_full_topk_indexer",
     "fused_residual_norm",
+    "fused_single_token_moe",
     "fused_swiglu",
 })
 BACKENDS = ("torch", "triton", "cutedsl", "helion", "best")
@@ -223,6 +224,8 @@ def _patch_modules(
             _attach_mla_full_topk_forward(module, originals)
         if "fused_full_topk_indexer" in row.ops and isinstance(module, real_model.Indexer):
             _attach_indexer_kernel(module, dispatcher, stats, originals)
+        if "fused_single_token_moe" in row.ops and isinstance(module, real_model.MoE):
+            _attach_moe_kernel(module, dispatcher, stats, originals)
         if "fused_residual_norm" in row.ops and isinstance(module, real_model.RMSNorm):
             _attach_kernel(module, dispatcher, stats, originals)
         if "fused_swiglu" in row.ops and isinstance(module, (real_model.MLP, real_model.Expert)):
@@ -358,6 +361,27 @@ def _mla_full_topk_forward(
         x = torch.einsum("bsht,btc->bshc", scores, module.kv_cache[:bsz, :end_pos])
         x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -module.v_head_dim:])
     return module.wo(x.flatten(2))
+
+
+def _attach_moe_kernel(
+    module: torch.nn.Module,
+    dispatcher: Any,
+    stats: PatchStats,
+    originals: list[tuple[torch.nn.Module, str, bool, Any]],
+) -> None:
+    op_name = "fused_single_token_moe"
+    original_forward = module.forward
+
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        stats.calls[op_name] = stats.calls.get(op_name, 0) + 1
+
+        def fallback(moe: torch.nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+            del moe
+            return original_forward(hidden)
+
+        return dispatcher.call(op_name, fallback, module, x)
+
+    _set_attr(module, "forward", forward, originals)
 
 
 def _set_attr(

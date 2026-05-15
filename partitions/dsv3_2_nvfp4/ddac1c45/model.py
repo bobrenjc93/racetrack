@@ -34,6 +34,7 @@ FUSED_OP_GRAPH = {
     "fused_q_rope_prefill": ["q_rope"],
     "fused_prefill_qkv_b_rope_cache": ["q_rms", "q_b_proj", "q_rope", "kv_c_rms", "kv_b_proj", "kv_rope", "mla_cache"],
     "fused_full_topk_indexer": ["indexer_mqa", "logits_topk", "topk_page_idx"],
+    "fused_single_token_moe": ["gate_router", "topk_softmax", "expert_sum"],
     "fused_residual_norm": ["attn_residual_add", "ffn_rms"],
     "fused_swiglu": ["ffn_silu", "ffn_gate_up_mul"],
     "fused_indexer_k_path": ["kv_c_rms", "kv_rope", "kv_quant_fp8", "mla_cache", "q_rms", "indexer_ln", "indexer_rope", "indexer_quant_fp8", "indexer_cache"],

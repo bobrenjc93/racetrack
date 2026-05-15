@@ -194,6 +194,7 @@ def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
     assert row.ops == (
         "fused_full_topk_indexer",
         "fused_residual_norm",
+        "fused_single_token_moe",
         "fused_swiglu",
     )
 
@@ -308,6 +309,56 @@ def test_real_kernel_patcher_can_route_indexer_forward(tmp_path) -> None:
     assert stats.used_partition_kernel
     assert topk.shape == (1, 3, 5)
     assert torch.equal(topk[0, 0], torch.arange(5))
+
+
+def test_real_kernel_patcher_can_route_moe_forward(tmp_path) -> None:
+    kernel_dir = tmp_path / "kernels" / "triton"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "ops.py").write_text(
+        textwrap.dedent(
+            """
+            BACKEND_AVAILABLE = True
+
+            def fused_single_token_moe(moe, x, *, fallback):
+                del fallback, moe
+                return x + 1
+            """
+        )
+    )
+
+    from inference import model as real_model
+
+    class TinyMoE(real_model.MoE):
+        def __init__(self) -> None:
+            torch.nn.Module.__init__(self)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("fallback should not run")
+
+    class Tiny(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.moe = TinyMoE()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.moe(x)
+
+    model = Tiny()
+    row = RealKernelRow(
+        partition_model="dsv3_2_nvfp4",
+        partition="test",
+        backend="triton",
+        kernel_root=tmp_path / "kernels",
+        ops=("fused_single_token_moe",),
+    )
+
+    x = torch.randn(1, 1, 4)
+    with patch_real_model(model, row) as stats:
+        actual = model(x)
+
+    assert stats.calls == {"fused_single_token_moe": 1}
+    assert stats.used_partition_kernel
+    assert torch.equal(actual, x + 1)
 
 
 def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:
