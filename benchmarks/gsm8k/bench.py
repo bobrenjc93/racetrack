@@ -1,23 +1,25 @@
-"""GSM8K-shaped benchmark.
+"""GSM8K benchmark harness.
 
 Measures throughput at sequence lengths representative of the GSM8K dataset:
   - question:  96 tokens  (median question length)
   - cot:      256 tokens  (chain-of-thought answer)
   - full:     384 tokens  (question + full answer)
 
-Sweeps all partitions and kernel backends, picks the fastest combination,
-and writes the result to winner.json alongside this file.
+Local optimization runs use dummy synthetic weights and validate each row's
+logits against the baseline implementation for the same synthetic inputs. A
+published GSM8K report must use real weights and a Hugging Face token; this
+entry point refuses to publish synthetic results as GSM8K accuracy.
 
 Usage:
-    python -m benchmarks.gsm8k.bench
-    python -m benchmarks.gsm8k.bench --device cpu --dtype float32
+    python -m benchmarks.gsm8k.bench --dummy-weights
+    python -m benchmarks.gsm8k.bench --dummy-weights --device cpu --dtype float32
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
-import json
+import math
 import os
 import platform
 import time
@@ -26,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+
+from benchmarks.gsm8k.hf_auth import require_hf_token
 
 BENCHMARK_DIR = Path(__file__).parent
 MODELS = ("dsv3_2", "dsv3_2_nvfp4")
@@ -52,6 +56,16 @@ MODEL_OVERRIDES: dict[str, int | float | str] = {
     "num_layers": 4,
 }
 
+REAL_WEIGHT_UNSUPPORTED = (
+    "Real-weight per-row GSM8K benchmark generation is not supported by this "
+    "runner yet. The current partition models are single-process synthetic "
+    "shape models, while the DeepSeek-V3.2 checkpoint is an 8-way model-parallel "
+    "checkpoint and the partition architecture still lacks full checkpoint "
+    "coverage for the dense first layers and NVFP4/indexer weights. Use "
+    "--dummy-weights for local synthetic optimization; do not publish those "
+    "numbers as GSM8K accuracy."
+)
+
 
 @dataclass
 class Result:
@@ -67,6 +81,9 @@ class Result:
     min_ms: float
     max_ms: float
     tokens_per_second: float
+    max_abs_diff: float | None = None
+    max_rel_diff: float | None = None
+    ok: bool = True
     kernels: dict[str, str] | None = None
 
 
@@ -129,15 +146,19 @@ def _time_forward(
     warmup: int,
     repeat: int,
     device: torch.device,
-) -> list[float]:
+) -> tuple[torch.Tensor, list[float]]:
+    output = None
     for _ in range(warmup):
-        model(input_ids, positions)
+        output = model(input_ids, positions)
     _sync(device)
 
     if device.type == "cuda":
+        if output is None:
+            output = model(input_ids, positions)
+            _sync(device)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            model(input_ids, positions)
+            output = model(input_ids, positions)
 
         times: list[float] = []
         for _ in range(repeat):
@@ -152,9 +173,10 @@ def _time_forward(
         times = []
         for _ in range(repeat):
             t0 = time.perf_counter()
-            model(input_ids, positions)
+            output = model(input_ids, positions)
             times.append((time.perf_counter() - t0) * 1000.0)
-    return times
+    assert output is not None
+    return output, times
 
 
 def _resolve_dtype(name: str, device: torch.device) -> torch.dtype:
@@ -184,6 +206,105 @@ def _discover_kernel_map(dispatcher, backend: str) -> dict[str, str] | None:
     return kernel_map or None
 
 
+def _validate_output(
+    output: torch.Tensor,
+    baseline: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+) -> tuple[float, float, bool]:
+    if output.shape != baseline.shape:
+        return math.inf, math.inf, False
+
+    output_float = output.float()
+    baseline_float = baseline.float()
+    output_finite = torch.isfinite(output_float)
+    baseline_finite = torch.isfinite(baseline_float)
+    if not torch.equal(output_finite, baseline_finite):
+        return math.inf, math.inf, False
+
+    finite_mask = output_finite & baseline_finite
+    if bool(finite_mask.any()):
+        diff = float((output_float[finite_mask] - baseline_float[finite_mask]).abs().max().item())
+        ref_scale = max(float(baseline_float[finite_mask].abs().max().item()), 1.0e-12)
+    else:
+        diff = 0.0
+        ref_scale = 1.0
+    rel_diff = diff / ref_scale
+    ok = math.isfinite(diff) and diff <= atol + rtol * ref_scale
+    return diff, rel_diff, ok
+
+
+def _benchmark_backend(
+    *,
+    model_name: str,
+    partition: str,
+    backend: str,
+    case_name: str,
+    tokens: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    warmup: int,
+    repeat: int,
+    baseline_out: torch.Tensor | None,
+    atol: float,
+    rtol: float,
+) -> tuple[Result, torch.Tensor]:
+    os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
+    module = _load_partition_module(model_name, partition)
+    model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
+    model = _compile_model_if_requested(model, backend)
+
+    output, times = _time_forward(
+        model, input_ids, positions,
+        warmup=warmup, repeat=repeat, device=device,
+    )
+    mean_ms = sum(times) / len(times)
+
+    if baseline_out is None:
+        max_abs_diff = 0.0
+        max_rel_diff = 0.0
+        ok = True
+    else:
+        max_abs_diff, max_rel_diff, ok = _validate_output(
+            output, baseline_out, atol=atol, rtol=rtol,
+        )
+
+    status = "compiled" if backend == TORCH_COMPILE_BACKEND else "native"
+    dispatcher = getattr(model, "dispatcher", None)
+    kernel_map = None
+    if dispatcher is not None and backend in CONCRETE_BACKENDS:
+        kernel_map = _discover_kernel_map(dispatcher, backend)
+
+    result = Result(
+        model=model_name,
+        partition=partition,
+        backend=backend,
+        backend_status=status,
+        case=case_name,
+        tokens=tokens,
+        device=str(device),
+        dtype=str(dtype).replace("torch.", ""),
+        mean_ms=mean_ms,
+        min_ms=min(times),
+        max_ms=max(times),
+        tokens_per_second=tokens / (mean_ms / 1000.0),
+        max_abs_diff=max_abs_diff,
+        max_rel_diff=max_rel_diff,
+        ok=ok,
+        kernels=kernel_map,
+    )
+
+    del model
+    _sync(device)
+    if backend == TORCH_COMPILE_BACKEND:
+        _cleanup_compile_state(device)
+        _sync(device)
+    return result, output
+
+
 def run(
     device_str: str = "cuda:0",
     dtype_str: str = "auto",
@@ -191,7 +312,10 @@ def run(
     repeat: int = 30,
     partition_filter: str = "all",
     backend_filter: str = "all",
+    atol: float = 5.0e-2,
+    rtol: float = 1.0e-2,
 ) -> list[Result]:
+    """Run the synthetic dummy-weight shape benchmark."""
     device = torch.device(device_str)
     dtype = _resolve_dtype(dtype_str, device)
 
@@ -202,71 +326,73 @@ def run(
             all_partitions = [p for p in all_partitions if p in partition_filter.split(",")]
             if not all_partitions:
                 raise KeyError(f"No partitions matched filter {partition_filter!r}")
-        for partition in all_partitions:
-            if backend_filter == "all":
-                backends = (
-                    list(BASELINE_BACKENDS)
-                    if partition == "baseline"
-                    else list(PARTITION_BACKENDS)
-                )
-            else:
-                backends = [
-                    _normalize_backend_name(backend)
-                    for backend in backend_filter.split(",")
-                    if backend.strip()
-                ]
-            for backend in backends:
-                os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
-                module = _load_partition_module(model_name, partition)
-                model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
-                model = _compile_model_if_requested(model, backend)
+        for case_name, tokens in CASES:
+            input_ids = torch.arange(tokens, device=device, dtype=torch.long) % 4096
+            positions = torch.arange(tokens, device=device, dtype=torch.long)
 
-                dispatcher = getattr(model, "dispatcher", None)
-                backend_results: list[Result] = []
+            baseline_result, baseline_out = _benchmark_backend(
+                model_name=model_name,
+                partition="baseline",
+                backend="torch",
+                case_name=case_name,
+                tokens=tokens,
+                device=device,
+                dtype=dtype,
+                input_ids=input_ids,
+                positions=positions,
+                warmup=warmup,
+                repeat=repeat,
+                baseline_out=None,
+                atol=atol,
+                rtol=rtol,
+            )
 
-                try:
-                    for case_name, tokens in CASES:
-                        input_ids = torch.arange(tokens, device=device, dtype=torch.long) % 4096
-                        positions = torch.arange(tokens, device=device, dtype=torch.long)
+            for partition in all_partitions:
+                if backend_filter == "all":
+                    backends = (
+                        list(BASELINE_BACKENDS)
+                        if partition == "baseline"
+                        else list(PARTITION_BACKENDS)
+                    )
+                else:
+                    backends = [
+                        _normalize_backend_name(backend)
+                        for backend in backend_filter.split(",")
+                        if backend.strip()
+                    ]
+                for backend in backends:
+                    if partition == "baseline" and backend == "torch":
+                        results.append(baseline_result)
+                        continue
 
-                        times = _time_forward(
-                            model, input_ids, positions,
-                            warmup=warmup, repeat=repeat, device=device,
-                        )
-                        mean_ms = sum(times) / len(times)
-
-                        status = "compiled" if backend == TORCH_COMPILE_BACKEND else "native"
-                        kernel_map = None
-                        if dispatcher is not None and backend in CONCRETE_BACKENDS:
-                            kernel_map = _discover_kernel_map(dispatcher, backend)
-
-                        backend_results.append(Result(
-                            model=model_name,
+                    try:
+                        result, output = _benchmark_backend(
+                            model_name=model_name,
                             partition=partition,
                             backend=backend,
-                            backend_status=status,
-                            case=case_name,
+                            case_name=case_name,
                             tokens=tokens,
-                            device=str(device),
-                            dtype=str(dtype).replace("torch.", ""),
-                            mean_ms=mean_ms,
-                            min_ms=min(times),
-                            max_ms=max(times),
-                            tokens_per_second=tokens / (mean_ms / 1000.0),
-                            kernels=kernel_map,
-                        ))
-                except RuntimeError as exc:
-                    if not str(exc).startswith("No available "):
-                        raise
-                    print(f"Skipping {model_name}/{partition}/{backend}: {exc}")
-                else:
-                    results.extend(backend_results)
-
-                del model
-                _sync(device)
-                if backend == TORCH_COMPILE_BACKEND:
-                    _cleanup_compile_state(device)
+                            device=device,
+                            dtype=dtype,
+                            input_ids=input_ids,
+                            positions=positions,
+                            warmup=warmup,
+                            repeat=repeat,
+                            baseline_out=baseline_out,
+                            atol=atol,
+                            rtol=rtol,
+                        )
+                    except RuntimeError as exc:
+                        if not str(exc).startswith("No available "):
+                            raise
+                        print(f"Skipping {model_name}/{partition}/{backend}: {exc}")
+                    else:
+                        results.append(result)
+                        del output
                     _sync(device)
+
+            del baseline_out
+            _sync(device)
 
     return results
 
@@ -312,6 +438,14 @@ def _build_combo_entry(
     kernel_map = next((r.kernels for r in runs if r.kernels), None)
     aggregate = sum(r.mean_ms for r in runs)
     baseline_aggregate = sum(baseline_ms.get(r.case, r.mean_ms) for r in runs)
+    finite_abs_diffs = [
+        r.max_abs_diff for r in runs
+        if r.max_abs_diff is not None and math.isfinite(r.max_abs_diff)
+    ]
+    finite_rel_diffs = [
+        r.max_rel_diff for r in runs
+        if r.max_rel_diff is not None and math.isfinite(r.max_rel_diff)
+    ]
     return {
         "partition": runs[0].partition,
         "backend": runs[0].backend,
@@ -319,6 +453,9 @@ def _build_combo_entry(
         "kernels": kernel_map,
         "aggregate_mean_ms": round(aggregate, 3),
         "speedup_vs_baseline": round(baseline_aggregate / aggregate, 4) if aggregate > 0 else None,
+        "ok": all(r.ok for r in runs),
+        "max_abs_diff": max(finite_abs_diffs) if finite_abs_diffs else math.inf,
+        "max_rel_diff": max(finite_rel_diffs) if finite_rel_diffs else math.inf,
         "cases": {
             r.case: {
                 "tokens": r.tokens,
@@ -326,6 +463,9 @@ def _build_combo_entry(
                 "min_ms": round(r.min_ms, 3),
                 "max_ms": round(r.max_ms, 3),
                 "tokens_per_second": round(r.tokens_per_second, 1),
+                "max_abs_diff": r.max_abs_diff,
+                "max_rel_diff": r.max_rel_diff,
+                "ok": r.ok,
                 "vs_baseline": round(
                     baseline_ms.get(r.case, r.mean_ms) / r.mean_ms, 4
                 ) if r.mean_ms > 0 else None,
@@ -370,11 +510,13 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
             continue
         best_backend = min(
             backends.items(),
-            key=lambda kv: sum(r.mean_ms for r in kv[1]),
+            key=lambda kv: (not all(r.ok for r in kv[1]), sum(r.mean_ms for r in kv[1])),
         )
         backend_name, runs = best_backend
-        dispatched_ops = _discover_dispatched_ops(results, partition)
-        kernel_map = {op: backend_name for op in dispatched_ops} if dispatched_ops else None
+        kernel_map = None
+        if backend_name in CONCRETE_BACKENDS:
+            dispatched_ops = _discover_dispatched_ops(results, partition)
+            kernel_map = {op: backend_name for op in dispatched_ops} if dispatched_ops else None
         for r in runs:
             best_results.append(Result(
                 model=r.model,
@@ -389,6 +531,9 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
                 min_ms=r.min_ms,
                 max_ms=r.max_ms,
                 tokens_per_second=r.tokens_per_second,
+                max_abs_diff=r.max_abs_diff,
+                max_rel_diff=r.max_rel_diff,
+                ok=r.ok,
                 kernels=kernel_map,
             ))
     return best_results
@@ -411,7 +556,7 @@ def pick_winner(results: list[Result]) -> dict:
 
     ranked = sorted(
         combos.items(),
-        key=lambda kv: sum(r.mean_ms for r in kv[1]),
+        key=lambda kv: (not all(r.ok for r in kv[1]), sum(r.mean_ms for r in kv[1])),
     )
 
     winner_key, winner_runs = ranked[0]
@@ -436,12 +581,15 @@ def pick_winner(results: list[Result]) -> dict:
 
 def _print_table(results: list[Result]) -> None:
     headers = ["model", "partition", "backend", "status", "case", "tokens",
-               "mean_ms", "tok/s"]
+               "mean_ms", "tok/s", "diff", "rel", "ok"]
     rows = []
     for r in results:
         rows.append([
             r.model, r.partition, r.backend, r.backend_status, r.case,
             str(r.tokens), f"{r.mean_ms:.3f}", f"{r.tokens_per_second:.1f}",
+            _format_diff(r.max_abs_diff),
+            _format_diff(r.max_rel_diff),
+            "yes" if r.ok else "no",
         ])
     widths = [
         max(len(str(row[i])) for row in [headers, *rows])
@@ -453,25 +601,37 @@ def _print_table(results: list[Result]) -> None:
         print("  ".join(str(v).ljust(widths[i]) for i, v in enumerate(row)))
 
 
+def _format_diff(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if not math.isfinite(value):
+        return "inf"
+    return f"{value:.3e}"
+
+
 def _render_markdown(report: dict, slug: str) -> str:
     hw = report["hardware"]
     winner = report["winner"]
-    eval_result = report.get("eval")
+    weights_mode = report.get("weights_mode", "unknown")
     lines: list[str] = []
 
-    lines.append(f"# GSM8K Benchmark: {slug}")
+    title = "GSM8K Synthetic Shape Benchmark" if weights_mode == "dummy" else "GSM8K Benchmark"
+    lines.append(f"# {title}: {slug}")
     lines.append("")
     lines.append(f"**GPU**: {hw.get('gpu', 'N/A')} x{hw.get('gpu_count', 1)}")
     lines.append(f"**CUDA**: {hw.get('cuda', 'N/A')}")
     lines.append(f"**PyTorch**: {hw.get('torch', 'N/A')}")
     lines.append(f"**dtype**: {report.get('dtype', 'N/A')}")
     lines.append(f"**Date**: {report.get('timestamp', 'N/A')}")
-    if eval_result:
-        lines.append(f"**Eval model**: {eval_result['model']}")
+    if weights_mode == "dummy":
+        lines.append("**Weights**: dummy synthetic")
         lines.append(
-            f"**GSM8K accuracy**: {eval_result['accuracy_pct']}% "
-            f"({eval_result['correct']}/{eval_result['num_samples']})"
+            "**Validation**: synthetic outputs are compared with `baseline/torch` "
+            "logits for each row. This is not a GSM8K accuracy score."
         )
+    else:
+        lines.append("**Weights**: real")
+        lines.append("**Validation**: each row is evaluated against GSM8K ground truth.")
     lines.append("")
 
     lines.append("## Winner")
@@ -489,9 +649,7 @@ def _render_markdown(report: dict, slug: str) -> str:
 
     lines.append("## Leaderboard")
     lines.append("")
-    headers = ["#", "partition", "backend", "total (ms)", "vs baseline"]
-    if eval_result:
-        headers.append("correctness")
+    headers = ["#", "partition", "backend", "total (ms)", "vs baseline", "validation", "max diff"]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("---" for _ in headers) + "|")
     for rank, entry in enumerate(report["leaderboard"], 1):
@@ -508,9 +666,9 @@ def _render_markdown(report: dict, slug: str) -> str:
             f"{entry['backend']}{kernels_note}",
             f"{entry['aggregate_mean_ms']:.1f}",
             speedup_cell,
+            "pass" if entry.get("ok") else "fail",
+            _format_diff(entry.get("max_abs_diff")),
         ]
-        if eval_result:
-            row.append(f"{eval_result['accuracy_pct']}%")
         lines.append("| " + " | ".join(row) + " |")
     lines.append("")
 
@@ -519,7 +677,11 @@ def _render_markdown(report: dict, slug: str) -> str:
         lines.append("## Cases")
         lines.append("")
         for case_name, case_data in first_cases.items():
-            lines.append(f"- **{case_name}**: {case_data['tokens']} tokens")
+            validation = "pass" if case_data.get("ok") else "fail"
+            lines.append(
+                f"- **{case_name}**: {case_data['tokens']} tokens, "
+                f"{validation}, max diff {_format_diff(case_data.get('max_abs_diff'))}"
+            )
         lines.append("")
 
     baseline = report.get("baseline", {})
@@ -534,7 +696,7 @@ def _render_markdown(report: dict, slug: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GSM8K-shaped benchmark")
+    parser = argparse.ArgumentParser(description="GSM8K benchmark harness")
     parser.add_argument(
         "--device",
         default="cuda:0" if torch.cuda.is_available() else "cpu",
@@ -542,55 +704,64 @@ def main() -> None:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
+    parser.add_argument("--atol", type=float, default=5.0e-2)
+    parser.add_argument("--rtol", type=float, default=1.0e-2)
     parser.add_argument("--partition", default="all", help="all, baseline, or comma-separated hashes")
     parser.add_argument(
         "--backend",
         default="all",
         help="all, or comma-separated: torch,torch.compile,triton,cutedsl,helion",
     )
-    parser.add_argument("--no-eval", action="store_true", help="Skip GSM8K accuracy eval")
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        help="Hugging Face token. Falls back to HF_TOKEN or hf_token=... in ~/.env.",
+    )
+    parser.add_argument(
+        "--dummy-weights",
+        action="store_true",
+        help="Run the local synthetic-weight shape benchmark without writing a report.",
+    )
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
 
-    eval_result = None
-    if not args.no_eval:
-        from benchmarks.gsm8k.eval import CACHE_PATH
+    if args.dummy_weights:
+        print(
+            "Running dummy-weight synthetic benchmark. No markdown report will "
+            "be written and these are not GSM8K accuracy scores."
+        )
+    else:
+        try:
+            hf_token = require_hf_token(args.hf_token, purpose="GSM8K benchmark reports")
+        except ValueError as exc:
+            parser.error(str(exc))
+        del hf_token
+        raise SystemExit(REAL_WEIGHT_UNSUPPORTED)
 
-        if CACHE_PATH.exists():
-            import json as _json
-            _cache = _json.loads(CACHE_PATH.read_text())
-            if _cache:
-                eval_result = next(iter(_cache.values()))
-                print(f"Loaded cached eval: {eval_result['accuracy_pct']}% "
-                      f"({eval_result['correct']}/{eval_result['num_samples']})")
-        if eval_result is None:
-            print("No cached eval results. Run the eval first with torchrun:\n"
-                  "  torchrun --standalone --nproc-per-node=8 \\\n"
-                  "    -m benchmarks.gsm8k.eval \\\n"
-                  "    --ckpt-path checkpoints/dsv3_2-mp8")
-
-    results = run(args.device, args.dtype, args.warmup, args.repeat, args.partition, args.backend)
+    results = run(
+        args.device,
+        args.dtype,
+        args.warmup,
+        args.repeat,
+        args.partition,
+        args.backend,
+        args.atol,
+        args.rtol,
+    )
     _print_table(results)
 
-    slug = _hardware_slug(args.device)
     models_in_results = sorted(set(r.model for r in results))
     for model_name in models_in_results:
         model_results = [r for r in results if r.model == model_name]
         report = pick_winner(model_results)
-        if eval_result is not None:
-            report["eval"] = eval_result
+        report["weights_mode"] = "dummy"
         winner = report["winner"]
-        results_dir = BENCHMARK_DIR / "results" / model_name
-        results_dir.mkdir(parents=True, exist_ok=True)
-        results_path = results_dir / f"{slug}.md"
-        md = _render_markdown(report, slug)
-        results_path.write_text(md)
         speedup = winner.get("speedup_vs_baseline")
         speedup_str = f" ({speedup:.3f}x vs baseline)" if speedup is not None else ""
         print(f"\n[{model_name}] Winner: {winner['partition']}/{winner['backend']} "
               f"({winner['aggregate_mean_ms']:.1f}ms aggregate){speedup_str}")
-        print(f"Saved to {results_path}")
+        print("Report not saved in --dummy-weights mode.")
 
 
 if __name__ == "__main__":

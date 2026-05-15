@@ -1,8 +1,8 @@
 """GSM8K accuracy evaluation using DeepSeek-V3.2.
 
 Loads the full DeepSeek-V3.2 model across 8 GPUs using the official inference
-code, runs it on GSM8K test questions, and reports accuracy.  Results are
-cached so subsequent benchmark runs skip the expensive generation step.
+code, runs it on GSM8K test questions, and reports accuracy. No cache is used;
+each run evaluates the provided checkpoint.
 
 Usage:
     torchrun --standalone --nproc-per-node=8 \
@@ -10,8 +10,8 @@ Usage:
         --ckpt-path checkpoints/dsv3_2-mp8 \
         --samples 200
 
-Standalone (no torchrun, uses cached results only):
-    python -m benchmarks.gsm8k.eval
+The evaluator requires a Hugging Face token, either through --hf-token,
+HF_TOKEN, or hf_token=... in ~/.env.
 """
 
 from __future__ import annotations
@@ -29,10 +29,11 @@ for _tv_mod in ("torchvision", "torchvision.transforms"):
 
 import torch
 
+from benchmarks.gsm8k.hf_auth import require_hf_token
+
 EVAL_MODEL = "deepseek-ai/DeepSeek-V3.2"
 NUM_SAMPLES = 50
 MAX_NEW_TOKENS = 4096
-CACHE_PATH = Path(__file__).parent / "results" / "eval_cache.json"
 
 DSV3_2_CONFIG = {
     "vocab_size": 129280,
@@ -66,30 +67,6 @@ DSV3_2_CONFIG = {
 }
 
 
-def _load_hf_token() -> str | None:
-    env_path = Path.home() / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.strip().startswith("hf_token"):
-                _, _, value = line.partition("=")
-                return value.strip()
-    return os.getenv("HF_TOKEN")
-
-
-def _load_cache() -> dict:
-    if CACHE_PATH.exists():
-        try:
-            return json.loads(CACHE_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def _save_cache(cache: dict) -> None:
-    CACHE_PATH.parent.mkdir(exist_ok=True)
-    CACHE_PATH.write_text(json.dumps(cache, indent=2) + "\n")
-
-
 def extract_answer(text: str) -> float | None:
     match = re.search(r"####\s*([+-]?\d[\d,]*\.?\d*)", text)
     if match:
@@ -111,14 +88,15 @@ def evaluate(
     ckpt_path: str,
     num_samples: int = NUM_SAMPLES,
     max_new_tokens: int = MAX_NEW_TOKENS,
-    force: bool = False,
+    hf_token: str | None = None,
 ) -> dict:
-    cache = _load_cache()
-    cache_key = f"{EVAL_MODEL}:{num_samples}"
-    if not force and cache_key in cache:
-        print(f"Using cached eval: {EVAL_MODEL} ({num_samples} samples) "
-              f"-> {cache[cache_key]['accuracy_pct']}%")
-        return cache[cache_key]
+    hf_token = require_hf_token(hf_token, purpose="GSM8K accuracy evaluation")
+    ckpt_dir = Path(ckpt_path)
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(
+            f"Checkpoint directory {ckpt_dir} does not exist. Convert or mount the "
+            "DeepSeek-V3.2 model-parallel checkpoint before running GSM8K eval."
+        )
 
     import torch.distributed as dist
     from datasets import load_dataset
@@ -130,6 +108,12 @@ def evaluate(
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    ckpt_file = ckpt_dir / f"model{rank}-mp{world_size}.safetensors"
+    tokenizer_file = ckpt_dir / "tokenizer.json"
+    if not ckpt_file.exists():
+        raise FileNotFoundError(f"Checkpoint shard {ckpt_file} does not exist")
+    if not tokenizer_file.exists():
+        raise FileNotFoundError(f"Tokenizer file {tokenizer_file} does not exist")
 
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl")
@@ -149,20 +133,19 @@ def evaluate(
     with torch.device("cuda"):
         model = Transformer(args)
 
-    ckpt_file = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
-    load_model(model, ckpt_file)
+    load_model(model, str(ckpt_file))
 
     if rank == 0:
         print("Model loaded. Loading tokenizer ...")
 
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_file=os.path.join(ckpt_path, "tokenizer.json"),
+        tokenizer_file=str(tokenizer_file),
     )
 
     if rank == 0:
         print("Loading GSM8K test set ...")
 
-    dataset = load_dataset("openai/gsm8k", "main", split="test")
+    dataset = load_dataset("openai/gsm8k", "main", split="test", token=hf_token)
     if num_samples < len(dataset):
         dataset = dataset.select(range(num_samples))
 
@@ -214,10 +197,6 @@ def evaluate(
         "correct": correct,
         "accuracy_pct": round(accuracy, 1),
     }
-
-    if rank == 0:
-        cache[cache_key] = result
-        _save_cache(cache)
 
     del model
     torch.cuda.empty_cache()
@@ -279,10 +258,19 @@ def main() -> None:
     )
     parser.add_argument("--samples", type=int, default=NUM_SAMPLES)
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
-    parser.add_argument("--force", action="store_true", help="Ignore cache")
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        help="Hugging Face token. Falls back to HF_TOKEN or hf_token=... in ~/.env.",
+    )
     args = parser.parse_args()
 
-    result = evaluate(args.ckpt_path, args.samples, args.max_new_tokens, args.force)
+    result = evaluate(
+        args.ckpt_path,
+        args.samples,
+        args.max_new_tokens,
+        hf_token=args.hf_token,
+    )
 
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
