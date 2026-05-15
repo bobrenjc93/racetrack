@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Tuple, Optional, Literal
+from typing import Tuple, Optional, Literal, Callable, Any
 
 import torch
 from torch import nn
@@ -13,6 +13,23 @@ from inference.kernel import act_quant, fp8_gemm, fp8_index
 world_size = 1
 rank = 0
 block_size = 128
+
+
+def _kernel_call(
+    module: nn.Module,
+    op_name: str,
+    fallback: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    dispatcher = getattr(module, "kernel_dispatcher", None)
+    if dispatcher is None:
+        return fallback(*args, **kwargs)
+    stats = getattr(module, "kernel_stats", None)
+    if stats is not None:
+        stats.calls[op_name] = stats.calls.get(op_name, 0) + 1
+    return dispatcher.call(op_name, fallback, *args, **kwargs)
+
 
 @dataclass
 class ModelArgs:
@@ -299,11 +316,28 @@ class RMSNorm(nn.Module):
             var = x.pow(2).mean(-1, keepdim=True)
             x = x * torch.rsqrt(var + self.eps)
             return (self.weight * x).to(dtype)
-        else:
-            x = residual = x.float() + residual.float()
-            var = x.pow(2).mean(-1, keepdim=True)
-            x = x * torch.rsqrt(var + self.eps)
-            return (self.weight * x).to(dtype), residual.to(dtype)
+
+        def fallback(
+            update: torch.Tensor,
+            prev_residual: torch.Tensor,
+            weight: torch.Tensor,
+            *,
+            eps: float,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            hidden = update.float() + prev_residual.float()
+            var = hidden.pow(2).mean(-1, keepdim=True)
+            normed = hidden * torch.rsqrt(var + eps)
+            return (weight * normed).to(update.dtype), hidden.to(update.dtype)
+
+        return _kernel_call(
+            self,
+            "fused_residual_norm",
+            fallback,
+            x,
+            residual,
+            self.weight,
+            eps=self.eps,
+        )
 
 
 class LayerNorm(nn.Module):
@@ -644,7 +678,14 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        return self.w2((F.silu(self.w1(x).float()) * self.w3(x).float()).type_as(x))
+        gate = self.w1(x)
+        up = self.w3(x)
+
+        def fallback(gate_values: torch.Tensor, up_values: torch.Tensor) -> torch.Tensor:
+            return (F.silu(gate_values.float()) * up_values.float()).type_as(gate_values)
+
+        hidden = _kernel_call(self, "fused_swiglu", fallback, gate, up)
+        return self.w2(hidden.type_as(x))
 
 
 class Gate(nn.Module):
@@ -745,7 +786,14 @@ class Expert(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert computation.
         """
-        return self.w2((F.silu(self.w1(x).float()) * self.w3(x).float()).type_as(x))
+        gate = self.w1(x)
+        up = self.w3(x)
+
+        def fallback(gate_values: torch.Tensor, up_values: torch.Tensor) -> torch.Tensor:
+            return (F.silu(gate_values.float()) * up_values.float()).type_as(gate_values)
+
+        hidden = _kernel_call(self, "fused_swiglu", fallback, gate, up)
+        return self.w2(hidden.type_as(x))
 
 
 class MoE(nn.Module):

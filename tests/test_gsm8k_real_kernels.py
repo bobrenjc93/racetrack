@@ -55,11 +55,17 @@ def test_real_kernel_patcher_uses_real_module_weights(tmp_path) -> None:
     )
     with patch_real_model(model, row) as stats:
         actual = model(x, residual)
+        assert hasattr(model.norm, "kernel_dispatcher")
+        assert hasattr(model.mlp, "kernel_dispatcher")
 
     assert stats.calls == {"fused_residual_norm": 1, "fused_swiglu": 1}
     assert stats.used_partition_kernel
     assert torch.equal(actual[0], expected[0])
     assert torch.equal(actual[1], expected[1])
+    assert not hasattr(model.norm, "kernel_dispatcher")
+    assert not hasattr(model.norm, "kernel_stats")
+    assert not hasattr(model.mlp, "kernel_dispatcher")
+    assert not hasattr(model.mlp, "kernel_stats")
 
 
 def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:

@@ -1,9 +1,10 @@
-"""Patch real DeepSeek inference modules with partition-local kernels.
+"""Attach partition-local kernels to real DeepSeek inference modules.
 
 The synthetic partition models own their own randomly initialized parameters.
 For real GSM8K benchmarking we instead keep the checkpoint-backed
-``inference.model.Transformer`` intact and patch compatible primitive ops in
-place. A leaderboard row is therefore:
+``inference.model.Transformer`` intact and let compatible real modules dispatch
+through partition kernels from their normal ``forward`` methods. A leaderboard
+row is therefore:
 
     real full model + one partition kernel directory + one backend
 
@@ -16,13 +17,11 @@ from __future__ import annotations
 
 import contextlib
 import os
-import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Iterator
 
 import torch
-import torch.nn.functional as F
 
 from racetrack.runtime.dispatch import KernelDispatcher
 
@@ -166,7 +165,7 @@ def patch_real_model(
         calls={op_name: 0 for op_name in row.ops},
         selected_backends={},
     )
-    originals: list[tuple[torch.nn.Module, str, Callable]] = []
+    originals: list[tuple[torch.nn.Module, str, bool, Any]] = []
     previous_backend = os.environ.get("RACETRACK_KERNEL_BACKEND")
     os.environ["RACETRACK_KERNEL_BACKEND"] = row.backend
 
@@ -189,8 +188,11 @@ def patch_real_model(
         if strict_kernel_use and not stats.used_partition_kernel:
             raise RuntimeError(f"{row.label} did not use any non-torch partition kernel")
     finally:
-        for module, name, original in reversed(originals):
-            setattr(module, name, original)
+        for module, name, existed, original in reversed(originals):
+            if existed:
+                setattr(module, name, original)
+            else:
+                delattr(module, name)
         if previous_backend is None:
             os.environ.pop("RACETRACK_KERNEL_BACKEND", None)
         else:
@@ -202,74 +204,34 @@ def _patch_modules(
     row: RealKernelRow,
     dispatcher: KernelDispatcher,
     stats: PatchStats,
-    originals: list[tuple[torch.nn.Module, str, Callable]],
+    originals: list[tuple[torch.nn.Module, str, bool, Any]],
 ) -> None:
     from inference import model as real_model
 
     for module in model.modules():
         if "fused_residual_norm" in row.ops and isinstance(module, real_model.RMSNorm):
-            original = module.forward
-            originals.append((module, "forward", original))
-            module.forward = types.MethodType(
-                _make_rms_norm_forward(original, dispatcher, stats),
-                module,
-            )
+            _attach_kernel(module, dispatcher, stats, originals)
         if "fused_swiglu" in row.ops and isinstance(module, (real_model.MLP, real_model.Expert)):
-            original = module.forward
-            originals.append((module, "forward", original))
-            module.forward = types.MethodType(
-                _make_swiglu_forward(dispatcher, stats),
-                module,
-            )
+            _attach_kernel(module, dispatcher, stats, originals)
 
 
-def _make_rms_norm_forward(
-    original: Callable,
+def _attach_kernel(
+    module: torch.nn.Module,
     dispatcher: KernelDispatcher,
     stats: PatchStats,
-) -> Callable:
-    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
-        if residual is None:
-            return original(x, residual)
-
-        def fallback(
-            update: torch.Tensor,
-            prev_residual: torch.Tensor,
-            weight: torch.Tensor,
-            *,
-            eps: float,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            hidden = update.float() + prev_residual.float()
-            var = hidden.pow(2).mean(-1, keepdim=True)
-            normed = hidden * torch.rsqrt(var + eps)
-            return (weight * normed).to(update.dtype), hidden.to(update.dtype)
-
-        stats.calls["fused_residual_norm"] = stats.calls.get("fused_residual_norm", 0) + 1
-        return dispatcher.call(
-            "fused_residual_norm",
-            fallback,
-            x,
-            residual,
-            self.weight,
-            eps=self.eps,
-        )
-
-    return forward
+    originals: list[tuple[torch.nn.Module, str, bool, Any]],
+) -> None:
+    _set_attr(module, "kernel_dispatcher", dispatcher, originals)
+    _set_attr(module, "kernel_stats", stats, originals)
 
 
-def _make_swiglu_forward(
-    dispatcher: KernelDispatcher,
-    stats: PatchStats,
-) -> Callable:
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.w1(x)
-        up = self.w3(x)
-
-        def fallback(gate_values: torch.Tensor, up_values: torch.Tensor) -> torch.Tensor:
-            return (F.silu(gate_values.float()) * up_values.float()).type_as(gate_values)
-
-        stats.calls["fused_swiglu"] = stats.calls.get("fused_swiglu", 0) + 1
-        hidden = dispatcher.call("fused_swiglu", fallback, gate, up)
-        return self.w2(hidden.type_as(x))
-
-    return forward
+def _set_attr(
+    module: torch.nn.Module,
+    name: str,
+    value: Any,
+    originals: list[tuple[torch.nn.Module, str, bool, Any]],
+) -> None:
+    existed = hasattr(module, name)
+    original = getattr(module, name, None)
+    originals.append((module, name, existed, original))
+    setattr(module, name, value)
