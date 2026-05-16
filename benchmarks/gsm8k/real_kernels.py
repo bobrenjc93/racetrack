@@ -457,6 +457,7 @@ def _attach_mlp_gate_up_kernel(
             hidden = dispatcher.call(swiglu_op, swiglu_fallback, gate, up)
         else:
             hidden = swiglu_fallback(gate, up)
+
         return module.w2(hidden.type_as(x))
 
     _set_attr(module, "forward", forward, originals)
