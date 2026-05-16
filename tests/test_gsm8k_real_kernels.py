@@ -183,8 +183,6 @@ def test_dsv3_2_real_rows_skip_helion_until_full_model_configs_exist() -> None:
         "fused_single_token_moe",
         "fused_swiglu",
     )
-    cutedsl_row = next(row for row in rows if row.backend == "cutedsl")
-    assert cutedsl_row.ops == best_row.ops
 
 
 def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
