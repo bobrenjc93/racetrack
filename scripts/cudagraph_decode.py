@@ -1,10 +1,28 @@
-"""CUDA graph decode with batched MoE experts.
+"""CUDA graph decode with fused Triton kernels + batched MoE.
+
+Combines: kernel fusion (54k→fewer launches) + CUDA graph (zero dispatch overhead).
 
 Run with:
   PYTHONPATH=~/local/b/pytorch:. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    torchrun --standalone --nproc-per-node=8 /tmp/test_cg_full.py
+    torchrun --standalone --nproc-per-node=8 /tmp/test_cg_fused.py
 """
-import os, time, torch, torch.nn.functional as F, torch.distributed as dist
+import os, sys, time, importlib.util, torch, torch.nn.functional as F, torch.distributed as dist
+
+# Load fused kernels directly (no dispatcher)
+def _load_kernel(name):
+    path = f"partitions/dsv3_2/3336cdbd/kernels/triton/{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+KERNELS = {}
+
+def load_kernels():
+    KERNELS['residual_norm'] = _load_kernel('residual_norm')
+    KERNELS['swiglu'] = _load_kernel('swiglu')
+    KERNELS['act_quant'] = _load_kernel('act_quant')
+
 
 def main():
     rank = int(os.environ.get("RANK", "0"))
@@ -25,7 +43,7 @@ def main():
     config["max_seq_len"] = 256
     config["dtype"] = "fp8"
     args = ModelArgs(**config)
-    hf_token = require_hf_token(None, purpose="cg full")
+    hf_token = require_hf_token(None, purpose="cg fused")
 
     if rank == 0: print("Loading model...", flush=True)
     with torch.device("cuda"):
@@ -34,35 +52,36 @@ def main():
                             hf_token=hf_token, rank=rank, world_size=world_size)
     run_post_load_transforms(model)
     model.eval()
+    load_kernels()
 
-    # Patch BEFORE any forward (before KV caches allocate)
-    if rank == 0: print("Patching for CUDA graph...", flush=True)
+    if rank == 0: print("Patching with fused kernels...", flush=True)
     patch_for_cudagraph(model)
     torch.cuda.synchronize()
     if rank == 0:
         mem = torch.cuda.memory_allocated() / 1e9
-        print(f"Memory after patching: {mem:.1f} GB", flush=True)
+        print(f"Memory: {mem:.1f} GB", flush=True)
 
     with torch.inference_mode():
-        # Prefill + warmup
         tok = torch.arange(16, device="cuda", dtype=torch.long).unsqueeze(0)
         model.forward(tok, 0)
         for i in range(10):
             model.forward(torch.tensor([[100+i]], device="cuda", dtype=torch.long), 16+i)
         torch.cuda.synchronize()
 
-        # Eager baseline
         N = 50
         start = 26
+
+        # Eager baseline (unpatched model won't work since we patched it)
+        # Just time the patched model eagerly
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for i in range(N):
             model.forward(torch.tensor([[200+i]], device="cuda", dtype=torch.long), start+i)
         torch.cuda.synchronize()
         eager_ms = (time.perf_counter() - t0) * 1000 / N
-        if rank == 0: print(f"Eager decode (patched): {eager_ms:.2f} ms/token", flush=True)
+        if rank == 0: print(f"Fused eager decode: {eager_ms:.2f} ms/token", flush=True)
 
-        # Capture
+        # CUDA graph capture
         static_tok = torch.tensor([[0]], device="cuda", dtype=torch.long)
         vocab_shard = model.head.weight.shape[0]
         static_logits = torch.empty(1, vocab_shard * world_size, device="cuda", dtype=torch.float32)
@@ -95,7 +114,6 @@ def main():
                 dist.barrier(); dist.destroy_process_group()
             return
 
-        # Benchmark replay
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for i in range(N):
@@ -105,8 +123,9 @@ def main():
         graph_ms = (time.perf_counter() - t0) * 1000 / N
 
         if rank == 0:
-            print(f"CUDA graph replay: {graph_ms:.2f} ms/token", flush=True)
-            print(f"Speedup vs eager: {eager_ms/graph_ms:.3f}x", flush=True)
+            print(f"CUDA graph + fused kernels: {graph_ms:.2f} ms/token", flush=True)
+            print(f"Speedup vs fused eager: {eager_ms/graph_ms:.3f}x", flush=True)
+            print(f"Reference: eager ~277ms, compile ~143ms", flush=True)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier(); dist.destroy_process_group()
@@ -121,21 +140,68 @@ def patch_for_cudagraph(model):
             _patch_gate(module)
         if isinstance(module, rm.MLA):
             _patch_mla(module)
+        if isinstance(module, rm.RMSNorm):
+            _patch_rmsnorm(module)
+        if isinstance(module, rm.MLP):
+            _patch_mlp(module)
+
+
+def _patch_rmsnorm(module):
+    """Use fused residual_norm Triton kernel directly."""
+    kernel = KERNELS['residual_norm']
+    original = module.forward
+
+    def forward(x, residual=None):
+        if residual is None:
+            return original(x)
+        # Call fused kernel directly — no dispatcher
+        shape = x.shape
+        cols = shape[-1]
+        x_flat = x.contiguous().view(-1, cols)
+        r_flat = residual.contiguous().view(-1, cols)
+        # dsv3_2 kernel expects (residual, update) order
+        hidden, normed = kernel.fused_residual_norm(
+            r_flat, x_flat, module.weight, eps=module.eps, fallback=None,
+        )
+        return normed.view(shape), hidden.view(shape)
+
+    module.forward = forward
+
+
+def _patch_mlp(module):
+    """Use fused swiglu Triton kernel + fused act_quant directly."""
+    swiglu_kernel = KERNELS['swiglu']
+    aq_kernel = KERNELS['act_quant']
+    is_fp8 = module.w2.weight.dtype == torch.float8_e4m3fn
+
+    def forward(x):
+        gate = module.w1(x)
+        up = module.w3(x)
+        # Fused swiglu — 1 kernel instead of 4
+        hidden = swiglu_kernel.fused_swiglu(gate, up, fallback=None)
+
+        if is_fp8:
+            from inference.kernel import fp8_gemm
+            # Fused act_quant — 1 kernel instead of 6
+            h_fp8, h_s = aq_kernel.fused_act_quant(hidden.type_as(x), fallback=None)
+            y = fp8_gemm(h_fp8, h_s, module.w2.weight, module.w2.weight.scale)
+            if getattr(module.w2, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
+                y = y.float()
+                dist.all_reduce(y)
+            return y.to(x.dtype)
+        return module.w2(hidden.type_as(x))
+
+    module.forward = forward
 
 
 def _patch_moe(module):
-    """
-    Batch experts into single weight tensors for CUDA-tensor indexing.
-    Runs only topk experts per token without CPU sync.
-    """
+    """Batched MoE with stacked weights + fused kernels."""
     topk = module.gate.topk
     start = module.experts_start_idx
     end = module.experts_end_idx
     local_experts = [module.experts[i] for i in range(start, end)]
     n_local = len(local_experts)
 
-    # Stack expert weights one matrix at a time, freeing originals after each
-    # to keep peak overhead to ~470MB instead of ~1.4GB
     has_scales = hasattr(local_experts[0].w1.weight, 'scale') and local_experts[0].w1.weight.scale is not None
     scale_fmt = local_experts[0].w1.scale_fmt if has_scales else None
 
@@ -157,10 +223,12 @@ def _patch_moe(module):
     for e in local_experts: e.w2 = None
     torch.cuda.empty_cache()
 
-    # Clear expert module references
     for i in range(start, end):
         module.experts[i] = None
     torch.cuda.empty_cache()
+
+    swiglu_kernel = KERNELS['swiglu']
+    aq_kernel = KERNELS['act_quant']
 
     def forward(x):
         from inference.kernel import act_quant, fp8_gemm
@@ -172,34 +240,39 @@ def _patch_moe(module):
 
         y = torch.zeros_like(x_flat, dtype=torch.float32)
 
-        for t in range(topk):
-            eid = indices[0, t]
-            local_id = (eid - start).clamp(0, n_local - 1)
-            is_local = ((eid >= start) & (eid < end)).float()
-            w = weights[0:1, t:t+1] * is_local
+        # Map global expert indices to local, build selection mask
+        local_ids = (indices[0] - start).clamp(0, n_local - 1).to(torch.long)
+        is_local = ((indices[0] >= start) & (indices[0] < end)).float()
+        expert_weights = weights[0] * is_local  # [topk], zero for non-local
 
-            idx = local_id.view(1).to(torch.long)
-            ew1 = torch.index_select(w1_stack, 0, idx).squeeze(0)
-            ew3 = torch.index_select(w3_stack, 0, idx).squeeze(0)
-            ew2 = torch.index_select(w2_stack, 0, idx).squeeze(0)
+        # Select topk expert weights via batched index_select: [topk, out, in]
+        sel_w1 = torch.index_select(w1_stack, 0, local_ids)
+        sel_w3 = torch.index_select(w3_stack, 0, local_ids)
+        sel_w2 = torch.index_select(w2_stack, 0, local_ids)
 
-            if has_scales:
-                es1 = torch.index_select(w1_s, 0, idx).squeeze(0)
-                es3 = torch.index_select(w3_s, 0, idx).squeeze(0)
-                es2 = torch.index_select(w2_s, 0, idx).squeeze(0)
-                x_q, x_s = act_quant(x_flat, block_size, scale_fmt)
-                gate_out = fp8_gemm(x_q, x_s, ew1, es1)
-                up_out = fp8_gemm(x_q, x_s, ew3, es3)
-                hidden = (F.silu(gate_out.float()) * up_out.float()).to(gate_out.dtype)
-                h_q, h_s = act_quant(hidden, block_size, scale_fmt)
-                out = fp8_gemm(h_q, h_s, ew2, es2)
-            else:
-                gate_out = F.linear(x_flat, ew1)
-                up_out = F.linear(x_flat, ew3)
-                hidden = (F.silu(gate_out.float()) * up_out.float()).to(gate_out.dtype)
-                out = F.linear(hidden, ew2)
+        # Batched expert forward: all topk experts in parallel via bmm
+        x_exp = x_flat.expand(topk, -1, -1)  # [topk, 1, dim]
 
-            y += out.float() * w
+        if has_scales:
+            sel_s1 = torch.index_select(w1_s, 0, local_ids)
+            sel_s3 = torch.index_select(w3_s, 0, local_ids)
+            sel_s2 = torch.index_select(w2_s, 0, local_ids)
+            # Per-expert fp8_gemm still needed (scales are per-expert)
+            x_q, x_s = aq_kernel.fused_act_quant(x_flat, fallback=None)
+            for t in range(topk):
+                gate_out = fp8_gemm(x_q, x_s, sel_w1[t], sel_s1[t])
+                up_out = fp8_gemm(x_q, x_s, sel_w3[t], sel_s3[t])
+                hidden = swiglu_kernel.fused_swiglu(gate_out, up_out, fallback=None)
+                h_q, h_s = aq_kernel.fused_act_quant(hidden.type_as(x_flat), fallback=None)
+                out = fp8_gemm(h_q, h_s, sel_w2[t], sel_s2[t])
+                y += out.float() * expert_weights[t]
+        else:
+            # Non-FP8: use batched matmul (3 bmm calls instead of 3*topk)
+            gate_out = torch.bmm(x_exp, sel_w1.transpose(1, 2))  # [topk, 1, inter]
+            up_out = torch.bmm(x_exp, sel_w3.transpose(1, 2))
+            hidden = (F.silu(gate_out.float()) * up_out.float()).to(gate_out.dtype)
+            out = torch.bmm(hidden, sel_w2.transpose(1, 2))  # [topk, 1, dim]
+            y += (out.squeeze(1).float() * expert_weights.unsqueeze(-1)).sum(0, keepdim=True)
 
         y += module.shared_experts(x_flat)
         if dist.is_initialized() and dist.get_world_size() > 1:
