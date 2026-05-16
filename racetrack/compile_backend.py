@@ -129,48 +129,20 @@ def rewrite_graph(gm: GraphModule, partition_root: Path) -> GraphModule:
     """
     Rewrite an FX graph by replacing matched op patterns with
     partition kernel calls.
+
+    Strategy: DON'T replace elementwise fusions that Inductor already
+    handles well (swiglu, act_quant, norm). Instead, inject ALGORITHMIC
+    optimizations as custom ops — patterns where hand-written kernels
+    have structural advantages over auto-generated code.
+
+    Inductor handles the elementwise fusion + scheduling (CUDA graphs,
+    dispatch overhead). We handle the algorithmic shortcuts.
     """
-    graph = gm.graph
-
-    # Load available kernels
-    act_quant_mod = _load_kernel(partition_root, "act_quant")
-    residual_norm_mod = _load_kernel(partition_root, "residual_norm")
-    swiglu_mod = _load_kernel(partition_root, "swiglu")
-
-    rewrites = 0
-
-    # Match and replace swiglu: silu(x) * y → fused_swiglu(x, y)
-    if swiglu_mod is not None:
-        def _swiglu_impl(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-            return swiglu_mod.fused_swiglu(gate, up, fallback=None)
-
-        def _swiglu_fake(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-            return torch.empty_like(gate)
-
-        swiglu_op = _get_custom_op("fused_swiglu", _swiglu_impl, _swiglu_fake)
-
-        for silu_node, mul_node in _match_swiglu(graph):
-            gate_input = silu_node.args[0]
-            # The mul has silu output as one arg, up as the other
-            other_args = [a for a in mul_node.args if a is not silu_node]
-            if not other_args:
-                continue
-            up_input = other_args[0]
-
-            # Use the OpOverload (not CustomOpDef) so FX can serialize the node
-            op_callable = swiglu_op._opoverload
-            with graph.inserting_before(mul_node):
-                fused = graph.call_function(op_callable, args=(gate_input, up_input))
-            mul_node.replace_all_uses_with(fused)
-            graph.erase_node(mul_node)
-            if len(silu_node.users) == 0:
-                graph.erase_node(silu_node)
-            rewrites += 1
-
-    if rewrites > 0:
-        graph.lint()
-        gm.recompile()
-
+    # Currently a passthrough — Inductor handles everything.
+    # Add pattern matchers here for algorithmic optimizations:
+    # - fused_full_topk_indexer: skip indexer when seq <= topk
+    # - fused_single_token_moe: optimized expert routing for batch=1
+    # - Custom attention patterns for MLA latent-space attention
     return gm
 
 
