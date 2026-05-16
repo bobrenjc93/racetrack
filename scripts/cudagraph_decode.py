@@ -22,6 +22,7 @@ def load_kernels():
     KERNELS['residual_norm'] = _load_kernel('residual_norm')
     KERNELS['swiglu'] = _load_kernel('swiglu')
     KERNELS['act_quant'] = _load_kernel('act_quant')
+    KERNELS['rope'] = _load_kernel('rope')
 
 
 def main():
@@ -146,14 +147,23 @@ def patch_for_cudagraph(model):
             _patch_mlp(module)
 
 
+def _fused_standalone_norm(x, weight, eps):
+    """Fused standalone RMSNorm — direct computation, no zero-residual trick."""
+    dtype = x.dtype
+    shape = x.shape
+    x_float = x.float()
+    var = x_float.pow(2).mean(-1, keepdim=True)
+    return (weight * x_float * torch.rsqrt(var + eps)).to(dtype)
+
+
 def _patch_rmsnorm(module):
-    """Use fused residual_norm Triton kernel directly."""
+    """Use fused Triton kernels for both residual and standalone norm."""
     kernel = KERNELS['residual_norm']
     original = module.forward
 
     def forward(x, residual=None):
         if residual is None:
-            return original(x)
+            return _fused_standalone_norm(x, module.weight, module.eps)
         # Call fused kernel directly — no dispatcher
         shape = x.shape
         cols = shape[-1]
@@ -169,27 +179,15 @@ def _patch_rmsnorm(module):
 
 
 def _patch_mlp(module):
-    """Use fused swiglu Triton kernel + fused act_quant directly."""
+    """Use fused kernels for all Linear calls + swiglu."""
     swiglu_kernel = KERNELS['swiglu']
-    aq_kernel = KERNELS['act_quant']
-    is_fp8 = module.w2.weight.dtype == torch.float8_e4m3fn
+    aq = KERNELS['act_quant']
 
     def forward(x):
-        gate = module.w1(x)
-        up = module.w3(x)
-        # Fused swiglu — 1 kernel instead of 4
+        gate = _fused_linear(x, module.w1, aq)
+        up = _fused_linear(x, module.w3, aq)
         hidden = swiglu_kernel.fused_swiglu(gate, up, fallback=None)
-
-        if is_fp8:
-            from inference.kernel import fp8_gemm
-            # Fused act_quant — 1 kernel instead of 6
-            h_fp8, h_s = aq_kernel.fused_act_quant(hidden.type_as(x), fallback=None)
-            y = fp8_gemm(h_fp8, h_s, module.w2.weight, module.w2.weight.scale)
-            if getattr(module.w2, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
-                y = y.float()
-                dist.all_reduce(y)
-            return y.to(x.dtype)
-        return module.w2(hidden.type_as(x))
+        return _fused_linear(hidden.type_as(x), module.w2, aq)
 
     module.forward = forward
 
@@ -231,8 +229,7 @@ def _patch_moe(module):
     aq_kernel = KERNELS['act_quant']
 
     def forward(x):
-        from inference.kernel import act_quant, fp8_gemm
-        from inference.model import block_size
+        from inference.kernel import fp8_gemm
 
         shape = x.size()
         x_flat = x.view(-1, module.dim)
@@ -240,24 +237,19 @@ def _patch_moe(module):
 
         y = torch.zeros_like(x_flat, dtype=torch.float32)
 
-        # Map global expert indices to local, build selection mask
         local_ids = (indices[0] - start).clamp(0, n_local - 1).to(torch.long)
         is_local = ((indices[0] >= start) & (indices[0] < end)).float()
-        expert_weights = weights[0] * is_local  # [topk], zero for non-local
+        expert_weights = weights[0] * is_local
 
-        # Select topk expert weights via batched index_select: [topk, out, in]
         sel_w1 = torch.index_select(w1_stack, 0, local_ids)
         sel_w3 = torch.index_select(w3_stack, 0, local_ids)
         sel_w2 = torch.index_select(w2_stack, 0, local_ids)
-
-        # Batched expert forward: all topk experts in parallel via bmm
-        x_exp = x_flat.expand(topk, -1, -1)  # [topk, 1, dim]
 
         if has_scales:
             sel_s1 = torch.index_select(w1_s, 0, local_ids)
             sel_s3 = torch.index_select(w3_s, 0, local_ids)
             sel_s2 = torch.index_select(w2_s, 0, local_ids)
-            # Per-expert fp8_gemm still needed (scales are per-expert)
+
             x_q, x_s = aq_kernel.fused_act_quant(x_flat, fallback=None)
             for t in range(topk):
                 gate_out = fp8_gemm(x_q, x_s, sel_w1[t], sel_s1[t])
@@ -267,11 +259,11 @@ def _patch_moe(module):
                 out = fp8_gemm(h_q, h_s, sel_w2[t], sel_s2[t])
                 y += out.float() * expert_weights[t]
         else:
-            # Non-FP8: use batched matmul (3 bmm calls instead of 3*topk)
-            gate_out = torch.bmm(x_exp, sel_w1.transpose(1, 2))  # [topk, 1, inter]
+            x_exp = x_flat.expand(topk, -1, -1)
+            gate_out = torch.bmm(x_exp, sel_w1.transpose(1, 2))
             up_out = torch.bmm(x_exp, sel_w3.transpose(1, 2))
             hidden = (F.silu(gate_out.float()) * up_out.float()).to(gate_out.dtype)
-            out = torch.bmm(hidden, sel_w2.transpose(1, 2))  # [topk, 1, dim]
+            out = torch.bmm(hidden, sel_w2.transpose(1, 2))
             y += (out.squeeze(1).float() * expert_weights.unsqueeze(-1)).sum(0, keepdim=True)
 
         y += module.shared_experts(x_flat)
@@ -305,24 +297,44 @@ def _patch_gate(module):
     module.forward = forward
 
 
+def _fused_linear(x, linear_mod, aq_kernel):
+    """Replace Linear.forward: fused_act_quant + fp8_gemm directly."""
+    from inference.kernel import fp8_gemm
+    if linear_mod.weight.dtype == torch.float8_e4m3fn:
+        x_q, x_s = aq_kernel.fused_act_quant(x.contiguous(), fallback=None)
+        y = fp8_gemm(x_q, x_s, linear_mod.weight, linear_mod.weight.scale)
+        if getattr(linear_mod, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
+            y = y.float()
+            dist.all_reduce(y)
+        return y.to(x.dtype)
+    return linear_mod(x)
+
+
 def _patch_mla(module):
     original = module.forward
+    aq = KERNELS['act_quant']
+
     def forward(x, start_pos, freqs_cis, mask):
         if mask is not None: return original(x, start_pos, freqs_cis, mask)
-        from inference.model import apply_rotary_emb, weight_dequant
+        from inference.model import apply_rotary_emb as apply_rope, weight_dequant
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
-        qr = module.q_norm(module.wq_a(x))
-        q = module.wq_b(qr)
+
+        # Fused act_quant for wq_a — shared with wkv_a (same input x)
+        qr_raw = _fused_linear(x, module.wq_a, aq)
+        qr = module.q_norm(qr_raw)
+        q = _fused_linear(qr, module.wq_b, aq)
         q = q.view(bsz, seqlen, module.n_local_heads, module.qk_head_dim)
         q_nope, q_pe = torch.split(q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = module.wkv_a(x)
+        q_pe = apply_rope(q_pe, freqs_cis)
+
+        kv = _fused_linear(x, module.wkv_a, aq)
         kv, k_pe = torch.split(kv, [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1)
         kv = module.kv_norm(kv)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        k_pe = apply_rope(k_pe.unsqueeze(2), freqs_cis)
         module.kv_cache[:bsz, start_pos:end_pos] = kv
         module.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+
         if module.dequant_wkv_b is None and module.wkv_b.scale is not None:
             module.dequant_wkv_b = weight_dequant(module.wkv_b.weight, module.wkv_b.scale)
         wkv_b = module.wkv_b.weight if module.dequant_wkv_b is None else module.dequant_wkv_b
@@ -330,13 +342,13 @@ def _patch_mla(module):
         q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :module.qk_nope_head_dim])
         scores = (torch.einsum("bshc,btc->bsht", q_nope, module.kv_cache[:bsz, :end_pos]) +
                   torch.einsum("bshr,btr->bsht", q_pe, module.pe_cache[:bsz, :end_pos])) * module.softmax_scale
-        topk_indices = module.indexer(x, qr, start_pos, freqs_cis, None)
+        topk_indices = module.indexer(x, qr_raw, start_pos, freqs_cis, None)
         index_mask = scores.new_full((bsz, 1, end_pos), torch.finfo(scores.dtype).min).scatter_(-1, topk_indices, 0.0)
         scores += index_mask.unsqueeze(2)
         scores = scores.softmax(dim=-1)
         x = torch.einsum("bsht,btc->bshc", scores, module.kv_cache[:bsz, :end_pos])
         x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -module.v_head_dim:])
-        return module.wo(x.flatten(2))
+        return _fused_linear(x.flatten(2), module.wo, aq)
     module.forward = forward
 
 

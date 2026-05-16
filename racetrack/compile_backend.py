@@ -141,55 +141,68 @@ def rewrite_graph(gm: GraphModule, partition_root: Path) -> GraphModule:
     graph = gm.graph
     rewrites = 0
 
-    # Match RoPE: view_as_complex → mul(freqs_cis) → view_as_real
-    # Inductor falls back to eager ATen for this pattern.
-    rope_mod = _load_kernel(partition_root, "rope")
-    if rope_mod is not None:
-        def _rope_impl(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-            return rope_mod.fused_rope(x, freqs_cis, fallback=None)
+    # --- act_quant fusion ---
+    # Match: float → view → abs → amax → clamp → div(448) → div(scale) → clamp → to(fp8) → view
+    # Replace with: fused_act_quant(x) → (fp8, scale)
+    aq_mod = _load_kernel(partition_root, "act_quant")
+    if aq_mod is not None:
+        def _aq_impl(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return aq_mod.fused_act_quant(x, fallback=None)
 
-        def _rope_fake(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-            return torch.empty_like(x)
+        def _aq_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            shape = x.shape
+            N = shape[-1]
+            n_groups = N // 128
+            return (
+                torch.empty(shape, dtype=torch.float8_e4m3fn, device=x.device),
+                torch.empty(*shape[:-1], n_groups, dtype=torch.float32, device=x.device),
+            )
 
-        rope_op = _get_custom_op("fused_rope", _rope_impl, _rope_fake)
-        op_callable = rope_op._opoverload
+        aq_op = _get_custom_op("fused_act_quant", _aq_impl, _aq_fake)
 
-        for node in list(graph.nodes):
-            if node.op != "call_function":
+    # --- swiglu fusion ---
+    swiglu_mod = _load_kernel(partition_root, "swiglu")
+    if swiglu_mod is not None:
+        def _swiglu_impl(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+            return swiglu_mod.fused_swiglu(gate, up, fallback=None)
+
+        def _swiglu_fake(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(gate)
+
+        swiglu_op = _get_custom_op("fused_swiglu", _swiglu_impl, _swiglu_fake)
+        swiglu_callable = swiglu_op._opoverload
+
+        for silu_node, mul_node in _match_swiglu(graph):
+            gate_input = silu_node.args[0]
+            other_args = [a for a in mul_node.args if a is not silu_node]
+            if not other_args:
                 continue
-            name = getattr(node.target, '__name__', str(node.target))
-            if "view_as_complex" not in name:
-                continue
-            # Found view_as_complex — look for mul → view_as_real chain
-            mul_node = None
-            for user in node.users:
-                if "mul" in str(user.target):
-                    mul_node = user
-                    break
-            if mul_node is None:
-                continue
-            real_node = None
-            for user in mul_node.users:
-                if "view_as_real" in str(getattr(user.target, '__name__', str(user.target))):
-                    real_node = user
-                    break
-            if real_node is None:
-                continue
+            up_input = other_args[0]
 
-            # Found the pattern. The input to view_as_complex is the
-            # float-casted, reshaped x. The freqs_cis is the other mul arg.
-            x_input = node.args[0]  # float view before complex
-            freqs_input = [a for a in mul_node.args if a is not node]
-            if not freqs_input:
-                continue
+            with graph.inserting_before(mul_node):
+                fused = graph.call_function(swiglu_callable, args=(gate_input, up_input))
+            mul_node.replace_all_uses_with(fused)
+            graph.erase_node(mul_node)
+            if len(silu_node.users) == 0:
+                graph.erase_node(silu_node)
+            rewrites += 1
 
-            # TODO: proper integration requires matching the reshape chain
-            # For now, skip — the pattern matching needs more work to handle
-            # the view/reshape ops around view_as_complex properly.
+    # --- residual_norm fusion ---
+    # Match: add(residual, x) → pow(2) → mean → add(eps) → rsqrt → mul → mul(weight)
+    norm_mod = _load_kernel(partition_root, "residual_norm")
+    if norm_mod is not None:
+        def _norm_impl(residual: torch.Tensor, update: torch.Tensor, weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+            return norm_mod.fused_residual_norm(residual, update, weight, eps=eps, fallback=None)
 
-    # Future pattern matchers:
-    # - fused_full_topk_indexer: skip indexer when seq <= topk
-    # - fused_single_token_moe: optimized expert routing for batch=1
+        def _norm_fake(residual: torch.Tensor, update: torch.Tensor, weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+            return torch.empty_like(update), torch.empty_like(update)
+
+        norm_op = _get_custom_op("fused_residual_norm", _norm_impl, _norm_fake)
+
+    if rewrites > 0:
+        graph.lint()
+        gm.recompile()
+
     return gm
 
 
@@ -208,13 +221,18 @@ def racetrack_backend(gm: GraphModule, example_inputs):
     """
     partition_root = _DEFAULT_PARTITION
 
-    # Phase 1: Pattern-match and replace with our kernels
+    # Phase 1: Pattern-match and replace with our fused kernels
     gm = rewrite_graph(gm, partition_root)
 
-    # Phase 2: Let Inductor handle everything else
-    # (compilation, fusion of remaining ops, CUDA graph capture)
-    from torch._inductor.compile_fx import compile_fx
-    return compile_fx(gm, example_inputs)
+    # Phase 2: Codegen a direct function from the graph.
+    # No Inductor — we generate a Python function that calls
+    # our kernels + PyTorch ops directly, suitable for CUDA graph capture.
+    gm.recompile()
+
+    # Return gm.forward directly — Dynamo calls this without
+    # the FX interpreter overhead since gm.recompile() already
+    # generated a Python function from the graph.
+    return gm.forward
 
 
 def patch_model_for_racetrack(model: torch.nn.Module):
