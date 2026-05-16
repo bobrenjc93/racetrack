@@ -138,11 +138,58 @@ def rewrite_graph(gm: GraphModule, partition_root: Path) -> GraphModule:
     Inductor handles the elementwise fusion + scheduling (CUDA graphs,
     dispatch overhead). We handle the algorithmic shortcuts.
     """
-    # Currently a passthrough — Inductor handles everything.
-    # Add pattern matchers here for algorithmic optimizations:
+    graph = gm.graph
+    rewrites = 0
+
+    # Match RoPE: view_as_complex → mul(freqs_cis) → view_as_real
+    # Inductor falls back to eager ATen for this pattern.
+    rope_mod = _load_kernel(partition_root, "rope")
+    if rope_mod is not None:
+        def _rope_impl(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+            return rope_mod.fused_rope(x, freqs_cis, fallback=None)
+
+        def _rope_fake(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        rope_op = _get_custom_op("fused_rope", _rope_impl, _rope_fake)
+        op_callable = rope_op._opoverload
+
+        for node in list(graph.nodes):
+            if node.op != "call_function":
+                continue
+            name = getattr(node.target, '__name__', str(node.target))
+            if "view_as_complex" not in name:
+                continue
+            # Found view_as_complex — look for mul → view_as_real chain
+            mul_node = None
+            for user in node.users:
+                if "mul" in str(user.target):
+                    mul_node = user
+                    break
+            if mul_node is None:
+                continue
+            real_node = None
+            for user in mul_node.users:
+                if "view_as_real" in str(getattr(user.target, '__name__', str(user.target))):
+                    real_node = user
+                    break
+            if real_node is None:
+                continue
+
+            # Found the pattern. The input to view_as_complex is the
+            # float-casted, reshaped x. The freqs_cis is the other mul arg.
+            x_input = node.args[0]  # float view before complex
+            freqs_input = [a for a in mul_node.args if a is not node]
+            if not freqs_input:
+                continue
+
+            # TODO: proper integration requires matching the reshape chain
+            # For now, skip — the pattern matching needs more work to handle
+            # the view/reshape ops around view_as_complex properly.
+
+    # Future pattern matchers:
     # - fused_full_topk_indexer: skip indexer when seq <= topk
     # - fused_single_token_moe: optimized expert routing for batch=1
-    # - Custom attention patterns for MLA latent-space attention
     return gm
 
 
@@ -168,6 +215,38 @@ def racetrack_backend(gm: GraphModule, example_inputs):
     # (compilation, fusion of remaining ops, CUDA graph capture)
     from torch._inductor.compile_fx import compile_fx
     return compile_fx(gm, example_inputs)
+
+
+def patch_model_for_racetrack(model: torch.nn.Module):
+    """
+    Pre-trace patching: replace model functions with custom-op versions
+    BEFORE Dynamo traces. This prevents decomposition of ops we want
+    to keep as fused kernels.
+
+    Call this before torch.compile(model, backend="racetrack").
+    """
+    partition_root = _DEFAULT_PARTITION
+    rope_mod = _load_kernel(partition_root, "rope")
+
+    if rope_mod is not None:
+        import inference.model as real_model
+
+        @torch.library.custom_op("racetrack::apply_rotary_emb", mutates_args=())
+        def _rope_op(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+            return rope_mod.fused_rope(x, freqs_cis, fallback=None)
+
+        @_rope_op.register_fake
+        def _(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        _original_rope = real_model.apply_rotary_emb
+
+        def _patched_rope(x, freqs_cis, interleaved=True):
+            if not interleaved:
+                return _original_rope(x, freqs_cis, interleaved)
+            return _rope_op(x, freqs_cis)
+
+        real_model.apply_rotary_emb = _patched_rope
 
 
 # Register as a named backend so torch.compile(backend="racetrack") works
