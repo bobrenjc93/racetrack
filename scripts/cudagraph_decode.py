@@ -24,8 +24,7 @@ def load_kernels():
     KERNELS['act_quant'] = _load_kernel('act_quant')
     KERNELS['rope'] = _load_kernel('rope')
     KERNELS['fused_rope'] = _load_kernel('fused_rope')  # has standalone _rms_norm_kernel
-    # tc/gemv kernels slower than original fp8_gemm in CUDA graph
-    # KERNELS['fp8_gemm_tc'] = _load_kernel('fp8_gemm_tc')
+    KERNELS['norm_act_quant'] = _load_kernel('norm_act_quant')
 
 
 def main():
@@ -428,8 +427,20 @@ def _patch_mla(module):
 
         # Fused act_quant for wq_a — shared with wkv_a (same input x)
         qr_raw = _fused_linear(x, module.wq_a, aq)
-        qr = _fused_standalone_norm(qr_raw, module.q_norm.weight, module.q_norm.eps)
-        q = _fused_linear(qr, module.wq_b, aq)
+        naq = KERNELS.get('norm_act_quant')
+        if naq and module.wq_b.weight.dtype == torch.float8_e4m3fn:
+            from inference.kernel import fp8_gemm
+            # norm + quant in one kernel → direct fp8_gemm (skips separate norm + act_quant)
+            qr_fp8, qr_scale = naq.fused_standalone_norm_quant(
+                qr_raw, module.q_norm.weight, eps=module.q_norm.eps,
+            )
+            q = fp8_gemm(qr_fp8, qr_scale, module.wq_b.weight, module.wq_b.weight.scale)
+            if getattr(module.wq_b, 'reduce_output', False) and dist.is_initialized():
+                q = q.float(); dist.all_reduce(q)
+            q = q.to(x.dtype)
+        else:
+            qr = _fused_standalone_norm(qr_raw, module.q_norm.weight, module.q_norm.eps)
+            q = _fused_linear(qr, module.wq_b, aq)
         q = q.view(bsz, seqlen, module.n_local_heads, module.qk_head_dim)
         q_nope, q_pe = torch.split(q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
         q_pe = apply_rope(q_pe, freqs_cis)
