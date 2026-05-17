@@ -425,18 +425,25 @@ def _patch_mla(module):
         end_pos = start_pos + seqlen
 
         # Fused act_quant for wq_a — shared with wkv_a (same input x)
-        qr_raw = _fused_linear(x, module.wq_a, aq)
+        from inference.kernel import fp8_gemm
+
+        # Share act_quant(x) for BOTH wq_a and wkv_a (same input)
+        # Inductor does this in 1 kernel; we do 1 quant + 2 GEMMs
+        if module.wq_a.weight.dtype == torch.float8_e4m3fn:
+            x_q, x_s = aq.fused_act_quant(x, fallback=None)
+            qr_raw = fp8_gemm(x_q, x_s, module.wq_a.weight, module.wq_a.weight.scale)
+            kv_raw = fp8_gemm(x_q, x_s, module.wkv_a.weight, module.wkv_a.weight.scale)
+        else:
+            qr_raw = module.wq_a(x)
+            kv_raw = module.wkv_a(x)
+
+        # Q path: norm → quant → GEMM
         naq = KERNELS.get('norm_act_quant')
         if naq and module.wq_b.weight.dtype == torch.float8_e4m3fn:
-            from inference.kernel import fp8_gemm
-            # norm + quant in one kernel → direct fp8_gemm (skips separate norm + act_quant)
             qr_fp8, qr_scale = naq.fused_standalone_norm_quant(
                 qr_raw, module.q_norm.weight, eps=module.q_norm.eps,
             )
             q = fp8_gemm(qr_fp8, qr_scale, module.wq_b.weight, module.wq_b.weight.scale)
-            if getattr(module.wq_b, 'reduce_output', False) and dist.is_initialized():
-                q = q.float(); dist.all_reduce(q)
-            q = q.to(x.dtype)
         else:
             qr = _fused_standalone_norm(qr_raw, module.q_norm.weight, module.q_norm.eps)
             q = _fused_linear(qr, module.wq_b, aq)
@@ -444,7 +451,8 @@ def _patch_mla(module):
         q_nope, q_pe = torch.split(q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
         q_pe = apply_rope(q_pe, freqs_cis)
 
-        kv = _fused_linear(x, module.wkv_a, aq)
+        # KV path: reuse kv_raw from shared quant above
+        kv = kv_raw
         kv, k_pe = torch.split(kv, [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1)
         kv = _fused_standalone_norm(kv, module.kv_norm.weight, module.kv_norm.eps)
         k_pe = apply_rope(k_pe.unsqueeze(2), freqs_cis)
