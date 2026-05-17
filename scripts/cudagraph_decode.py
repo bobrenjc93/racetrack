@@ -169,6 +169,8 @@ def main():
 def patch_for_cudagraph(model):
     from inference import model as rm
     for module in model.modules():
+        if isinstance(module, rm.Indexer):
+            _patch_indexer_shortcircuit(module)
         if isinstance(module, rm.MoE):
             _patch_moe(module)
         if isinstance(module, rm.Gate):
@@ -179,10 +181,26 @@ def patch_for_cudagraph(model):
             _patch_rmsnorm(module)
         if isinstance(module, rm.MLP):
             _patch_mlp(module)
-        # Patch ALL Linear modules for fused act_quant (including Indexer internals)
         if isinstance(module, (rm.Linear, rm.ColumnParallelLinear, rm.RowParallelLinear)):
             if module.weight.dtype == torch.float8_e4m3fn:
                 _patch_linear_global(module)
+
+
+def _patch_indexer_shortcircuit(module):
+    """Skip entire indexer when seq < topk — return arange(end_pos)."""
+    original = module.forward
+    topk = module.index_topk
+
+    def forward(x, qr, start_pos, freqs_cis, mask):
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        if end_pos <= topk:
+            return torch.arange(
+                end_pos, device=x.device, dtype=torch.long,
+            ).view(1, 1, end_pos).expand(bsz, seqlen, end_pos)
+        return original(x, qr, start_pos, freqs_cis, mask)
+
+    module.forward = forward
 
 
 def _patch_linear_global(module):
@@ -430,10 +448,14 @@ def _patch_mla(module):
         q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :module.qk_nope_head_dim])
         scores = (torch.einsum("bshc,btc->bsht", q_nope, module.kv_cache[:bsz, :end_pos]) +
                   torch.einsum("bshr,btr->bsht", q_pe, module.pe_cache[:bsz, :end_pos])) * module.softmax_scale
-        topk_indices = module.indexer(x, qr_raw, start_pos, freqs_cis, None)
-        index_mask = scores.new_full((bsz, 1, end_pos), torch.finfo(scores.dtype).min).scatter_(-1, topk_indices, 0.0)
-        scores += index_mask.unsqueeze(2)
-        scores = scores.softmax(dim=-1)
+        if end_pos <= module.indexer.index_topk:
+            # Full-topk shortcircuit: ALL positions selected, no masking needed
+            scores = scores.softmax(dim=-1)
+        else:
+            topk_indices = module.indexer(x, qr_raw, start_pos, freqs_cis, None)
+            index_mask = scores.new_full((bsz, 1, end_pos), torch.finfo(scores.dtype).min).scatter_(-1, topk_indices, 0.0)
+            scores += index_mask.unsqueeze(2)
+            scores = scores.softmax(dim=-1)
         x = torch.einsum("bsht,btc->bshc", scores, module.kv_cache[:bsz, :end_pos])
         x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -module.v_head_dim:])
         return _fused_linear(x.flatten(2), module.wo, aq)
