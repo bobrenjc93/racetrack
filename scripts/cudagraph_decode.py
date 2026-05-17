@@ -24,6 +24,7 @@ def load_kernels():
     KERNELS['act_quant'] = _load_kernel('act_quant')
     KERNELS['rope'] = _load_kernel('rope')
     KERNELS['fused_rope'] = _load_kernel('fused_rope')  # has standalone _rms_norm_kernel
+    KERNELS['fp8_gemm_fused'] = _load_kernel('fp8_gemm_fused')
 
 
 def main():
