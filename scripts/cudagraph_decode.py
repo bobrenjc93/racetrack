@@ -178,6 +178,23 @@ def patch_for_cudagraph(model):
             _patch_rmsnorm(module)
         if isinstance(module, rm.MLP):
             _patch_mlp(module)
+        # Patch ALL Linear modules for fused act_quant (including Indexer internals)
+        if isinstance(module, (rm.Linear, rm.ColumnParallelLinear, rm.RowParallelLinear)):
+            if module.weight.dtype == torch.float8_e4m3fn:
+                _patch_linear_global(module)
+
+
+def _patch_linear_global(module):
+    """Patch ALL FP8 Linear modules for fused act_quant."""
+    aq = KERNELS['act_quant']
+    def forward(x):
+        from inference.kernel import fp8_gemm
+        xq, xs = aq.fused_act_quant(x.contiguous(), fallback=None)
+        y = fp8_gemm(xq, xs, module.weight, module.weight.scale)
+        if getattr(module, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
+            y = y.float(); dist.all_reduce(y)
+        return y.to(x.dtype)
+    module.forward = forward
 
 
 def _fused_standalone_norm(x, weight, eps):
