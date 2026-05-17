@@ -25,18 +25,19 @@ def _load_kernel(kernel_root: Path, name: str):
     return None
 
 
-def build_flat_decode(model, kernel_root: Path):
-    """Build a flat decode function from the model + partition kernels.
+def build_flat_decode(model, kernel_root: Path | None = None):
+    """Build a flat decode function from the model + optional partition kernels.
 
-    Returns a callable: flat_decode(tok_tensor, start_pos) -> logits
-    that does one decode step with zero nn.Module dispatch overhead.
+    When kernel_root is None, uses inference.kernel defaults (baseline mode).
+    Returns (flat_decode, flat_decode_cg, update_bufs, static_logits).
     """
     from inference.model import apply_rotary_emb, weight_dequant
     from inference.kernel import fp8_gemm
+    from inference import kernel as inf_kernel
 
-    aq = _load_kernel(kernel_root, "act_quant")
-    rn = _load_kernel(kernel_root, "residual_norm")
-    fr = _load_kernel(kernel_root, "fused_rope")
+    aq = _load_kernel(kernel_root, "act_quant") if kernel_root else None
+    rn = _load_kernel(kernel_root, "residual_norm") if kernel_root else None
+    fr = _load_kernel(kernel_root, "fused_rope") if kernel_root else None
 
     ws = dist.get_world_size() if dist.is_initialized() else 1
 
@@ -68,17 +69,33 @@ def build_flat_decode(model, kernel_root: Path):
         ld = _extract_layer(layer, aq, rn, ws)
         layers.append(ld)
 
-    def _act_quant_gemm(x, w, s):
-        xq, xs = aq.fused_act_quant(x, fallback=None)
-        return fp8_gemm(xq, xs, w, s)
+    def _do_act_quant(x):
+        if aq is not None:
+            return aq.fused_act_quant(x, fallback=None)
+        return inf_kernel.act_quant(x)
+
+    def _do_swiglu_quant(gate, up):
+        if aq is not None and hasattr(aq, 'fused_swiglu_quant'):
+            return aq.fused_swiglu_quant(gate, up, fallback=None)
+        h = (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+        return _do_act_quant(h)
+
+    def _rms_norm_eager(x, weight, eps):
+        dtype = x.dtype
+        xf = x.float()
+        return (weight * xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(dtype)
 
     def _residual_norm(x, residual, weight, eps):
-        shape = x.shape
-        cols = shape[-1]
-        x_f = x.contiguous().view(-1, cols)
-        r_f = residual.contiguous().view(-1, cols)
-        hidden, normed = rn.fused_residual_norm(r_f, x_f, weight, eps=eps, fallback=None)
-        return normed.view(shape), hidden.view(shape)
+        if rn is not None:
+            shape = x.shape
+            cols = shape[-1]
+            x_f = x.contiguous().view(-1, cols)
+            r_f = residual.contiguous().view(-1, cols)
+            hidden, normed = rn.fused_residual_norm(r_f, x_f, weight, eps=eps, fallback=None)
+            return normed.view(shape), hidden.view(shape)
+        hidden = residual + x
+        normed = _rms_norm_eager(hidden, weight, eps)
+        return normed, hidden
 
     def _standalone_norm(x, weight, eps):
         if fr is not None:
@@ -92,12 +109,10 @@ def build_flat_decode(model, kernel_root: Path):
                 x_f, weight, out, eps, cols,
                 x_f.stride(0), bs, num_warps=8 if bs >= 2048 else 4)
             return out.view(shape)
-        dtype = x.dtype
-        xf = x.float()
-        return (weight * xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(dtype)
+        return _rms_norm_eager(x, weight, eps)
 
     def _linear_fp8(x, w, s):
-        xq, xs = aq.fused_act_quant(x, fallback=None)
+        xq, xs = _do_act_quant(x)
         return fp8_gemm(xq, xs, w, s)
 
     def _linear_fp8_reduce(x, w, s):
@@ -141,7 +156,7 @@ def build_flat_decode(model, kernel_root: Path):
                 normed, residual = _residual_norm(h, residual, ld['an_w'], ld['eps'])
 
             if ld['wq_a_fp8']:
-                xq, xs = aq.fused_act_quant(normed, fallback=None)
+                xq, xs = _do_act_quant(normed)
                 qr_raw = fp8_gemm(xq, xs, ld['wq_a_w'], ld['wq_a_s'])
                 kv_raw = fp8_gemm(xq, xs, ld['wkv_a_w'], ld['wkv_a_s'])
             else:
@@ -184,17 +199,17 @@ def build_flat_decode(model, kernel_root: Path):
 
             normed, residual = _residual_norm(attn_out, residual, ld['fn_w'], ld['eps'])
 
-            if not ld['is_moe'] and ld.get('mlp_fp8') and aq is not None:
+            if not ld['is_moe'] and ld.get('mlp_fp8'):
                 gate_v = _linear_fp8(normed, ld['mlp_w1_w'], ld['mlp_w1_s'])
                 up_v = _linear_fp8(normed, ld['mlp_w3_w'], ld['mlp_w3_s'])
-                h_q, h_s = aq.fused_swiglu_quant(gate_v, up_v, fallback=None)
+                h_q, h_s = _do_swiglu_quant(gate_v, up_v)
                 h = fp8_gemm(h_q, h_s, ld['mlp_w2_w'], ld['mlp_w2_s'])
                 if ld['mlp_w2_reduce'] and ws > 1:
                     h = h.float()
                     dist.all_reduce(h)
                     h = h.to(torch.bfloat16)
-            elif ld['is_moe'] and ld.get('moe_has_scales') and aq is not None:
-                h = _flat_moe(normed, ld, aq, fp8_gemm, ws, _linear_fp8, _linear_fp8_reduce)
+            elif ld['is_moe'] and ld.get('moe_has_scales'):
+                h = _flat_moe(normed, ld, _do_act_quant, _do_swiglu_quant, fp8_gemm, ws, _linear_fp8, _linear_fp8_reduce)
             else:
                 h = ld['ffn_fn'](normed)
 
@@ -219,7 +234,7 @@ def build_flat_decode(model, kernel_root: Path):
     return flat_decode, flat_decode_cg, _update_decode_buffers, static_logits
 
 
-def _flat_moe(x, ld, aq, fp8_gemm, ws, linear_fp8, linear_fp8_reduce):
+def _flat_moe(x, ld, do_act_quant, do_swiglu_quant, fp8_gemm, ws, linear_fp8, linear_fp8_reduce):
     """Inlined MoE with stacked weights. CUDA-graph-safe (no .tolist, no bincount)."""
     x_flat = x.view(-1, ld['moe_dim'])
 
@@ -265,18 +280,18 @@ def _flat_moe(x, ld, aq, fp8_gemm, ws, linear_fp8, linear_fp8_reduce):
 
     y = torch.zeros_like(x_flat, dtype=torch.float32)
     for t in range(topk):
-        x_q, x_s = aq.fused_act_quant(x_flat, fallback=None)
+        x_q, x_s = do_act_quant(x_flat)
         gate_out = fp8_gemm(x_q, x_s, sel_w1[t], sel_s1[t])
         up_out = fp8_gemm(x_q, x_s, sel_w3[t], sel_s3[t])
-        h_q, h_s = aq.fused_swiglu_quant(gate_out, up_out, fallback=None)
+        h_q, h_s = do_swiglu_quant(gate_out, up_out)
         out = fp8_gemm(h_q, h_s, sel_w2[t], sel_s2[t])
         y = y + out.float() * expert_weights[t]
 
     # Shared experts (inlined MLP)
-    if ld.get('shared_fp8') and aq is not None:
+    if ld.get('shared_fp8'):
         sg = linear_fp8(x_flat, ld['shared_mlp_w1_w'], ld['shared_mlp_w1_s'])
         su = linear_fp8(x_flat, ld['shared_mlp_w3_w'], ld['shared_mlp_w3_s'])
-        sh_q, sh_s = aq.fused_swiglu_quant(sg, su, fallback=None)
+        sh_q, sh_s = do_swiglu_quant(sg, su)
         shared_out = fp8_gemm(sh_q, sh_s, ld['shared_mlp_w2_w'], ld['shared_mlp_w2_s'])
     else:
         shared_out = ld['shared_experts_fn'](x_flat)
