@@ -163,7 +163,9 @@ def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
     partitions = sorted(
         p.name
         for p in root.iterdir()
-        if p.is_dir() and (p / "model.py").exists() and not p.name.startswith("__")
+        if p.is_dir()
+        and ((p / "spec.py").exists() or (p / "model.py").exists())
+        and not p.name.startswith("__")
     )
     if partition_filter == "all":
         return ["baseline", *partitions]

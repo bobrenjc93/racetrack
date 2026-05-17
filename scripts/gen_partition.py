@@ -370,6 +370,58 @@ def generate_model_py(
     return text
 
 
+_FX_PATTERN_OPS = {
+    "fused_swiglu", "fused_residual_norm", "fused_act_quant",
+    "fused_rms_norm", "fused_norm_rope",
+}
+_PRE_TRACE_OPS = {
+    "fused_full_topk_indexer", "fused_single_token_moe",
+}
+
+
+def _classify_op_kind(op_name: str) -> str:
+    if op_name in _FX_PATTERN_OPS:
+        return "fx_pattern"
+    if op_name in _PRE_TRACE_OPS:
+        return "pre_trace"
+    return "module_patch"
+
+
+def generate_spec_py(
+    fusions: list[FusionSpec],
+    model: ModelConfig,
+    notes: str | None = None,
+) -> str:
+    if notes is None:
+        recipe_names = [f.name for f in fusions]
+        notes = f"Codegen partition: {', '.join(recipe_names)}."
+
+    graph_nodes: dict[str, list[str]] = {}
+    for f in fusions:
+        graph_nodes[f.name] = f.graph_nodes
+
+    graph_lines = ["GRAPH_NODES = {"]
+    for name, nodes in graph_nodes.items():
+        nodes_str = ", ".join(f'"{n}"' for n in nodes)
+        graph_lines.append(f'    "{name}": [{nodes_str}],')
+    graph_lines.append("}")
+
+    ops_lines = ["FUSED_OPS = ["]
+    for f in fusions:
+        kind = _classify_op_kind(f.name)
+        ops_lines.append(f'    {{"name": "{f.name}", "kind": "{kind}"}},')
+    ops_lines.append("]")
+
+    return "\n".join([
+        f"PARTITION_NOTES = {notes!r}",
+        "",
+        *graph_lines,
+        "",
+        *ops_lines,
+        "",
+    ])
+
+
 def generate_kernel_stub(
     backend: str, op_names: list[str], runtime_ops: set[str],
 ) -> str:
@@ -506,12 +558,8 @@ def main() -> None:
         for f in no_recipe:
             print(f"  {f.name}")
 
-    baseline = model.baseline_path.read_text()
-    model_text = generate_model_py(
-        baseline, fusions, model, cli_args, notes=args.notes,
-    )
-
-    partition_hash = hashlib.sha256(model_text.encode()).hexdigest()[:8]
+    spec_text = generate_spec_py(fusions, model, notes=args.notes)
+    partition_hash = hashlib.sha256(spec_text.encode()).hexdigest()[:8]
     partition_dir = model.partitions_dir / partition_hash
 
     print(f"\nPartition: {partition_hash}")
@@ -519,8 +567,7 @@ def main() -> None:
 
     if args.dry_run:
         print("\nDry run — files that would be created:")
-        print(f"  {partition_dir}/model.py")
-        print(f"  {partition_dir}/__init__.py")
+        print(f"  {partition_dir}/spec.py")
         for backend in BACKENDS:
             print(f"  {partition_dir}/kernels/{backend}/ops.py")
         print(f"  {partition_dir}/graph.png")
@@ -532,11 +579,8 @@ def main() -> None:
     for backend in BACKENDS:
         (partition_dir / "kernels" / backend).mkdir(parents=True, exist_ok=True)
 
-    (partition_dir / "model.py").write_text(model_text)
-    print("  wrote model.py")
-
-    (partition_dir / "__init__.py").write_text("")
-    print("  wrote __init__.py")
+    (partition_dir / "spec.py").write_text(spec_text)
+    print("  wrote spec.py")
 
     for backend in BACKENDS:
         stub = generate_kernel_stub(backend, op_names, model.runtime_ops)
@@ -555,7 +599,7 @@ def main() -> None:
 
     print(f"\nDone. Test with:")
     print(
-        f"  RACETRACK_KERNEL_BACKEND=torch \\\n"
+        f"  RACETRACK_KERNEL_BACKEND=triton \\\n"
         f"    python -m racetrack.bench \\\n"
         f"    --partition {partition_hash} \\\n"
         f"    --benchmark smoke"

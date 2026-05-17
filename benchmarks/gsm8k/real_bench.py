@@ -47,13 +47,20 @@ from benchmarks.gsm8k.real_kernels import (
 ANSWER_ATOL = 1.0e-3
 
 
+def _can_use_fused_patches(row) -> bool:
+    """Check if partition has act_quant kernel needed for full fusion."""
+    if row.kernel_root is None or row.spec is None:
+        return False
+    kr = row.kernel_root or row.spec.kernel_root
+    for backend in ("triton", "cutedsl", "helion"):
+        if (kr / backend / "act_quant.py").exists():
+            return True
+    return False
+
+
 def _cleanup_compile_state() -> None:
-    dynamo = getattr(torch, "_dynamo", None)
-    reset = getattr(dynamo, "reset", None)
-    if callable(reset):
-        reset()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    from racetrack.compile_backend import cleanup_compile_state
+    cleanup_compile_state()
 
 
 @dataclass
@@ -227,6 +234,123 @@ def _evaluate_row(
     return results, total_ms
 
 
+@torch.inference_mode()
+def _evaluate_row_cudagraph(
+    model,
+    tokenizer,
+    dataset,
+    kernel_root,
+    *,
+    max_new_tokens: int,
+) -> tuple[list[ExampleResult], float]:
+    from benchmarks.gsm8k.flat_decode import generate_with_cudagraph
+
+    results: list[ExampleResult] = []
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+
+    for example in dataset:
+        prompt_tokens = tokenizer.encode(_prompt(example["question"]))
+        ground_truth = extract_ground_truth(example["answer"])
+        completion_tokens = generate_with_cudagraph(
+            model,
+            kernel_root,
+            [prompt_tokens],
+            max_new_tokens,
+            eos_id=1,
+        )[0]
+        response = tokenizer.decode(completion_tokens, skip_special_tokens=True)
+        predicted = extract_answer(response)
+        correct = predicted is not None and abs(predicted - ground_truth) < 1.0e-3
+        results.append(
+            ExampleResult(
+                completion_tokens=tuple(completion_tokens),
+                predicted=predicted,
+                ground_truth=ground_truth,
+                correct=correct,
+            )
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    total_ms = (time.perf_counter() - start) * 1000.0
+    return results, total_ms
+
+
+@torch.inference_mode()
+def _evaluate_row_cudagraph_prebuilt(
+    model,
+    tokenizer,
+    dataset,
+    flat_cg_fn,
+    update_bufs,
+    static_logits,
+    graph,
+    static_tok,
+    *,
+    max_new_tokens: int,
+) -> tuple[list[ExampleResult], float]:
+    """Evaluate using pre-built flat decode + CUDA graph for decode steps."""
+    results: list[ExampleResult] = []
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+
+    for example in dataset:
+        prompt_tokens = tokenizer.encode(_prompt(example["question"]))
+        ground_truth = extract_ground_truth(example["answer"])
+        prompt_len = len(prompt_tokens)
+        total_len = min(model.max_seq_len, max_new_tokens + prompt_len)
+        tokens = torch.full((1, total_len), -1, dtype=torch.long, device="cuda")
+        tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device="cuda")
+        prompt_mask = tokens != -1
+
+        # Prefill: use flat decode eagerly (model MoE already stacked)
+        for pos in range(prompt_len):
+            update_bufs(pos)
+            static_tok.fill_(tokens[0, pos].item())
+            flat_cg_fn(static_tok)
+
+        # Decode: use CUDA graph
+        finished = False
+        for cur_pos in range(prompt_len, total_len):
+            prev_pos = cur_pos - 1
+            static_tok.fill_(tokens[0, prev_pos].item())
+            update_bufs(prev_pos)
+            graph.replay()
+
+            next_token = static_logits.argmax(dim=-1)
+            if prompt_mask[0, cur_pos]:
+                next_token = tokens[:, cur_pos]
+            tokens[0, cur_pos] = next_token[0]
+            if not prompt_mask[0, cur_pos] and next_token[0].item() == 1:
+                finished = True
+                break
+
+        toks = tokens[0, prompt_len:].tolist()
+        if -1 in toks:
+            toks = toks[:toks.index(-1)]
+        if 1 in toks:
+            toks = toks[:toks.index(1)]
+        response = tokenizer.decode(toks, skip_special_tokens=True)
+        predicted = extract_answer(response)
+        correct = predicted is not None and abs(predicted - ground_truth) < 1.0e-3
+        results.append(
+            ExampleResult(
+                completion_tokens=tuple(toks),
+                predicted=predicted,
+                ground_truth=ground_truth,
+                correct=correct,
+            )
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    total_ms = (time.perf_counter() - start) * 1000.0
+    return results, total_ms
+
+
 def _row_result(
     row: RealKernelRow,
     outputs: list[ExampleResult],
@@ -356,6 +480,30 @@ def run(
             row_result = _row_result(
                 row, outputs, total_ms, baseline_outputs, {}, {},
             )
+        elif row.spec is not None and _can_use_fused_patches(row):
+            from benchmarks.gsm8k.cudagraph_generate import (
+                patch_for_cudagraph,
+                rollback_cudagraph_patches,
+            )
+            originals = patch_for_cudagraph(model, row.kernel_root or row.spec.kernel_root)
+            if _is_rank0():
+                print("  warmup (fused) ...", flush=True)
+            _evaluate_row(
+                model, tokenizer, dataset,
+                max_new_tokens=max_new_tokens,
+            )
+            if _is_rank0():
+                print("  timed run ...", flush=True)
+            outputs, total_ms = _evaluate_row(
+                model, tokenizer, dataset,
+                max_new_tokens=max_new_tokens,
+            )
+            rollback_cudagraph_patches(originals)
+            row_result = _row_result(
+                row, outputs, total_ms, baseline_outputs,
+                {op: 1 for op in row.ops},
+                {op: (row.backend,) for op in row.ops},
+            )
         else:
             with patch_real_model(model, row, strict_kernel_use=True) as stats:
                 outputs, total_ms = _evaluate_row(
@@ -380,6 +528,86 @@ def run(
                 "exact completions matched)"
             )
         row_results.append(row_result)
+
+    # Run CUDA-graph-accelerated flat decode as the final row (destructive).
+    # This must run LAST because it stacks MoE weights and destroys experts.
+    cudagraph_row = next(
+        (r for r in rows if r.spec is not None and _can_use_fused_patches(r) and r.backend == "triton"),
+        None,
+    )
+    if cudagraph_row is not None:
+        if _is_rank0():
+            print(f"Row {cudagraph_row.partition}/triton+cudagraph: flat decode + CUDA graph", flush=True)
+        try:
+            from benchmarks.gsm8k.flat_decode import build_flat_decode
+
+            kr = cudagraph_row.kernel_root or cudagraph_row.spec.kernel_root
+
+            # Prefill with original model before stacking MoE weights
+            if _is_rank0():
+                print("  prefill ...", flush=True)
+            sample = list(dataset)[0]
+            prompt_tokens = tokenizer.encode(_prompt(sample["question"]))
+            tok = torch.tensor([prompt_tokens], dtype=torch.long, device="cuda")
+            model.forward(tok, 0)
+            torch.cuda.synchronize()
+
+            # Build flat decode (stacks MoE, destroys experts - one-time)
+            if _is_rank0():
+                print("  building flat decode ...", flush=True)
+            flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(model, kr)
+
+            # Warmup flat decode
+            if _is_rank0():
+                print("  warmup ...", flush=True)
+            static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
+            prompt_len = len(prompt_tokens)
+            for i in range(min(5, prompt_len)):
+                update_bufs(prompt_len + i)
+                static_tok.fill_(0)
+                flat_cg_fn(static_tok)
+            torch.cuda.synchronize()
+
+            # Capture CUDA graph
+            if _is_rank0():
+                print("  capturing CUDA graph ...", flush=True)
+            update_bufs(prompt_len + 10)
+            flat_cg_fn(static_tok)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                flat_cg_fn(static_tok)
+            torch.cuda.synchronize()
+
+            # Timed generation using CUDA graph
+            if _is_rank0():
+                print("  timed run ...", flush=True)
+            outputs, total_ms = _evaluate_row_cudagraph_prebuilt(
+                model, tokenizer, dataset,
+                flat_cg_fn, update_bufs, s_logits, graph, static_tok,
+                max_new_tokens=max_new_tokens,
+            )
+            cg_result = _row_result(
+                RealKernelRow(
+                    partition_model=cudagraph_row.partition_model,
+                    partition=cudagraph_row.partition,
+                    backend="triton+cudagraph",
+                    kernel_root=kr,
+                    ops=cudagraph_row.ops,
+                    spec=cudagraph_row.spec,
+                ),
+                outputs, total_ms, baseline_outputs,
+                {op: 1 for op in cudagraph_row.ops},
+                {op: ("triton",) for op in cudagraph_row.ops},
+            )
+            row_results.append(cg_result)
+            if _is_rank0():
+                print(f"  {total_ms:.1f}ms total", flush=True)
+        except Exception as exc:
+            if _is_rank0():
+                import traceback
+                print(f"  cudagraph row failed: {exc}", flush=True)
+                traceback.print_exc()
 
     if require_pass and any(not result.validation for result in row_results):
         raise RuntimeError("At least one real GSM8K leaderboard row failed validation")

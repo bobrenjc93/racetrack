@@ -129,38 +129,16 @@ def main():
         if rank == 0:
             print(f"CUDA graph + fused kernels: {graph_ms:.2f} ms/token", flush=True)
 
-        # Now compare against Inductor in the SAME run
-        # Need a fresh model (original, unpatched)
-        del graph, static_tok, static_logits
-        torch.cuda.empty_cache()
-
-        if rank == 0: print("Loading fresh model for Inductor comparison...", flush=True)
-        with torch.device("cuda"):
-            model2 = Transformer(args)
-        load_hf_sharded_weights(model2, repo_id="deepseek-ai/DeepSeek-V3.2",
-                                hf_token=hf_token, rank=rank, world_size=world_size)
-        run_post_load_transforms(model2)
-        model2.eval()
-
-        tok = torch.arange(16, device="cuda", dtype=torch.long).unsqueeze(0)
-        model2.forward(tok, 0)
-        for i in range(10):
-            model2.forward(torch.tensor([[100+i]], device="cuda", dtype=torch.long), 16+i)
-
-        compiled = torch.compile(model2)
-        for i in range(15):
-            compiled.forward(torch.tensor([[200+i]], device="cuda", dtype=torch.long), start+i)
+        # Re-run timing to confirm
         torch.cuda.synchronize()
-
         t0 = time.perf_counter()
         for i in range(N):
-            compiled.forward(torch.tensor([[400+i]], device="cuda", dtype=torch.long), start+i)
+            static_tok.fill_(500+i)
+            graph.replay()
         torch.cuda.synchronize()
-        inductor_ms = (time.perf_counter() - t0) * 1000 / N
-
+        graph_ms2 = (time.perf_counter() - t0) * 1000 / N
         if rank == 0:
-            print(f"Inductor: {inductor_ms:.2f} ms/token", flush=True)
-            print(f"Gap: {graph_ms - inductor_ms:.1f}ms ({(graph_ms/inductor_ms - 1)*100:.1f}%)", flush=True)
+            print(f"CUDA graph (recheck): {graph_ms2:.2f} ms/token", flush=True)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier(); dist.destroy_process_group()

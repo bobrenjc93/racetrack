@@ -8,9 +8,10 @@ benchmark workload.
 
 - **Baseline**: `partitions/<model>/model.py` -- self-contained model with
   pure-torch ops, no kernel dispatch. This is the thing to beat.
-- **Partition**: `partitions/<model>/<hash>/model.py` -- a modified copy of
-  the baseline that routes one or more ops through `KernelDispatcher`. The
-  `<hash>` is the first 8 hex chars of SHA-256 of the model.py content.
+- **Partition**: `partitions/<model>/<hash>/spec.py` -- a declarative spec
+  defining which ops to fuse, how to patch the model pre-trace, and which
+  FX graph patterns to match. The `<hash>` is the first 8 hex chars of
+  SHA-256 of the spec content.
 - **Kernel**: `partitions/<model>/<hash>/kernels/<backend>/<op>.py` -- a
   backend-specific implementation of a dispatchable op. Each file exports
   `BACKEND_AVAILABLE: bool` and one or more op functions.
@@ -18,47 +19,50 @@ benchmark workload.
   and `results/<model>/<hardware>.md` (results per model + hardware config,
   e.g. `results/dsv3_2/8xh100.md`). Run with `python -m benchmarks.<name>.bench`.
 
+## Partition Architecture
+
+Each partition is defined by `spec.py` + `kernels/`, driven by a
+`torch.compile` custom backend:
+
+```
+partitions/<model>/<hash>/
+  spec.py                    -- partition spec (FUSED_OPS, GRAPH_NODES)
+  kernels/
+    triton/<op>.py           -- Triton kernel implementations
+    helion/<op>.py            -- Helion kernel implementations
+    cutedsl/<op>.py           -- CuteDSL kernel implementations
+```
+
+The system uses three kinds of fused ops:
+
+| Kind | When Applied | Examples |
+|------|-------------|----------|
+| `fx_pattern` | FX graph pattern matching after Dynamo traces | swiglu, residual_norm, act_quant |
+| `pre_trace` | Before Dynamo traces (control flow changes) | indexer shortcircuit, single-token MoE |
+| `module_patch` | Before Dynamo traces (module forward replacement) | mlp_gate_up_proj, attn_norm_qkv |
+
+Pipeline:
+1. Load spec → `PartitionSpec`
+2. `apply_pre_trace_patches(model, spec, dispatcher)` — patches modules
+3. `torch.compile(model, backend=RacetrackBackend(spec))` — traces + FX rewrites
+4. Execute compiled model (optionally via CUDA graph)
+
 ## Creating a new partition
 
-1. Copy the baseline: `cp partitions/dsv3_2/model.py new_model.py`
+Use `scripts/gen_partition.py` to generate a partition from fusion recipes:
 
-2. Identify ops to fuse or replace. Look for sequences of small ops in the
-   forward pass that could be a single kernel (e.g., norm + activation,
-   attention score + mask + softmax, residual + norm). Each dispatchable op
-   needs a torch fallback function already defined in the file and a call
-   through the dispatcher:
-   ```python
-   if self.dispatcher is None:
-       result = my_fused_op(x, weight, eps=eps)
-   else:
-       result = self.dispatcher.call("my_fused_op", my_fused_op, x, weight, eps=eps)
-   ```
+```bash
+python scripts/gen_partition.py \
+    --fuse rms_norm_q,rms_norm_kv,rope_kpe \
+    --fuse res_add_attn,ffn_norm
 
-3. Hash and create the partition directory:
-   ```bash
-   HASH=$(python3 -c "import hashlib; print(hashlib.sha256(open('new_model.py','rb').read()).hexdigest()[:8])")
-   mkdir -p partitions/dsv3_2/$HASH/kernels
-   mv new_model.py partitions/dsv3_2/$HASH/model.py
-   ```
+python scripts/gen_partition.py --list-recipes  # show available recipes
+python scripts/gen_partition.py --list-nodes    # show graph node IDs
+```
 
-4. Update `build_model()` at the bottom to pass `partition_root`:
-   ```python
-   def build_model(**overrides) -> FlattenedDeepSeekModel:
-       config = DSV3_2_CONFIG.for_benchmark(**overrides)
-       return FlattenedDeepSeekModel(config, partition_root=Path(__file__).parent)
-   ```
-
-5. Add `PARTITION_HASH` and `PARTITION_NOTES` constants at the top explaining
-   what this partition changes vs baseline.
-
-6. Add a `FUSED_OP_GRAPH` dict mapping each fused op name to the list of
-   graph node IDs it covers (see existing partitions for examples), then
-   regenerate graphs:
-   ```bash
-   python scripts/gen_graphs.py
-   ```
-   This produces `graph.png` for every partition and baseline. Always commit
-   the generated `graph.png` alongside the new partition.
+This creates `partitions/<model>/<hash>/spec.py` with the partition
+definition and kernel stubs. Then implement kernels in
+`kernels/<backend>/`.
 
 ## Writing kernels
 
@@ -79,46 +83,30 @@ The dispatcher scans ALL `.py` files (excluding `_`-prefixed) under
 `kernels/<backend>/` for each op, so kernels can be split across files.
 Backends: `triton`, `helion`, `cutedsl`.
 
+## Key modules
+
+- `racetrack/partition_spec.py` -- PartitionSpec data model, loader, discovery
+- `racetrack/pre_trace.py` -- Pre-trace model patchers (registry pattern)
+- `racetrack/fx_patterns.py` -- FX graph pattern matchers
+- `racetrack/compile_backend.py` -- Unified torch.compile backend
+- `racetrack/runtime/dispatch.py` -- KernelDispatcher (backend selection)
+
 ## Benchmarking
 
 ```bash
-# Run a specific benchmark
-python -m benchmarks.gsm8k.bench
+# Run the real-weight GSM8K benchmark
+torchrun --standalone --nproc-per-node=8 -m benchmarks.gsm8k.real_bench \
+    --hf-direct --partition-model dsv3_2 --backend all
 
-# Run with specific device/dtype
-python -m benchmarks.gsm8k.bench --device cuda:0 --dtype bfloat16
-
-# The old sweep runner still works too
+# Run the synthetic sweep benchmark
 python -m racetrack.bench --partition all --kernel-filter all --benchmark smoke
 ```
 
 After a benchmark run:
 - `benchmarks/<name>/results/<model>/<hardware>.md` has the winner, full
-  leaderboard, baseline comparison, and hardware info. The hardware slug is
-  auto-detected (e.g., `results/dsv3_2/8xh100.md`). These files are committed.
+  leaderboard, baseline comparison, and hardware info.
 - `partitions/<model>/<hash>/kernels/best.json` is a runtime cache for per-op
   backend winners (gitignored, not committed -- hardware-specific).
-
-## Iteration loop
-
-The workflow for improving performance:
-
-1. Run the benchmark, check `winner.json`
-2. If baseline wins, the partition's kernel overhead exceeds its fusion benefit
-3. Analyze where time is spent (try larger sequence lengths or model dims)
-4. Either:
-   - Add more fused ops to an existing partition (new kernel files)
-   - Create a new partition with different fusion boundaries
-   - Write better kernel implementations for existing ops
-5. Re-run the benchmark
-6. Commit `results/<model>/<hardware>.md` when a partition beats baseline
-
-## Partition files are self-contained
-
-Every `model.py` inlines all dependencies (ops, config, dispatcher, model
-classes). No imports from `racetrack.runtime`. This means duplication across
-partitions, which is intentional -- each partition is independently readable
-and modifiable without cross-file coordination.
 
 ## Environment
 

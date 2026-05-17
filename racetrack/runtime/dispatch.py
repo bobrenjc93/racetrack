@@ -141,6 +141,8 @@ class KernelDispatcher:
             self._modules[key] = None
             return None
         module = importlib.util.module_from_spec(spec)
+        import sys
+        sys.modules[spec_name] = module
         spec.loader.exec_module(module)
         self._modules[key] = module
         return module

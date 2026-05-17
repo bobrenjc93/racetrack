@@ -248,7 +248,7 @@ def _read_fused_op_graph(model_py: Path, model_dir: Path) -> dict[str, list[str]
 
 
 def _parse_fused_op_graph(text: str) -> dict[str, list[str]]:
-    m = re.search(r"FUSED_OP_GRAPH\s*=\s*(\{.*?\})\s*\n", text, re.DOTALL)
+    m = re.search(r"(?:FUSED_OP_GRAPH|GRAPH_NODES)\s*=\s*(\{.*?\})\s*\n", text, re.DOTALL)
     if not m:
         return {}
     try:
@@ -380,14 +380,16 @@ def generate_baseline_graph(model_name: str, info: dict) -> Path:
 def generate_partition_graph(
     partition_dir: Path, info: dict,
 ) -> Path | None:
+    spec_py = partition_dir / "spec.py"
     model_py = partition_dir / "model.py"
-    if not model_py.exists():
+    source = spec_py if spec_py.exists() else model_py
+    if not source.exists():
         return None
-    fused_op_graph = _read_fused_op_graph(model_py, info["dir"])
+    fused_op_graph = _read_fused_op_graph(source, info["dir"])
     if not fused_op_graph:
-        print(f"  {partition_dir.name} → skipped (no FUSED_OP_GRAPH)")
+        print(f"  {partition_dir.name} → skipped (no FUSED_OP_GRAPH/GRAPH_NODES)")
         return None
-    notes = _read_partition_notes(model_py)
+    notes = _read_partition_notes(source)
     title = f"{info['title']} — Partition {partition_dir.name}"
     g = _build_graph(
         title, info["nodes"], info["edges"],
@@ -420,7 +422,7 @@ def main() -> None:
                 continue
             if targets and child.name not in targets:
                 continue
-            if not (child / "model.py").exists():
+            if not (child / "spec.py").exists() and not (child / "model.py").exists():
                 continue
             generate_partition_graph(child, info)
 

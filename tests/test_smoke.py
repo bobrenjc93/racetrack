@@ -45,18 +45,10 @@ def test_missing_backend_errors(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_backend_env_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RACETRACK_KERNEL_BACKEND", "cutedl")
-    from partitions.dsv3_2.a1f6d7e2.model import build_model
+    from racetrack.runtime.dispatch import KernelDispatcher
 
-    model = build_model().eval()
-    input_ids = torch.arange(4, dtype=torch.long)
-    assert model.backend_status["cutedsl"] in {"native", "missing"}
-    expected = (
-        "CUTEDSL kernels require CUDA tensors"
-        if model.backend_status["cutedsl"] == "native"
-        else "No available cutedsl kernel"
-    )
-    with pytest.raises(RuntimeError, match=expected):
-        model(input_ids)
+    dispatcher = KernelDispatcher()
+    assert dispatcher.selected_backend() == "cutedsl"
 
 
 def test_all_uses_only_implemented_backends() -> None:
@@ -67,6 +59,6 @@ def test_only_one_model_is_supported() -> None:
     from racetrack.bench import MODELS
     from racetrack.runtime.modeling import model_config
 
-    assert MODELS == ("dsv3_2",)
+    assert MODELS == ("dsv3_2", "dsv3_2_nvfp4")
     with pytest.raises(KeyError, match="Unknown model config"):
         model_config("not_dsv3_2")

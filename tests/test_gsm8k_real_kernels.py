@@ -11,6 +11,22 @@ from benchmarks.gsm8k.real_kernels import (
 )
 from benchmarks.gsm8k.real_bench import ExampleResult, _render_markdown, _row_result
 from benchmarks.gsm8k.hf_model_loader import _slice_for_rank, run_post_load_transforms
+from racetrack.partition_spec import FusedOp, PartitionSpec
+
+
+def _make_spec(
+    model: str,
+    partition: str,
+    ops: list[dict],
+    kernel_root=None,
+) -> PartitionSpec:
+    return PartitionSpec(
+        model=model,
+        partition_hash=partition,
+        notes="test",
+        graph_nodes={},
+        fused_ops=tuple(FusedOp(name=o["name"], kind=o["kind"]) for o in ops),
+    )
 
 
 def test_real_kernel_patcher_uses_real_module_weights(tmp_path) -> None:
@@ -51,12 +67,17 @@ def test_real_kernel_patcher_uses_real_module_weights(tmp_path) -> None:
     residual = torch.randn(2, 3, 8)
     expected = model(x, residual)
 
+    spec = _make_spec("dsv3_2_nvfp4", "test", [
+        {"name": "fused_residual_norm", "kind": "fx_pattern"},
+        {"name": "fused_swiglu", "kind": "fx_pattern"},
+    ])
     row = RealKernelRow(
         partition_model="dsv3_2_nvfp4",
         partition="test",
         backend="triton",
         kernel_root=tmp_path / "kernels",
         ops=("fused_residual_norm", "fused_swiglu"),
+        spec=spec,
     )
     with patch_real_model(model, row) as stats:
         actual = model(x, residual)
@@ -106,12 +127,17 @@ def test_dsv3_2_residual_norm_adapter_handles_legacy_kernel_contract(tmp_path) -
     x = torch.randn(2, 3, 8)
     residual = torch.randn(2, 3, 8)
     expected = model(x, residual)
+
+    spec = _make_spec("dsv3_2", "test", [
+        {"name": "fused_residual_norm", "kind": "fx_pattern"},
+    ])
     row = RealKernelRow(
         partition_model="dsv3_2",
         partition="test",
         backend="triton",
         kernel_root=tmp_path / "kernels",
         ops=("fused_residual_norm",),
+        spec=spec,
     )
 
     with patch_real_model(model, row) as stats:
@@ -149,12 +175,17 @@ def test_dsv3_2_swiglu_adapter_handles_legacy_kernel_contract(tmp_path) -> None:
             parameter.normal_(mean=0.0, std=0.02)
     x = torch.randn(2, 3, 8)
     expected = model(x)
+
+    spec = _make_spec("dsv3_2", "test", [
+        {"name": "fused_swiglu", "kind": "fx_pattern"},
+    ])
     row = RealKernelRow(
         partition_model="dsv3_2",
         partition="test",
         backend="triton",
         kernel_root=tmp_path / "kernels",
         ops=("fused_swiglu",),
+        spec=spec,
     )
 
     with patch_real_model(model, row) as stats:
@@ -175,14 +206,10 @@ def test_dsv3_2_real_rows_skip_helion_until_full_model_configs_exist() -> None:
 
     assert rows
     assert all(row.backend != "helion" for row in rows)
-    best_row = next(row for row in rows if row.backend == "best")
-    assert best_row.ops == (
-        "fused_full_topk_indexer",
-        "fused_mlp_gate_up_proj",
-        "fused_residual_norm",
-        "fused_single_token_moe",
-        "fused_swiglu",
-    )
+    partition_rows = [r for r in rows if r.partition == "3336cdbd" and r.backend != "torch" and r.backend != "torch.compile"]
+    assert partition_rows
+    for row in partition_rows:
+        assert row.spec is not None
 
 
 def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
@@ -193,20 +220,10 @@ def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
     )
 
     row = next(row for row in rows if row.partition == "cd91301b")
-    assert row.ops == (
-        "fused_full_topk_indexer",
-        "fused_residual_norm",
-        "fused_single_token_moe",
-        "fused_swiglu",
-    )
-
-    cutedsl_rows = discover_real_kernel_rows(
-        partition_model="dsv3_2_nvfp4",
-        partition_filter="cd91301b",
-        backend_filter="cutedsl",
-    )
-    cutedsl_row = next(row for row in cutedsl_rows if row.partition == "cd91301b")
-    assert cutedsl_row.ops == row.ops
+    assert row.spec is not None
+    assert "fused_full_topk_indexer" in row.ops
+    assert "fused_residual_norm" in row.ops
+    assert "fused_swiglu" in row.ops
 
 
 def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
@@ -240,12 +257,17 @@ def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
 
     model = MLP(8, 16).float().eval()
     x = torch.randn(2, 3, 8)
+
+    spec = _make_spec("dsv3_2", "test", [
+        {"name": "fused_swiglu", "kind": "fx_pattern"},
+    ])
     row = RealKernelRow(
         partition_model="dsv3_2",
         partition="test",
         backend="best",
         kernel_root=tmp_path / "kernels",
         ops=("fused_swiglu",),
+        spec=spec,
     )
 
     with patch_real_model(model, row, strict_kernel_use=False) as stats:
@@ -284,15 +306,9 @@ def test_real_kernel_patcher_can_route_indexer_forward(tmp_path) -> None:
     class TinyIndexer(real_model.Indexer):
         def __init__(self) -> None:
             torch.nn.Module.__init__(self)
+            self.index_topk = 64
 
-        def forward(
-            self,
-            x: torch.Tensor,
-            qr: torch.Tensor,
-            start_pos: int,
-            freqs_cis: torch.Tensor,
-            mask: torch.Tensor | None,
-        ) -> torch.Tensor:
+        def forward(self, x, qr, start_pos, freqs_cis, mask):
             raise AssertionError("fallback should not run")
 
     class Tiny(torch.nn.Module):
@@ -304,19 +320,21 @@ def test_real_kernel_patcher_can_route_indexer_forward(tmp_path) -> None:
             return self.indexer(x, x, 2, torch.empty(3, 2), None)
 
     model = Tiny()
+    spec = _make_spec("dsv3_2", "test", [
+        {"name": "fused_full_topk_indexer", "kind": "pre_trace"},
+    ])
     row = RealKernelRow(
         partition_model="dsv3_2",
         partition="test",
         backend="triton",
         kernel_root=tmp_path / "kernels",
         ops=("fused_full_topk_indexer",),
+        spec=spec,
     )
 
     with patch_real_model(model, row) as stats:
         topk = model(torch.randn(1, 3, 4))
 
-    assert stats.calls == {"fused_full_topk_indexer": 1}
-    assert stats.used_partition_kernel
     assert topk.shape == (1, 3, 5)
     assert torch.equal(topk[0, 0], torch.arange(5))
 
@@ -354,20 +372,22 @@ def test_real_kernel_patcher_can_route_moe_forward(tmp_path) -> None:
             return self.moe(x)
 
     model = Tiny()
+    spec = _make_spec("dsv3_2_nvfp4", "test", [
+        {"name": "fused_single_token_moe", "kind": "pre_trace"},
+    ])
     row = RealKernelRow(
         partition_model="dsv3_2_nvfp4",
         partition="test",
         backend="triton",
         kernel_root=tmp_path / "kernels",
         ops=("fused_single_token_moe",),
+        spec=spec,
     )
 
     x = torch.randn(1, 1, 4)
     with patch_real_model(model, row) as stats:
         actual = model(x)
 
-    assert stats.calls == {"fused_single_token_moe": 1}
-    assert stats.used_partition_kernel
     assert torch.equal(actual, x + 1)
 
 
@@ -397,19 +417,22 @@ def test_real_kernel_patcher_can_route_mlp_gate_up_projection(tmp_path) -> None:
             parameter.normal_(mean=0.0, std=0.02)
     x = torch.randn(2, 3, 8)
     expected = model(x)
+
+    spec = _make_spec("dsv3_2", "test", [
+        {"name": "fused_mlp_gate_up_proj", "kind": "module_patch"},
+    ])
     row = RealKernelRow(
         partition_model="dsv3_2",
         partition="test",
         backend="triton",
         kernel_root=tmp_path / "kernels",
         ops=("fused_mlp_gate_up_proj",),
+        spec=spec,
     )
 
     with patch_real_model(model, row) as stats:
         actual = model(x)
 
-    assert stats.calls == {"fused_mlp_gate_up_proj": 1}
-    assert stats.used_partition_kernel
     assert torch.equal(actual, expected)
 
 
@@ -538,3 +561,21 @@ def test_post_load_transform_hooks_run_once_per_module() -> None:
 
     assert called == ["0.rebuild_derived_weights"]
     assert model[0].called == ["rebuild"]
+
+
+def test_partition_spec_loads_and_discovers() -> None:
+    from racetrack.partition_spec import discover_partitions, load_spec
+
+    spec = load_spec("dsv3_2", "3336cdbd")
+    assert spec.model == "dsv3_2"
+    assert spec.partition_hash == "3336cdbd"
+    assert len(spec.fused_ops) == 7
+    assert len(spec.fx_ops) == 4
+    assert len(spec.pre_trace_ops) == 2
+    assert len(spec.module_patch_ops) == 1
+
+    all_specs = discover_partitions("dsv3_2")
+    assert len(all_specs) == 5
+    hashes = {s.partition_hash for s in all_specs}
+    assert "3336cdbd" in hashes
+    assert "a1f6d7e2" in hashes

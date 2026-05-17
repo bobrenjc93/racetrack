@@ -17,45 +17,45 @@ if BACKEND_AVAILABLE:
     @triton.jit
     def _swiglu_quant_kernel(
         gate_ptr, up_ptr, out_fp8_ptr, out_scale_ptr,
-        n_elements,
+        n_elements, n_quant_blocks,
         quant_block: tl.constexpr,
     ):
         row = tl.program_id(0)
+        qb = tl.program_id(1)
         base = row * n_elements
-        for qb in range(0, tl.cdiv(n_elements, quant_block)):
-            offsets = qb * quant_block + tl.arange(0, quant_block)
-            mask = offsets < n_elements
-            g = tl.load(gate_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
-            u = tl.load(up_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
-            x = (g * tl.sigmoid(g)) * u
-            amax = tl.max(tl.abs(x), axis=0)
-            amax = tl.where(amax > 1e-4, amax, 1e-4)
-            scale = amax / 448.0
-            scaled = x / scale
-            clamped = tl.minimum(tl.maximum(scaled, -448.0), 448.0)
-            tl.store(out_fp8_ptr + base + offsets, clamped.to(tl.float8e4nv), mask=mask)
-            tl.store(out_scale_ptr + row * tl.cdiv(n_elements, quant_block) + qb, scale)
+        offsets = qb * quant_block + tl.arange(0, quant_block)
+        mask = offsets < n_elements
+        g = tl.load(gate_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(up_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        x = (g * tl.sigmoid(g)) * u
+        amax = tl.max(tl.abs(x), axis=0)
+        amax = tl.where(amax > 1e-4, amax, 1e-4)
+        scale = amax / 448.0
+        scaled = x / scale
+        clamped = tl.minimum(tl.maximum(scaled, -448.0), 448.0)
+        tl.store(out_fp8_ptr + base + offsets, clamped.to(tl.float8e4nv), mask=mask)
+        tl.store(out_scale_ptr + row * n_quant_blocks + qb, scale)
 
 
     @triton.jit
     def _act_quant_kernel(
         x_ptr, out_fp8_ptr, out_scale_ptr,
-        n_elements,
+        n_elements, n_quant_blocks,
         quant_block: tl.constexpr,
     ):
         row = tl.program_id(0)
+        qb = tl.program_id(1)
         base = row * n_elements
-        for qb in range(0, tl.cdiv(n_elements, quant_block)):
-            offsets = qb * quant_block + tl.arange(0, quant_block)
-            mask = offsets < n_elements
-            x = tl.load(x_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
-            amax = tl.max(tl.abs(x), axis=0)
-            amax = tl.where(amax > 1e-4, amax, 1e-4)
-            scale = amax / 448.0
-            scaled = x / scale
-            clamped = tl.minimum(tl.maximum(scaled, -448.0), 448.0)
-            tl.store(out_fp8_ptr + base + offsets, clamped.to(tl.float8e4nv), mask=mask)
-            tl.store(out_scale_ptr + row * tl.cdiv(n_elements, quant_block) + qb, scale)
+        offsets = qb * quant_block + tl.arange(0, quant_block)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        amax = tl.max(tl.abs(x), axis=0)
+        amax = tl.where(amax > 1e-4, amax, 1e-4)
+        scale = amax / 448.0
+        scaled = x / scale
+        clamped = tl.minimum(tl.maximum(scaled, -448.0), 448.0)
+        tl.store(out_fp8_ptr + base + offsets, clamped.to(tl.float8e4nv), mask=mask)
+        tl.store(out_scale_ptr + row * n_quant_blocks + qb, scale)
 
 
 def fused_act_quant(x, *, fallback):
@@ -64,10 +64,10 @@ def fused_act_quant(x, *, fallback):
     shape = x_c.shape
     N = shape[-1]
     n_rows = x_c.numel() // N
-    n_groups = N // QUANT_BLOCK
+    n_groups = (N + QUANT_BLOCK - 1) // QUANT_BLOCK
     out_fp8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=x.device)
     out_scale = torch.empty(*shape[:-1], n_groups, dtype=torch.float32, device=x.device)
-    _act_quant_kernel[(n_rows,)](x_c, out_fp8, out_scale, N, QUANT_BLOCK)
+    _act_quant_kernel[(n_rows, n_groups)](x_c, out_fp8, out_scale, N, n_groups, QUANT_BLOCK)
     return out_fp8, out_scale
 
 
@@ -78,8 +78,8 @@ def fused_swiglu_quant(gate, up, *, fallback):
     shape = gate_c.shape
     N = shape[-1]
     n_rows = gate_c.numel() // N
-    n_groups = N // QUANT_BLOCK
+    n_groups = (N + QUANT_BLOCK - 1) // QUANT_BLOCK
     out_fp8 = torch.empty(shape, dtype=torch.float8_e4m3fn, device=gate.device)
     out_scale = torch.empty(*shape[:-1], n_groups, dtype=torch.float32, device=gate.device)
-    _swiglu_quant_kernel[(n_rows,)](gate_c, up_c, out_fp8, out_scale, N, QUANT_BLOCK)
+    _swiglu_quant_kernel[(n_rows, n_groups)](gate_c, up_c, out_fp8, out_scale, N, n_groups, QUANT_BLOCK)
     return out_fp8, out_scale
