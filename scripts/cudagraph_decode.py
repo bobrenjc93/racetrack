@@ -24,8 +24,8 @@ def load_kernels():
     KERNELS['act_quant'] = _load_kernel('act_quant')
     KERNELS['rope'] = _load_kernel('rope')
     KERNELS['fused_rope'] = _load_kernel('fused_rope')  # has standalone _rms_norm_kernel
-    # GEMV kernel is slower in CUDA graph — don't use
-    # KERNELS['fp8_gemv_fused'] = _load_kernel('fp8_gemv_fused')
+    # tc/gemv kernels slower than original fp8_gemm in CUDA graph
+    # KERNELS['fp8_gemm_tc'] = _load_kernel('fp8_gemm_tc')
 
 
 def main():
@@ -188,10 +188,10 @@ def patch_for_cudagraph(model):
 def _patch_linear_global(module):
     """Patch ALL FP8 Linear modules for fused GEMV (M=1) or act_quant+fp8_gemm."""
     aq = KERNELS['act_quant']
-    gemv = KERNELS.get('fp8_gemv_fused')
+    tc = KERNELS.get('fp8_gemm_tc')
     def forward(x):
-        if gemv is not None and x.view(-1, x.shape[-1]).shape[0] == 1:
-            y = gemv.fp8_gemv_fused(x, module.weight, module.weight.scale)
+        if tc is not None:
+            y = tc.fp8_gemm_tc(x, module.weight, module.weight.scale)
         else:
             from inference.kernel import fp8_gemm
             xq, xs = aq.fused_act_quant(x.contiguous(), fallback=None)
@@ -328,13 +328,13 @@ def _patch_moe(module):
             sel_s3 = torch.index_select(w3_s, 0, local_ids)
             sel_s2 = torch.index_select(w2_s, 0, local_ids)
 
-            gemv = KERNELS.get('fp8_gemv_fused')
+            tc = KERNELS.get('fp8_gemm_tc')
             for t in range(topk):
-                if gemv is not None:
-                    gate_out = gemv.fp8_gemv_fused(x_flat, sel_w1[t], sel_s1[t])
-                    up_out = gemv.fp8_gemv_fused(x_flat, sel_w3[t], sel_s3[t])
+                if tc is not None:
+                    gate_out = tc.fp8_gemm_tc(x_flat, sel_w1[t], sel_s1[t])
+                    up_out = tc.fp8_gemm_tc(x_flat, sel_w3[t], sel_s3[t])
                     hidden = swiglu_kernel.fused_swiglu(gate_out, up_out, fallback=None)
-                    out = gemv.fp8_gemv_fused(hidden, sel_w2[t], sel_s2[t])
+                    out = tc.fp8_gemm_tc(hidden, sel_w2[t], sel_s2[t])
                 else:
                     x_q, x_s = aq_kernel.fused_act_quant(x_flat, fallback=None)
                     gate_out = fp8_gemm(x_q, x_s, sel_w1[t], sel_s1[t])
@@ -384,9 +384,9 @@ def _patch_gate(module):
 def _fused_linear(x, linear_mod, aq_kernel):
     """Replace Linear.forward: fused GEMV for M=1, fallback to act_quant+fp8_gemm."""
     if linear_mod.weight.dtype == torch.float8_e4m3fn:
-        gemv = KERNELS.get('fp8_gemv_fused')
-        if gemv is not None and x.view(-1, x.shape[-1]).shape[0] == 1:
-            y = gemv.fp8_gemv_fused(x, linear_mod.weight, linear_mod.weight.scale)
+        tc = KERNELS.get('fp8_gemm_tc')
+        if tc is not None:
+            y = tc.fp8_gemm_tc(x, linear_mod.weight, linear_mod.weight.scale)
         else:
             from inference.kernel import fp8_gemm
             x_q, x_s = aq_kernel.fused_act_quant(x.contiguous(), fallback=None)
