@@ -25,6 +25,7 @@ def load_kernels():
     KERNELS['rope'] = _load_kernel('rope')
     KERNELS['fused_rope'] = _load_kernel('fused_rope')  # has standalone _rms_norm_kernel
     KERNELS['norm_act_quant'] = _load_kernel('norm_act_quant')
+    KERNELS['rope_inline'] = _load_kernel('rope_inline')
 
 
 def main():
@@ -203,19 +204,16 @@ def _patch_indexer_shortcircuit(module):
 
 
 def _patch_linear_global(module):
-    """Patch ALL FP8 Linear modules for fused GEMV (M=1) or act_quant+fp8_gemm."""
+    """Patch ALL FP8 Linear modules: fused_act_quant + fp8_gemm, no redundant casts."""
     aq = KERNELS['act_quant']
-    tc = KERNELS.get('fp8_gemm_tc')
     def forward(x):
-        if tc is not None:
-            y = tc.fp8_gemm_tc(x, module.weight, module.weight.scale)
-        else:
-            from inference.kernel import fp8_gemm
-            xq, xs = aq.fused_act_quant(x.contiguous(), fallback=None)
-            y = fp8_gemm(xq, xs, module.weight, module.weight.scale)
+        from inference.kernel import fp8_gemm
+        xq, xs = aq.fused_act_quant(x, fallback=None)
+        y = fp8_gemm(xq, xs, module.weight, module.weight.scale)
         if getattr(module, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
             y = y.float(); dist.all_reduce(y)
-        return y.to(x.dtype)
+            return y.to(x.dtype)
+        return y
     module.forward = forward
 
 
@@ -229,12 +227,12 @@ def _fused_standalone_norm(x, weight, eps):
 
     shape = x.shape
     cols = shape[-1]
-    x_flat = x.contiguous().view(-1, cols)
+    x_flat = x.view(-1, cols) if x.is_contiguous() else x.contiguous().view(-1, cols)
     out = torch.empty_like(x_flat)
     import triton
     block_size = triton.next_power_of_2(cols)
     rope_mod._rms_norm_kernel[(x_flat.shape[0],)](
-        x_flat, weight.contiguous(), out, eps, cols,
+        x_flat, weight, out, eps, cols,
         x_flat.stride(0), block_size,
         num_warps=8 if block_size >= 2048 else 4,
     )
@@ -252,9 +250,8 @@ def _patch_rmsnorm(module):
         # Call fused kernel directly — no dispatcher
         shape = x.shape
         cols = shape[-1]
-        x_flat = x.contiguous().view(-1, cols)
-        r_flat = residual.contiguous().view(-1, cols)
-        # dsv3_2 kernel expects (residual, update) order
+        x_flat = x.view(-1, cols) if x.is_contiguous() else x.contiguous().view(-1, cols)
+        r_flat = residual.view(-1, cols) if residual.is_contiguous() else residual.contiguous().view(-1, cols)
         hidden, normed = kernel.fused_residual_norm(
             r_flat, x_flat, module.weight, eps=module.eps, fallback=None,
         )
@@ -277,12 +274,12 @@ def _patch_mlp(module):
             h_fp8, h_s = aq.fused_swiglu_quant(gate, up, fallback=None)
             y = fp8_gemm(h_fp8, h_s, module.w2.weight, module.w2.weight.scale)
             if getattr(module.w2, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
-                y = y.float()
-                dist.all_reduce(y)
-            return y.to(x.dtype)
+                y = y.float(); dist.all_reduce(y)
+                return y.to(x.dtype)
+            return y  # bf16 already
         swiglu_kernel = KERNELS['swiglu']
         hidden = swiglu_kernel.fused_swiglu(gate, up, fallback=None)
-        return _fused_linear(hidden.type_as(x), module.w2, aq)
+        return _fused_linear(hidden, module.w2, aq)  # no .type_as() needed
 
     module.forward = forward
 
@@ -367,10 +364,10 @@ def _patch_moe(module):
             out = torch.bmm(hidden, sel_w2.transpose(1, 2))
             y += (out.squeeze(1).float() * expert_weights.unsqueeze(-1)).sum(0, keepdim=True)
 
-        y += module.shared_experts(x_flat)
+        y += module.shared_experts(x_flat).float()
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(y)
-        return y.type_as(x).view(shape)
+        return y.to(torch.bfloat16).view(shape)
 
     module.forward = forward
 
@@ -399,19 +396,16 @@ def _patch_gate(module):
 
 
 def _fused_linear(x, linear_mod, aq_kernel):
-    """Replace Linear.forward: fused GEMV for M=1, fallback to act_quant+fp8_gemm."""
+    """Replace Linear.forward: fused_act_quant + fp8_gemm, minimal casts."""
     if linear_mod.weight.dtype == torch.float8_e4m3fn:
-        tc = KERNELS.get('fp8_gemm_tc')
-        if tc is not None:
-            y = tc.fp8_gemm_tc(x, linear_mod.weight, linear_mod.weight.scale)
-        else:
-            from inference.kernel import fp8_gemm
-            x_q, x_s = aq_kernel.fused_act_quant(x.contiguous(), fallback=None)
-            y = fp8_gemm(x_q, x_s, linear_mod.weight, linear_mod.weight.scale)
+        from inference.kernel import fp8_gemm
+        x_q, x_s = aq_kernel.fused_act_quant(x, fallback=None)
+        y = fp8_gemm(x_q, x_s, linear_mod.weight, linear_mod.weight.scale)
         if getattr(linear_mod, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
             y = y.float()
             dist.all_reduce(y)
-        return y.to(x.dtype)
+            return y.to(x.dtype)
+        return y  # fp8_gemm outputs bf16, same as x — no cast needed
     return linear_mod(x)
 
 
@@ -421,7 +415,12 @@ def _patch_mla(module):
 
     def forward(x, start_pos, freqs_cis, mask):
         if mask is not None: return original(x, start_pos, freqs_cis, mask)
-        from inference.model import apply_rotary_emb as apply_rope, weight_dequant
+        from inference.model import apply_rotary_emb as _orig_rope, weight_dequant
+        ri = KERNELS.get('rope_inline')
+        def apply_rope(t, fc, interleaved=True):
+            if ri and interleaved:
+                return ri.rope_inline(t, fc)
+            return _orig_rope(t, fc, interleaved)
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
 

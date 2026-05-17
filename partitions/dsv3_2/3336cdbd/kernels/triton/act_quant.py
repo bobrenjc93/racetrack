@@ -60,7 +60,7 @@ if BACKEND_AVAILABLE:
 
 def fused_act_quant(x, *, fallback):
     del fallback
-    x_c = x.contiguous()
+    x_c = x if x.is_contiguous() else x.contiguous()
     shape = x_c.shape
     N = shape[-1]
     n_rows = x_c.numel() // N
