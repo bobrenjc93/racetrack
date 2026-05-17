@@ -23,6 +23,7 @@ def load_kernels():
     KERNELS['swiglu'] = _load_kernel('swiglu')
     KERNELS['act_quant'] = _load_kernel('act_quant')
     KERNELS['rope'] = _load_kernel('rope')
+    KERNELS['fused_rope'] = _load_kernel('fused_rope')  # has standalone _rms_norm_kernel
 
 
 def main():
@@ -86,7 +87,7 @@ def main():
         static_tok = torch.tensor([[0]], device="cuda", dtype=torch.long)
         vocab_shard = model.head.weight.shape[0]
         static_logits = torch.empty(1, vocab_shard * world_size, device="cuda", dtype=torch.float32)
-        capture_pos = start + N
+        capture_pos = start + N // 2
 
         def decode_step():
             fc = model.freqs_cis[capture_pos:capture_pos+1]
@@ -125,8 +126,39 @@ def main():
 
         if rank == 0:
             print(f"CUDA graph + fused kernels: {graph_ms:.2f} ms/token", flush=True)
-            print(f"Speedup vs fused eager: {eager_ms/graph_ms:.3f}x", flush=True)
-            print(f"Reference: eager ~277ms, compile ~143ms", flush=True)
+
+        # Now compare against Inductor in the SAME run
+        # Need a fresh model (original, unpatched)
+        del graph, static_tok, static_logits
+        torch.cuda.empty_cache()
+
+        if rank == 0: print("Loading fresh model for Inductor comparison...", flush=True)
+        with torch.device("cuda"):
+            model2 = Transformer(args)
+        load_hf_sharded_weights(model2, repo_id="deepseek-ai/DeepSeek-V3.2",
+                                hf_token=hf_token, rank=rank, world_size=world_size)
+        run_post_load_transforms(model2)
+        model2.eval()
+
+        tok = torch.arange(16, device="cuda", dtype=torch.long).unsqueeze(0)
+        model2.forward(tok, 0)
+        for i in range(10):
+            model2.forward(torch.tensor([[100+i]], device="cuda", dtype=torch.long), 16+i)
+
+        compiled = torch.compile(model2)
+        for i in range(15):
+            compiled.forward(torch.tensor([[200+i]], device="cuda", dtype=torch.long), start+i)
+        torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        for i in range(N):
+            compiled.forward(torch.tensor([[400+i]], device="cuda", dtype=torch.long), start+i)
+        torch.cuda.synchronize()
+        inductor_ms = (time.perf_counter() - t0) * 1000 / N
+
+        if rank == 0:
+            print(f"Inductor: {inductor_ms:.2f} ms/token", flush=True)
+            print(f"Gap: {graph_ms - inductor_ms:.1f}ms ({(graph_ms/inductor_ms - 1)*100:.1f}%)", flush=True)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier(); dist.destroy_process_group()
@@ -148,12 +180,25 @@ def patch_for_cudagraph(model):
 
 
 def _fused_standalone_norm(x, weight, eps):
-    """Fused standalone RMSNorm — direct computation, no zero-residual trick."""
-    dtype = x.dtype
+    """Fused standalone RMSNorm — 1 Triton kernel instead of 5 eager ops."""
+    rope_mod = KERNELS.get('fused_rope')
+    if rope_mod is None:
+        dtype = x.dtype
+        xf = x.float()
+        return (weight * xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(dtype)
+
     shape = x.shape
-    x_float = x.float()
-    var = x_float.pow(2).mean(-1, keepdim=True)
-    return (weight * x_float * torch.rsqrt(var + eps)).to(dtype)
+    cols = shape[-1]
+    x_flat = x.contiguous().view(-1, cols)
+    out = torch.empty_like(x_flat)
+    import triton
+    block_size = triton.next_power_of_2(cols)
+    rope_mod._rms_norm_kernel[(x_flat.shape[0],)](
+        x_flat, weight.contiguous(), out, eps, cols,
+        x_flat.stride(0), block_size,
+        num_warps=8 if block_size >= 2048 else 4,
+    )
+    return out.view(shape)
 
 
 def _patch_rmsnorm(module):
@@ -179,13 +224,23 @@ def _patch_rmsnorm(module):
 
 
 def _patch_mlp(module):
-    """Use fused kernels for all Linear calls + swiglu."""
-    swiglu_kernel = KERNELS['swiglu']
+    """Use fused kernels for all Linear calls + swiglu+quant."""
     aq = KERNELS['act_quant']
+    w2_is_fp8 = module.w2.weight.dtype == torch.float8_e4m3fn
 
     def forward(x):
+        from inference.kernel import fp8_gemm
         gate = _fused_linear(x, module.w1, aq)
         up = _fused_linear(x, module.w3, aq)
+        if w2_is_fp8:
+            # swiglu + act_quant in one kernel → skip separate type_cast + act_quant
+            h_fp8, h_s = aq.fused_swiglu_quant(gate, up, fallback=None)
+            y = fp8_gemm(h_fp8, h_s, module.w2.weight, module.w2.weight.scale)
+            if getattr(module.w2, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
+                y = y.float()
+                dist.all_reduce(y)
+            return y.to(x.dtype)
+        swiglu_kernel = KERNELS['swiglu']
         hidden = swiglu_kernel.fused_swiglu(gate, up, fallback=None)
         return _fused_linear(hidden.type_as(x), module.w2, aq)
 
@@ -254,8 +309,7 @@ def _patch_moe(module):
             for t in range(topk):
                 gate_out = fp8_gemm(x_q, x_s, sel_w1[t], sel_s1[t])
                 up_out = fp8_gemm(x_q, x_s, sel_w3[t], sel_s3[t])
-                hidden = swiglu_kernel.fused_swiglu(gate_out, up_out, fallback=None)
-                h_q, h_s = aq_kernel.fused_act_quant(hidden.type_as(x_flat), fallback=None)
+                h_q, h_s = aq_kernel.fused_swiglu_quant(gate_out, up_out, fallback=None)
                 out = fp8_gemm(h_q, h_s, sel_w2[t], sel_s2[t])
                 y += out.float() * expert_weights[t]
         else:
@@ -322,7 +376,7 @@ def _patch_mla(module):
 
         # Fused act_quant for wq_a — shared with wkv_a (same input x)
         qr_raw = _fused_linear(x, module.wq_a, aq)
-        qr = module.q_norm(qr_raw)
+        qr = _fused_standalone_norm(qr_raw, module.q_norm.weight, module.q_norm.eps)
         q = _fused_linear(qr, module.wq_b, aq)
         q = q.view(bsz, seqlen, module.n_local_heads, module.qk_head_dim)
         q_nope, q_pe = torch.split(q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
@@ -330,7 +384,7 @@ def _patch_mla(module):
 
         kv = _fused_linear(x, module.wkv_a, aq)
         kv, k_pe = torch.split(kv, [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1)
-        kv = module.kv_norm(kv)
+        kv = _fused_standalone_norm(kv, module.kv_norm.weight, module.kv_norm.eps)
         k_pe = apply_rope(k_pe.unsqueeze(2), freqs_cis)
         module.kv_cache[:bsz, start_pos:end_pos] = kv
         module.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
