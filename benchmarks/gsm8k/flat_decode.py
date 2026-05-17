@@ -13,11 +13,13 @@ import torch
 import torch.distributed as dist
 
 
-def _load_kernel(kernel_root: Path, name: str):
-    for backend in ("triton",):
-        path = kernel_root / backend / f"{name}.py"
+def _load_kernel(kernel_root: Path, name: str, backend: str | None = None):
+    backends = [backend] if backend else ("triton", "cutedsl", "helion")
+    for b in backends:
+        path = kernel_root / b / f"{name}.py"
         if path.exists():
-            spec = importlib.util.spec_from_file_location(name, str(path))
+            spec_name = f"{name}_{b}_{abs(hash(str(path)))}"
+            spec = importlib.util.spec_from_file_location(spec_name, str(path))
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             if getattr(mod, "BACKEND_AVAILABLE", False):
@@ -25,19 +27,20 @@ def _load_kernel(kernel_root: Path, name: str):
     return None
 
 
-def build_flat_decode(model, kernel_root: Path | None = None):
+def build_flat_decode(model, kernel_root: Path | None = None, backend: str | None = None):
     """Build a flat decode function from the model + optional partition kernels.
 
     When kernel_root is None, uses inference.kernel defaults (baseline mode).
+    When backend is specified, only loads kernels from that backend directory.
     Returns (flat_decode, flat_decode_cg, update_bufs, static_logits).
     """
     from inference.model import apply_rotary_emb, weight_dequant
     from inference.kernel import fp8_gemm
     from inference import kernel as inf_kernel
 
-    aq = _load_kernel(kernel_root, "act_quant") if kernel_root else None
-    rn = _load_kernel(kernel_root, "residual_norm") if kernel_root else None
-    fr = _load_kernel(kernel_root, "fused_rope") if kernel_root else None
+    aq = _load_kernel(kernel_root, "act_quant", backend) if kernel_root else None
+    rn = _load_kernel(kernel_root, "residual_norm", backend) if kernel_root else None
+    fr = _load_kernel(kernel_root, "fused_rope", backend) if kernel_root else None
 
     ws = dist.get_world_size() if dist.is_initialized() else 1
 
@@ -98,17 +101,20 @@ def build_flat_decode(model, kernel_root: Path | None = None):
         return normed, hidden
 
     def _standalone_norm(x, weight, eps):
-        if fr is not None:
-            shape = x.shape
-            cols = shape[-1]
-            x_f = x.view(-1, cols) if x.is_contiguous() else x.contiguous().view(-1, cols)
-            out = torch.empty_like(x_f)
-            import triton
-            bs = triton.next_power_of_2(cols)
-            fr._rms_norm_kernel[(x_f.shape[0],)](
-                x_f, weight, out, eps, cols,
-                x_f.stride(0), bs, num_warps=8 if bs >= 2048 else 4)
-            return out.view(shape)
+        if fr is not None and hasattr(fr, '_rms_norm_kernel'):
+            try:
+                shape = x.shape
+                cols = shape[-1]
+                x_f = x.view(-1, cols) if x.is_contiguous() else x.contiguous().view(-1, cols)
+                out = torch.empty_like(x_f)
+                import triton
+                bs = triton.next_power_of_2(cols)
+                fr._rms_norm_kernel[(x_f.shape[0],)](
+                    x_f, weight, out, eps, cols,
+                    x_f.stride(0), bs, num_warps=8 if bs >= 2048 else 4)
+                return out.view(shape)
+            except TypeError:
+                pass
         return _rms_norm_eager(x, weight, eps)
 
     def _linear_fp8(x, w, s):
