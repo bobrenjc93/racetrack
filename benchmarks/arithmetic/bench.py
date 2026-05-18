@@ -167,7 +167,7 @@ def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
     if partition_filter == "tracked":
         repo_root = Path(__file__).resolve().parents[2]
         completed = subprocess.run(
-            ["git", "ls-files", f"partitions/{model_name}/*/model.py"],
+            ["git", "ls-files", f"partitions/{model_name}/*/spec.py"],
             cwd=repo_root,
             check=True,
             capture_output=True,
@@ -178,12 +178,16 @@ def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
             for line in completed.stdout.splitlines()
             if line.strip()
         )
+        partitions = [p for p in partitions if (root / p / "model.py").exists()]
         return ["baseline", *partitions]
     partitions = sorted(
         p.name
         for p in root.iterdir()
-        if p.is_dir() and (p / "model.py").exists() and not p.name.startswith("__")
+        if p.is_dir()
+        and ((p / "model.py").exists() or (p / "spec.py").exists())
+        and not p.name.startswith("__")
     )
+    partitions = [p for p in partitions if (root / p / "model.py").exists()]
     if partition_filter == "all":
         return ["baseline", *partitions]
     if partition_filter not in partitions:
@@ -376,6 +380,7 @@ def run(
     repeat: int = 30,
     partition_filter: str = "tracked",
     kernel_filter: str = "torch",
+    model_filter: str | None = None,
 ) -> list[Result]:
     if repeat < 1:
         raise ValueError("repeat must be at least 1")
@@ -392,8 +397,9 @@ def run(
     dtype = _resolve_dtype(dtype_str, device)
     vocab_size = int(MODEL_OVERRIDES.get("vocab_size", 8192))
 
+    models = [model_filter] if model_filter else MODELS
     results: list[Result] = []
-    for model_name in MODELS:
+    for model_name in models:
         partitions = _discover_partitions(model_name, partition_filter)
         for case in CASES:
             input_ids = _encode_case(case, device=device, vocab_size=vocab_size)

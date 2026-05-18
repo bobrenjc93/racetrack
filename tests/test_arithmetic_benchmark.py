@@ -17,6 +17,7 @@ def test_arithmetic_cpu_baseline_torch() -> None:
         repeat=1,
         partition_filter="baseline",
         kernel_filter="torch",
+        model_filter="dsv3_2",
     )
     assert len(results) == len(CASES)
     assert {result.backend for result in results} == {"torch"}
