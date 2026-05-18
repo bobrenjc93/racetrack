@@ -17,46 +17,44 @@ if BACKEND_AVAILABLE:
 
     @triton.jit
     def _residual_norm_kernel(
-        x, residual, weight, out_normed, out_hidden,
+        residual, update, weight, out_hidden, out_normed,
         eps: tl.constexpr, cols: tl.constexpr,
+        stride_r: tl.constexpr, stride_u: tl.constexpr,
         block_size: tl.constexpr,
     ):
-        row = tl.program_id(0)
+        token = tl.program_id(0)
         offsets = tl.arange(0, block_size)
         mask = offsets < cols
-        x_values = tl.load(x + row * cols + offsets, mask=mask, other=0.0).to(tl.float32)
-        r_values = tl.load(residual + row * cols + offsets, mask=mask, other=0.0).to(tl.float32)
-        weights = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
-        hidden = x_values + r_values
-        tl.store(out_hidden + row * cols + offsets, hidden, mask=mask)
+        r = tl.load(residual + token * stride_r + offsets, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(update + token * stride_u + offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
+        hidden = r + u
+        tl.store(out_hidden + token * cols + offsets, hidden, mask=mask)
         variance = tl.sum(hidden * hidden, axis=0) / cols
         scale = tl.rsqrt(variance + eps)
-        tl.store(out_normed + row * cols + offsets, hidden * scale * weights, mask=mask)
+        tl.store(out_normed + token * cols + offsets, hidden * scale * w, mask=mask)
 
 
 def fused_residual_norm(
-    x: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    update: torch.Tensor,
+    norm_weight: torch.Tensor,
     *,
     eps: float,
     fallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del fallback
-    x_c = x.contiguous()
-    residual_c = residual.contiguous()
-    shape = x_c.shape
-    cols = shape[-1]
-    rows = x_c.numel() // cols
-    x_flat = x_c.view(rows, cols)
-    residual_flat = residual_c.view(rows, cols)
-    out_normed = torch.empty_like(x_flat)
-    out_hidden = torch.empty_like(x_flat)
+    if residual.device.type != "cuda":
+        raise RuntimeError("Triton fused_residual_norm requires CUDA tensors")
+    tokens = residual.shape[0]
+    cols = residual.shape[-1]
     block_size = triton.next_power_of_2(cols)
-    _residual_norm_kernel[(rows,)](
-        x_flat, residual_flat, weight.contiguous(),
-        out_normed, out_hidden,
-        eps, cols, block_size,
+    out_hidden = torch.empty((tokens, cols), device=residual.device, dtype=residual.dtype)
+    out_normed = torch.empty((tokens, cols), device=residual.device, dtype=residual.dtype)
+    _residual_norm_kernel[(tokens,)](
+        residual.contiguous(), update.contiguous(), norm_weight.contiguous(),
+        out_hidden, out_normed,
+        eps, cols, residual.stride(0), update.stride(0), block_size,
         num_warps=8 if block_size >= 2048 else 4,
     )
-    return out_normed.view(shape), out_hidden.view(shape)
+    return out_hidden, out_normed
