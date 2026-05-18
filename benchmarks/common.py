@@ -128,7 +128,8 @@ def hardware_info(device_str: str = "cuda:0") -> dict[str, Any]:
         props = torch.cuda.get_device_properties(dev)
         info["gpu"] = props.name
         info["gpu_count"] = torch.cuda.device_count()
-        info["gpu_memory_gb"] = round(props.total_mem / 1e9, 1)
+        total_mem = getattr(props, "total_memory", None) or getattr(props, "total_mem", 0)
+        info["gpu_memory_gb"] = round(total_mem / 1e9, 1)
         cuda_version = torch.version.cuda
         if cuda_version:
             info["cuda"] = cuda_version
