@@ -26,7 +26,6 @@ from pathlib import Path
 
 import torch
 
-from benchmarks.gsm8k.bench import _hardware_info, _hardware_slug
 from benchmarks.gsm8k.eval import (
     DSV3_2_CONFIG,
     EVAL_MODEL,
@@ -37,8 +36,14 @@ from benchmarks.gsm8k.eval import (
     _generate_greedy,
 )
 from benchmarks.gsm8k.hf_auth import require_hf_token
-from benchmarks.gsm8k.real_kernels import (
+from benchmarks.common import (
     TORCH_COMPILE_BACKEND,
+    CONCRETE_BACKENDS,
+    hardware_info as _hardware_info,
+    hardware_slug as _hardware_slug,
+    format_diff as _format_diff,
+)
+from benchmarks.gsm8k.real_kernels import (
     RealKernelRow,
     discover_real_kernel_rows,
     patch_real_model,
@@ -59,7 +64,7 @@ def _can_use_fused_patches(row) -> bool:
 
 
 def _cleanup_compile_state() -> None:
-    from racetrack.compile_backend import cleanup_compile_state
+    from benchmarks.common import cleanup_compile_state
     cleanup_compile_state()
 
 

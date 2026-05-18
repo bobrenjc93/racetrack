@@ -28,11 +28,24 @@ from pathlib import Path
 
 import torch
 
+from benchmarks.common import (
+    TORCH_COMPILE_BACKEND,
+    TORCH_COMPILE_ALIASES,
+    CONCRETE_BACKENDS,
+    MODELS,
+    normalize_backend_name,
+    env_backend as _env_backend,
+    compile_model_if_requested as _compile_model_if_requested,
+    cleanup_compile_state,
+    sync as _sync,
+    resolve_dtype as _resolve_dtype,
+    time_forward as _time_forward,
+    hardware_info as _hardware_info,
+    hardware_slug as _hardware_slug,
+    discover_kernel_map as _discover_kernel_map,
+)
+
 BENCHMARK_DIR = Path(__file__).parent
-MODELS = ("dsv3_2", "dsv3_2_nvfp4")
-TORCH_COMPILE_BACKEND = "torch.compile"
-TORCH_COMPILE_ALIASES = {TORCH_COMPILE_BACKEND, "torch_compile"}
-CONCRETE_BACKENDS = ("triton", "cutedsl", "helion")
 KERNEL_FILTERS = (
     "available",
     "all",
@@ -150,34 +163,11 @@ def _build_model_with_partition(module, partition_root: Path | None = None):
     return model
 
 
-def _normalize_backend_name(backend: str) -> str:
-    backend = backend.strip().lower()
-    if backend in TORCH_COMPILE_ALIASES:
-        return TORCH_COMPILE_BACKEND
-    if backend == "cutedl":
-        return "cutedsl"
-    return backend
-
-
-def _env_backend(backend: str) -> str:
-    return "torch" if backend == TORCH_COMPILE_BACKEND else backend
-
-
-def _compile_model_if_requested(model: torch.nn.Module, backend: str) -> torch.nn.Module:
-    if backend != TORCH_COMPILE_BACKEND:
-        return model
-    if not hasattr(torch, "compile"):
-        raise RuntimeError("torch.compile is not available in this PyTorch build")
-    return torch.compile(model)
+_normalize_backend_name = normalize_backend_name
 
 
 def _cleanup_compile_state(device: torch.device) -> None:
-    dynamo = getattr(torch, "_dynamo", None)
-    reset = getattr(dynamo, "reset", None)
-    if callable(reset):
-        reset()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    cleanup_compile_state(device)
 
 
 def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:

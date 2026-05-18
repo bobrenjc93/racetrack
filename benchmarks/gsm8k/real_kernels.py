@@ -31,8 +31,13 @@ from racetrack.pre_trace import Originals, rollback_patches
 from racetrack.runtime.dispatch import KernelDispatcher
 
 
-TORCH_COMPILE_BACKEND = "torch.compile"
-BACKENDS = ("torch", TORCH_COMPILE_BACKEND, "triton", "cutedsl", "helion", "best")
+from benchmarks.common import (
+    TORCH_COMPILE_BACKEND,
+    CONCRETE_BACKENDS,
+    normalize_backend_name,
+)
+
+BACKENDS = ("torch", TORCH_COMPILE_BACKEND, *CONCRETE_BACKENDS, "best")
 REAL_DISABLED_BACKENDS = {
     "dsv3_2": frozenset({"helion"}),
 }
@@ -144,13 +149,7 @@ def discover_real_kernel_rows(
     return rows
 
 
-def _normalize_backend_name(backend: str) -> str:
-    backend = backend.strip().lower()
-    if backend == "cutedl":
-        return "cutedsl"
-    if backend == "torch_compile":
-        return "torch.compile"
-    return backend
+_normalize_backend_name = normalize_backend_name
 
 
 @contextlib.contextmanager
