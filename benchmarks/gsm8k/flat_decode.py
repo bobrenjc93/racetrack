@@ -14,8 +14,18 @@ import torch.distributed as dist
 
 
 def _load_kernel(kernel_root: Path, name: str, backend: str | None = None):
-    backends = [backend] if backend else ("triton", "cutedsl", "helion")
-    for b in backends:
+    """Load a kernel module by name, preferring the specified backend.
+
+    Falls back to other backends if the preferred one doesn't have the
+    kernel. This lets cutedsl/helion rows use triton's act_quant when
+    they don't have their own implementation.
+    """
+    all_backends = ("triton", "cutedsl", "helion")
+    if backend:
+        order = [backend] + [b for b in all_backends if b != backend]
+    else:
+        order = all_backends
+    for b in order:
         path = kernel_root / b / f"{name}.py"
         if path.exists():
             spec_name = f"{name}_{b}_{abs(hash(str(path)))}"
@@ -23,8 +33,21 @@ def _load_kernel(kernel_root: Path, name: str, backend: str | None = None):
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             if getattr(mod, "BACKEND_AVAILABLE", False):
-                return mod
+                fn = getattr(mod, f"fused_{name}", None) or getattr(mod, name, None)
+                if fn is not None and not _is_pure_fallback(fn):
+                    return mod
     return None
+
+
+def _is_pure_fallback(fn) -> bool:
+    """Check if a kernel function is just a pass-through to fallback."""
+    import inspect
+    try:
+        src = inspect.getsource(fn)
+        lines = [l.strip() for l in src.split('\n') if l.strip() and not l.strip().startswith('#') and not l.strip().startswith('def ')]
+        return len(lines) <= 2 and any('fallback(' in l for l in lines)
+    except (OSError, TypeError):
+        return False
 
 
 def build_flat_decode(model, kernel_root: Path | None = None, backend: str | None = None):
