@@ -125,9 +125,29 @@ def _validate_cases(cases: tuple[ArithmeticCase, ...] = CASES) -> None:
 
 
 def _load_partition_module(model_name: str, partition: str):
+    return importlib.import_module(f"partitions.{model_name}.model")
+
+
+def _partition_root(model_name: str, partition: str) -> Path | None:
     if partition == "baseline":
-        return importlib.import_module(f"partitions.{model_name}.model")
-    return importlib.import_module(f"partitions.{model_name}.{partition}.model")
+        return None
+    root = Path(__file__).resolve().parents[2] / "partitions" / model_name / partition
+    if root.is_dir():
+        return root
+    return None
+
+
+def _build_model_with_partition(module, partition_root: Path | None = None):
+    model = module.build_model(**MODEL_OVERRIDES)
+    if partition_root is not None:
+        from racetrack.runtime.dispatch import KernelDispatcher
+        dispatcher = KernelDispatcher(partition_root / "kernels")
+        model.dispatcher = dispatcher
+        for layer in model.layers:
+            layer.dispatcher = dispatcher
+            if hasattr(layer, 'attn'):
+                layer.attn.dispatcher = dispatcher
+    return model
 
 
 def _normalize_backend_name(backend: str) -> str:
@@ -178,16 +198,15 @@ def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
             for line in completed.stdout.splitlines()
             if line.strip()
         )
-        partitions = [p for p in partitions if (root / p / "model.py").exists()]
         return ["baseline", *partitions]
     partitions = sorted(
         p.name
         for p in root.iterdir()
         if p.is_dir()
-        and ((p / "model.py").exists() or (p / "spec.py").exists())
+        and (p / "kernels").is_dir()
+        and ((p / "spec.py").exists() or (p / "model.py").exists())
         and not p.name.startswith("__")
     )
-    partitions = [p for p in partitions if (root / p / "model.py").exists()]
     if partition_filter == "all":
         return ["baseline", *partitions]
     if partition_filter not in partitions:
@@ -215,7 +234,8 @@ def _backend_list(
         if device.type != "cuda":
             return backends
         module = _load_partition_module(model_name, partition)
-        model = module.build_model(**MODEL_OVERRIDES).eval()
+        pr = _partition_root(model_name, partition)
+        model = _build_model_with_partition(module, pr).eval()
         status_map = getattr(model, "backend_status", {"torch": "native"})
         backends.extend(
             backend
@@ -322,7 +342,8 @@ def _benchmark_backend(
 ) -> Result:
     os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
     module = _load_partition_module(model_name, partition)
-    model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
+    pr = _partition_root(model_name, partition)
+    model = _build_model_with_partition(module, pr).to(device=device, dtype=dtype).eval()
     status_map = getattr(model, "backend_status", {"torch": "native"})
     backend_status = (
         "compiled" if backend == TORCH_COMPILE_BACKEND else status_map.get(backend, "native")
@@ -407,8 +428,8 @@ def run(
 
             for partition in partitions:
                 for backend in _backend_list(model_name, partition, kernel_filter, device):
-                    results.append(
-                        _benchmark_backend(
+                    try:
+                        result = _benchmark_backend(
                             model_name=model_name,
                             partition=partition,
                             backend=backend,
@@ -420,7 +441,9 @@ def run(
                             warmup=warmup,
                             repeat=repeat,
                         )
-                    )
+                        results.append(result)
+                    except Exception as exc:
+                        print(f"  Skipping {partition}/{backend}: {exc}")
             _sync(device)
     return results
 
@@ -443,7 +466,8 @@ def _discover_dispatched_ops(results: list[Result], partition: str) -> list[str]
         if result.partition != partition or result.backend in ("torch", TORCH_COMPILE_BACKEND):
             continue
         module = _load_partition_module(result.model, partition)
-        model = module.build_model(**MODEL_OVERRIDES)
+        pr = _partition_root(result.model, partition)
+        model = _build_model_with_partition(module, pr)
         dispatcher = getattr(model, "dispatcher", None)
         if dispatcher is None:
             return []
