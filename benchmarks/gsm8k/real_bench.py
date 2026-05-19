@@ -551,6 +551,8 @@ def run(
                 "exact completions matched)"
             )
         row_results.append(row_result)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Run CUDA-graph-accelerated flat decode as the final row (destructive).
     # This must run LAST because it stacks MoE weights and destroys experts.
@@ -574,6 +576,14 @@ def run(
             tok = torch.tensor([prompt_tokens], dtype=torch.long, device="cuda")
             model.forward(tok, 0)
             torch.cuda.synchronize()
+
+            # Free KV/PE caches to make room for MoE weight stacking
+            # (~3GB reclaimed). build_flat_decode re-allocates fresh caches.
+            for layer in model.layers:
+                mla = layer.attn
+                if hasattr(mla, 'kv_cache') and mla.kv_cache is not None:
+                    del mla.kv_cache, mla.pe_cache
+            torch.cuda.empty_cache()
 
             # Build flat decode (stacks MoE, destroys experts - one-time)
             if _is_rank0():

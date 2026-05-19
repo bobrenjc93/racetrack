@@ -309,6 +309,18 @@ def _flat_moe(x, ld, do_act_quant, do_swiglu_quant, fp8_gemm, ws, linear_fp8, li
     return y.to(torch.bfloat16).view(x.shape)
 
 
+def _get_or_alloc_cache(mla, name, dim):
+    cache = getattr(mla, name, None)
+    if cache is not None:
+        return cache
+    max_t = getattr(mla, 'max_seq_len', 4096)
+    if hasattr(mla, 'kv_cache') and mla.kv_cache is not None:
+        max_t = mla.kv_cache.shape[1]
+    cache = torch.zeros(1, max_t, dim, device="cuda", dtype=torch.bfloat16)
+    setattr(mla, name, cache)
+    return cache
+
+
 def _extract_layer(layer, aq, rn, ws):
     """Extract all parameters from a layer into a flat dict for fast access."""
     from inference.model import weight_dequant, MoE, MLP
@@ -337,8 +349,8 @@ def _extract_layer(layer, aq, rn, ws):
         'wo_fp8': mla.wo.weight.dtype == torch.float8_e4m3fn,
         'wo_reduce': getattr(mla.wo, 'reduce_output', False),
         'wo_fn': mla.wo.forward,
-        'kv_cache': mla.kv_cache,
-        'pe_cache': mla.pe_cache,
+        'kv_cache': _get_or_alloc_cache(mla, 'kv_cache', mla.kv_lora_rank),
+        'pe_cache': _get_or_alloc_cache(mla, 'pe_cache', mla.qk_rope_head_dim),
         'n_heads': mla.n_local_heads,
         'qk_head_dim': mla.qk_head_dim,
         'qk_nope_dim': mla.qk_nope_head_dim,
