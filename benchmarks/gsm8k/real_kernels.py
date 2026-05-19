@@ -209,6 +209,7 @@ def patch_real_model(
                             if dispatcher._resolve(b, op_name) is not None:
                                 selected[op_name] = (b,)
                                 break
+                        # Ops with no concrete kernel are omitted (use fallback)
             stats.selected_backends.update(selected)
         else:
             stats.selected_backends.update(

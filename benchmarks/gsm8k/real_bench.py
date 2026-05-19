@@ -74,12 +74,10 @@ def _resolve_selected_backends(row) -> dict[str, tuple[str, ...]]:
     dispatcher = KernelDispatcher(kr)
     result = {}
     for op in row.ops:
-        resolved = None
         for backend in CONCRETE_BACKENDS:
             if dispatcher._resolve(backend, op) is not None:
-                resolved = backend
+                result[op] = (backend,)
                 break
-        result[op] = (resolved or "torch",)
     return result
 
 

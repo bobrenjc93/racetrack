@@ -161,12 +161,6 @@ class KernelDispatcher:
             return selected
 
         timings: list[tuple[float, str]] = []
-        _fb = fallback
-        torch_elapsed = self._time_candidate(
-            "torch", lambda *a, fallback=None, **kw: _fb(*a, **kw),
-            fallback, *args, **kwargs,
-        )
-        timings.append((torch_elapsed, "torch"))
         for candidate in self.BACKENDS:
             fn = self._resolve(candidate, op_name)
             if fn is None:
@@ -178,7 +172,10 @@ class KernelDispatcher:
                     raise
                 continue
             timings.append((elapsed, candidate))
-        selected = min(timings)[1]
+        if not timings:
+            selected = "torch"
+        else:
+            selected = min(timings)[1]
         self._best[key] = selected
         self._best_ops.setdefault(op_name, set()).add(selected)
         return selected
