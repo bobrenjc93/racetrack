@@ -128,10 +128,14 @@ def _patch_full_topk_indexer(
     for module in model.modules():
         if not isinstance(module, rm.MLA):
             continue
+        if not hasattr(module, 'indexer') or not hasattr(module.indexer, 'index_topk'):
+            continue
         original_mla = module.forward
 
         def _make_mla_forward(orig, mla_mod):
             def forward(x, start_pos, freqs_cis, mask):
+                if x.dim() < 3:
+                    return orig(x, start_pos, freqs_cis, mask)
                 bsz, seqlen, _ = x.size()
                 end_pos = start_pos + seqlen
                 if end_pos > mla_mod.indexer.index_topk:
