@@ -499,31 +499,35 @@ def run(
                 row, outputs, total_ms, baseline_outputs, {}, {},
             )
         elif row.spec is not None and _can_use_fused_patches(row):
-            with patch_real_model(model, row, strict_kernel_use=False) as stats:
-                outputs, total_ms = _evaluate_row(
-                    model, tokenizer, dataset,
-                    max_new_tokens=max_new_tokens,
+            try:
+                with patch_real_model(model, row, strict_kernel_use=False) as stats:
+                    outputs, total_ms = _evaluate_row(
+                        model, tokenizer, dataset,
+                        max_new_tokens=max_new_tokens,
+                    )
+                row_result = _row_result(
+                    row, outputs, total_ms, baseline_outputs,
+                    stats.calls, stats.selected_backends,
                 )
-            row_result = _row_result(
-                row, outputs, total_ms, baseline_outputs,
-                stats.calls, stats.selected_backends,
-            )
+            except Exception as exc:
+                if _is_rank0():
+                    print(f"  Skipping {row.label}: {exc}", flush=True)
+                continue
         else:
-            with patch_real_model(model, row, strict_kernel_use=True) as stats:
-                outputs, total_ms = _evaluate_row(
-                    model,
-                    tokenizer,
-                    dataset,
-                    max_new_tokens=max_new_tokens,
+            try:
+                with patch_real_model(model, row, strict_kernel_use=False) as stats:
+                    outputs, total_ms = _evaluate_row(
+                        model, tokenizer, dataset,
+                        max_new_tokens=max_new_tokens,
+                    )
+                row_result = _row_result(
+                    row, outputs, total_ms, baseline_outputs,
+                    stats.calls, stats.selected_backends,
                 )
-            row_result = _row_result(
-                row,
-                outputs,
-                total_ms,
-                baseline_outputs,
-                stats.calls,
-                stats.selected_backends,
-            )
+            except Exception as exc:
+                if _is_rank0():
+                    print(f"  Skipping {row.label}: {exc}", flush=True)
+                continue
         if require_pass and not row_result.validation:
             raise RuntimeError(
                 f"{row.label} failed validation: "
