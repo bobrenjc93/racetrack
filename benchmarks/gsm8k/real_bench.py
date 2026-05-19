@@ -650,7 +650,6 @@ def run(
                 else:
                     new_results.append(r)
             row_results = new_results
-            ]
             if _is_rank0():
                 print(f"  {total_ms:.1f}ms total", flush=True)
         except Exception as exc:
