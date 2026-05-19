@@ -125,24 +125,8 @@ def _patch_full_topk_indexer(
                 return forward
             _set_attr(module, "forward", _make_forward_shortcircuit(original_forward, topk), originals)
 
-    for module in model.modules():
-        if not isinstance(module, rm.MLA):
-            continue
-        if not hasattr(module, 'indexer') or not hasattr(module.indexer, 'index_topk'):
-            continue
-        original_mla = module.forward
-
-        def _make_mla_forward(orig, mla_mod):
-            def forward(x, start_pos, freqs_cis, mask):
-                if x.dim() < 3:
-                    return orig(x, start_pos, freqs_cis, mask)
-                bsz, seqlen, _ = x.size()
-                end_pos = start_pos + seqlen
-                if end_pos > mla_mod.indexer.index_topk:
-                    return orig(x, start_pos, freqs_cis, mask)
-                return _mla_full_topk_forward(mla_mod, x, start_pos, freqs_cis, mask)
-            return forward
-        _set_attr(module, "forward", _make_mla_forward(original_mla, module), originals)
+    # MLA full-topk shortcircuit is handled by the indexer patch above.
+    # Skipping MLA forward patching to avoid conflicts with other patchers.
 
 
 def _mla_full_topk_forward(module, x, start_pos, freqs_cis, mask):
