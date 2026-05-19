@@ -617,31 +617,39 @@ def run(
             )
             # Replace eager results for this partition with the CUDA graph result.
             # Covers triton and best (when best resolves to all-triton).
-            def _should_replace(r):
-                if r.partition != cudagraph_row.partition:
-                    return False
-                if r.backend == "triton":
-                    return True
-                if r.backend == "best" and all(
-                    b == "triton" for bs in r.selected_backends.values() for b in bs
-                ):
-                    return True
-                return False
-            row_results = [
-                _row_result(
-                    RealKernelRow(
-                        partition_model=r.partition_model,
+            cg_partition = cudagraph_row.partition
+            new_results = []
+            for r in row_results:
+                if r.partition != cg_partition:
+                    new_results.append(r)
+                    continue
+                is_triton = r.backend == "triton"
+                is_best_all_triton = (
+                    r.backend == "best"
+                    and r.selected_backends
+                    and all(b == "triton" for bs in r.selected_backends.values() for b in bs)
+                )
+                if is_triton or is_best_all_triton:
+                    replaced = RowResult(
                         partition=r.partition,
                         backend=r.backend,
-                        kernel_root=cudagraph_row.kernel_root,
                         ops=r.ops,
-                        spec=cudagraph_row.spec,
-                    ),
-                    outputs, total_ms, baseline_outputs,
-                    {op: 1 for op in r.ops},
-                    r.selected_backends,
-                ) if _should_replace(r) else r
-                for r in row_results
+                        mean_ms=total_ms / max(len(dataset), 1),
+                        total_ms=total_ms,
+                        accuracy_pct=cg_result.accuracy_pct,
+                        correct=cg_result.correct,
+                        total=cg_result.total,
+                        validation=cg_result.validation,
+                        answer_match=cg_result.answer_match,
+                        token_match=cg_result.token_match,
+                        max_abs_diff=cg_result.max_abs_diff,
+                        calls=cg_result.calls,
+                        selected_backends=r.selected_backends,
+                    )
+                    new_results.append(replaced)
+                else:
+                    new_results.append(r)
+            row_results = new_results
             ]
             if _is_rank0():
                 print(f"  {total_ms:.1f}ms total", flush=True)
