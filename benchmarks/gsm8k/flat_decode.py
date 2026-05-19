@@ -93,12 +93,8 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
 
     def _residual_norm(x, residual, weight, eps):
         if rn is not None:
-            shape = x.shape
-            cols = shape[-1]
-            x_f = x.contiguous().view(-1, cols)
-            r_f = residual.contiguous().view(-1, cols)
-            hidden, normed = rn.fused_residual_norm(r_f, x_f, weight, eps=eps, fallback=None)
-            return normed.view(shape), hidden.view(shape)
+            normed, hidden = rn.fused_residual_norm(x, residual, weight, eps=eps, fallback=None)
+            return normed, hidden
         hidden = residual + x
         normed = _rms_norm_eager(hidden, weight, eps)
         return normed, hidden

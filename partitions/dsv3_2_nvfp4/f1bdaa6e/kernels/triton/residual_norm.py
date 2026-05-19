@@ -36,25 +36,29 @@ if BACKEND_AVAILABLE:
 
 
 def fused_residual_norm(
-    residual: torch.Tensor,
     update: torch.Tensor,
+    residual: torch.Tensor,
     norm_weight: torch.Tensor,
     *,
     eps: float,
     fallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Matches inference model convention: (update, residual) → (normed, hidden)."""
     del fallback
-    if residual.device.type != "cuda":
+    if update.device.type != "cuda":
         raise RuntimeError("Triton fused_residual_norm requires CUDA tensors")
-    tokens = residual.shape[0]
-    cols = residual.shape[-1]
+    shape = update.shape
+    cols = shape[-1]
+    n_rows = update.numel() // cols
     block_size = triton.next_power_of_2(cols)
-    out_hidden = torch.empty((tokens, cols), device=residual.device, dtype=residual.dtype)
-    out_normed = torch.empty((tokens, cols), device=residual.device, dtype=residual.dtype)
-    _residual_norm_kernel[(tokens,)](
-        residual.contiguous(), update.contiguous(), norm_weight.contiguous(),
+    u_flat = update.contiguous().view(n_rows, cols)
+    r_flat = residual.contiguous().view(n_rows, cols)
+    out_hidden = torch.empty_like(u_flat)
+    out_normed = torch.empty_like(u_flat)
+    _residual_norm_kernel[(n_rows,)](
+        r_flat, u_flat, norm_weight.contiguous(),
         out_hidden, out_normed,
-        eps, cols, residual.stride(0), update.stride(0), block_size,
+        eps, cols, r_flat.stride(0), u_flat.stride(0), block_size,
         num_warps=8 if block_size >= 2048 else 4,
     )
-    return out_hidden, out_normed
+    return out_normed.view(shape), out_hidden.view(shape)
