@@ -615,9 +615,32 @@ def run(
                 {op: 1 for op in cudagraph_row.ops},
                 _resolve_selected_backends(cudagraph_row),
             )
-            # Replace the eager triton result with the CUDA graph result
+            # Replace eager results for this partition with the CUDA graph result.
+            # Covers triton and best (when best resolves to all-triton).
+            def _should_replace(r):
+                if r.partition != cudagraph_row.partition:
+                    return False
+                if r.backend == "triton":
+                    return True
+                if r.backend == "best" and all(
+                    b == "triton" for bs in r.selected_backends.values() for b in bs
+                ):
+                    return True
+                return False
             row_results = [
-                cg_result if (r.partition == cudagraph_row.partition and r.backend == "triton") else r
+                _row_result(
+                    RealKernelRow(
+                        partition_model=r.partition_model,
+                        partition=r.partition,
+                        backend=r.backend,
+                        kernel_root=cudagraph_row.kernel_root,
+                        ops=r.ops,
+                        spec=cudagraph_row.spec,
+                    ),
+                    outputs, total_ms, baseline_outputs,
+                    {op: 1 for op in r.ops},
+                    r.selected_backends,
+                ) if _should_replace(r) else r
                 for r in row_results
             ]
             if _is_rank0():
