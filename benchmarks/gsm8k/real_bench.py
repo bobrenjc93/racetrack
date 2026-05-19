@@ -329,13 +329,8 @@ def _evaluate_row_cudagraph_prebuilt(
         tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device="cuda")
         prompt_mask = tokens != -1
 
-        # Prefill: use flat decode eagerly (model MoE already stacked)
-        for pos in range(prompt_len):
-            update_bufs(pos)
-            static_tok.fill_(tokens[0, pos].item())
-            flat_cg_fn(static_tok)
-
-        # Decode: use CUDA graph
+        # KV cache is already filled from model.forward(tok, 0) prefill.
+        # Skip re-prefill — go straight to CUDA graph decode.
         finished = False
         for cur_pos in range(prompt_len, total_len):
             prev_pos = cur_pos - 1
