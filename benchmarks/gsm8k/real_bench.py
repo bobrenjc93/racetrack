@@ -501,6 +501,11 @@ def run(
         elif row.spec is not None and _can_use_fused_patches(row):
             try:
                 with patch_real_model(model, row, strict_kernel_use=False) as stats:
+                    if _is_rank0():
+                        print("  warmup ...", flush=True)
+                    _evaluate_row(model, tokenizer, dataset, max_new_tokens=max_new_tokens)
+                    if _is_rank0():
+                        print("  timed run ...", flush=True)
                     outputs, total_ms = _evaluate_row(
                         model, tokenizer, dataset,
                         max_new_tokens=max_new_tokens,
@@ -516,6 +521,11 @@ def run(
         else:
             try:
                 with patch_real_model(model, row, strict_kernel_use=False) as stats:
+                    if _is_rank0():
+                        print("  warmup ...", flush=True)
+                    _evaluate_row(model, tokenizer, dataset, max_new_tokens=max_new_tokens)
+                    if _is_rank0():
+                        print("  timed run ...", flush=True)
                     outputs, total_ms = _evaluate_row(
                         model, tokenizer, dataset,
                         max_new_tokens=max_new_tokens,
