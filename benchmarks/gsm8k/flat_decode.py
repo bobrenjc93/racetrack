@@ -28,11 +28,12 @@ def _load_kernel(kernel_root: Path, name: str, backend: str | None = None):
     return None
 
 
-def build_flat_decode(model, kernel_root: Path | None = None, backend: str | None = None):
+def build_flat_decode(model, kernel_root: Path | None = None, backend: str | None = None, max_seq_len: int | None = None):
     """Build a flat decode function from the model + optional partition kernels.
 
     When kernel_root is None, uses inference.kernel defaults (baseline mode).
     When backend is specified, only loads kernels from that backend directory.
+    max_seq_len overrides the model's max_seq_len for cache/attention sizing.
     Returns (flat_decode, flat_decode_cg, update_bufs, static_logits).
     """
     from inference.model import apply_rotary_emb, weight_dequant
@@ -67,10 +68,11 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
     norm_eps = model.norm.eps
     head_weight = model.head.weight
     head_scale = model.head.scale if hasattr(model.head, 'scale') else None
+    max_t = max_seq_len or model.max_seq_len
 
     layers = []
     for layer in model.layers:
-        ld = _extract_layer(layer, aq, rn, ws)
+        ld = _extract_layer(layer, aq, rn, ws, max_t)
         layers.append(ld)
 
     def _do_act_quant(x):
@@ -128,7 +130,6 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
         dist.all_reduce(y)
         return y.to(x.dtype)
 
-    max_t = model.max_seq_len
     finfo_min = torch.finfo(torch.float32).min
     static_attn_mask = torch.full((1, 1, 1, max_t), finfo_min, device="cuda", dtype=torch.float32)
     static_pos = torch.zeros(1, dtype=torch.long, device="cuda")
@@ -309,19 +310,16 @@ def _flat_moe(x, ld, do_act_quant, do_swiglu_quant, fp8_gemm, ws, linear_fp8, li
     return y.to(torch.bfloat16).view(x.shape)
 
 
-def _get_or_alloc_cache(mla, name, dim):
+def _get_or_alloc_cache(mla, name, dim, max_t=4096):
     cache = getattr(mla, name, None)
     if cache is not None:
         return cache
-    max_t = getattr(mla, 'max_seq_len', 4096)
-    if hasattr(mla, 'kv_cache') and mla.kv_cache is not None:
-        max_t = mla.kv_cache.shape[1]
     cache = torch.zeros(1, max_t, dim, device="cuda", dtype=torch.bfloat16)
     setattr(mla, name, cache)
     return cache
 
 
-def _extract_layer(layer, aq, rn, ws):
+def _extract_layer(layer, aq, rn, ws, max_t=4096):
     """Extract all parameters from a layer into a flat dict for fast access."""
     from inference.model import weight_dequant, MoE, MLP
 
@@ -349,8 +347,8 @@ def _extract_layer(layer, aq, rn, ws):
         'wo_fp8': mla.wo.weight.dtype == torch.float8_e4m3fn,
         'wo_reduce': getattr(mla.wo, 'reduce_output', False),
         'wo_fn': mla.wo.forward,
-        'kv_cache': _get_or_alloc_cache(mla, 'kv_cache', mla.kv_lora_rank),
-        'pe_cache': _get_or_alloc_cache(mla, 'pe_cache', mla.qk_rope_head_dim),
+        'kv_cache': _get_or_alloc_cache(mla, 'kv_cache', mla.kv_lora_rank, max_t),
+        'pe_cache': _get_or_alloc_cache(mla, 'pe_cache', mla.qk_rope_head_dim, max_t),
         'n_heads': mla.n_local_heads,
         'qk_head_dim': mla.qk_head_dim,
         'qk_nope_dim': mla.qk_nope_head_dim,
@@ -395,43 +393,46 @@ def _extract_layer(layer, aq, rn, ws):
         has_scales = (hasattr(local_experts[0].w1.weight, 'scale')
                       and local_experts[0].w1.weight.scale is not None)
         ld['moe_has_scales'] = has_scales
-        def _incremental_stack(experts, attr_chain):
-            """Stack weights one expert at a time to minimize peak memory.
+        def _stack_via_cpu(experts, weight_attr, scale_attr=None):
+            """Stack expert weights using CPU as staging area.
 
-            Pre-allocates the output, copies each expert's weight, then
-            deletes the original before moving to the next. Peak memory
-            is output + 1 expert weight instead of output + all experts.
+            Copies weights to CPU one at a time, freeing each GPU
+            original immediately. Then allocates the GPU stack and
+            copies from CPU. Peak GPU = model - freed experts.
             """
-            parts = attr_chain.split(".")
-            def _get(e):
-                obj = e
-                for p in parts:
-                    obj = getattr(obj, p)
-                return obj
-            ref = _get(experts[0])
-            out = torch.empty(len(experts), *ref.shape, dtype=ref.dtype, device=ref.device)
-            for i, e in enumerate(experts):
-                out[i].copy_(_get(e))
-            return out
-
-        def _clear_attr(experts, attr):
+            import gc
+            cpu_weights = []
+            cpu_scales = []
             for e in experts:
-                if hasattr(e, attr):
-                    setattr(e, attr, None)
+                mod = getattr(e, weight_attr)
+                cpu_weights.append(mod.weight.data.cpu())
+                if scale_attr:
+                    cpu_scales.append(mod.weight.scale.cpu())
+                mod.weight.data = torch.empty(0, device="cuda")
+            for e in experts:
+                setattr(e, weight_attr, None)
+            gc.collect()
             torch.cuda.empty_cache()
+            stacked = torch.stack(cpu_weights).to("cuda")
+            del cpu_weights
+            s = None
+            if cpu_scales:
+                s = torch.stack(cpu_scales).to("cuda")
+                del cpu_scales
+            return stacked, s
 
-        if has_scales:
-            ld['moe_w1_s'] = _incremental_stack(local_experts, "w1.weight.scale")
-        ld['moe_w1'] = _incremental_stack(local_experts, "w1.weight.data")
-        _clear_attr(local_experts, "w1")
-        if has_scales:
-            ld['moe_w3_s'] = _incremental_stack(local_experts, "w3.weight.scale")
-        ld['moe_w3'] = _incremental_stack(local_experts, "w3.weight.data")
-        _clear_attr(local_experts, "w3")
-        if has_scales:
-            ld['moe_w2_s'] = _incremental_stack(local_experts, "w2.weight.scale")
-        ld['moe_w2'] = _incremental_stack(local_experts, "w2.weight.data")
-        _clear_attr(local_experts, "w2")
+        ld['moe_w1'], w1_s = _stack_via_cpu(local_experts, "w1",
+                                             "w1" if has_scales else None)
+        if w1_s is not None:
+            ld['moe_w1_s'] = w1_s
+        ld['moe_w3'], w3_s = _stack_via_cpu(local_experts, "w3",
+                                             "w3" if has_scales else None)
+        if w3_s is not None:
+            ld['moe_w3_s'] = w3_s
+        ld['moe_w2'], w2_s = _stack_via_cpu(local_experts, "w2",
+                                             "w2" if has_scales else None)
+        if w2_s is not None:
+            ld['moe_w2_s'] = w2_s
         for i in range(start, end): ffn.experts[i] = None
         torch.cuda.empty_cache()
         ld['shared_experts_fn'] = ffn.shared_experts.forward

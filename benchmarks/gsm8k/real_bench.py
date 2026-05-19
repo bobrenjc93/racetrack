@@ -577,18 +577,12 @@ def run(
             model.forward(tok, 0)
             torch.cuda.synchronize()
 
-            # Free KV/PE caches to make room for MoE weight stacking
-            # (~3GB reclaimed). build_flat_decode re-allocates fresh caches.
-            for layer in model.layers:
-                mla = layer.attn
-                if hasattr(mla, 'kv_cache') and mla.kv_cache is not None:
-                    del mla.kv_cache, mla.pe_cache
-            torch.cuda.empty_cache()
-
-            # Build flat decode (stacks MoE, destroys experts - one-time)
+            # Build flat decode (stacks MoE via CPU staging, destroys experts)
             if _is_rank0():
                 print("  building flat decode ...", flush=True)
-            flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(model, kr)
+            prompt_len = len(prompt_tokens)
+            cg_max_seq = min(prompt_len + 256, model.max_seq_len)
+            flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(model, kr, max_seq_len=cg_max_seq)
 
             # Warmup flat decode
             if _is_rank0():
