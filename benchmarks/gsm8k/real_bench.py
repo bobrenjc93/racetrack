@@ -63,6 +63,26 @@ def _can_use_fused_patches(row) -> bool:
     return False
 
 
+def _resolve_selected_backends(row) -> dict[str, tuple[str, ...]]:
+    """Resolve 'best' to concrete backend names per op."""
+    if row.backend != "best":
+        return {op: (row.backend,) for op in row.ops}
+    kr = row.kernel_root or (row.spec.kernel_root if row.spec else None)
+    if kr is None:
+        return {op: ("best",) for op in row.ops}
+    from racetrack.runtime.dispatch import KernelDispatcher
+    dispatcher = KernelDispatcher(kr)
+    result = {}
+    for op in row.ops:
+        resolved = None
+        for backend in CONCRETE_BACKENDS:
+            if dispatcher._resolve(backend, op) is not None:
+                resolved = backend
+                break
+        result[op] = (resolved or "torch",)
+    return result
+
+
 def _cleanup_compile_state() -> None:
     from benchmarks.common import cleanup_compile_state
     cleanup_compile_state()
@@ -507,7 +527,7 @@ def run(
             row_result = _row_result(
                 row, outputs, total_ms, baseline_outputs,
                 {op: 1 for op in row.ops},
-                {op: (row.backend,) for op in row.ops},
+                _resolve_selected_backends(row),
             )
         else:
             with patch_real_model(model, row, strict_kernel_use=True) as stats:

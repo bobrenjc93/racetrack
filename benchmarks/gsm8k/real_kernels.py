@@ -196,12 +196,20 @@ def patch_real_model(
     try:
         yield stats
         if row.backend == "best":
-            stats.selected_backends.update(
-                {
-                    op_name: tuple(sorted(backends))
-                    for op_name, backends in dispatcher._best_ops.items()
-                }
-            )
+            selected = {}
+            for op_name, backends in dispatcher._best_ops.items():
+                selected[op_name] = tuple(sorted(backends))
+            for op_name in row.ops:
+                if op_name not in selected:
+                    cached = dispatcher._best_fast_path.get(op_name)
+                    if cached and cached != "torch":
+                        selected[op_name] = (cached,)
+                    else:
+                        for b in CONCRETE_BACKENDS:
+                            if dispatcher._resolve(b, op_name) is not None:
+                                selected[op_name] = (b,)
+                                break
+            stats.selected_backends.update(selected)
         else:
             stats.selected_backends.update(
                 {op_name: (row.backend,) for op_name in row.ops}
