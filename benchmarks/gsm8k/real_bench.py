@@ -499,28 +499,14 @@ def run(
                 row, outputs, total_ms, baseline_outputs, {}, {},
             )
         elif row.spec is not None and _can_use_fused_patches(row):
-            from benchmarks.gsm8k.cudagraph_generate import (
-                patch_for_cudagraph,
-                rollback_cudagraph_patches,
-            )
-            originals = patch_for_cudagraph(model, row.kernel_root or row.spec.kernel_root)
-            if _is_rank0():
-                print("  warmup (fused) ...", flush=True)
-            _evaluate_row(
-                model, tokenizer, dataset,
-                max_new_tokens=max_new_tokens,
-            )
-            if _is_rank0():
-                print("  timed run ...", flush=True)
-            outputs, total_ms = _evaluate_row(
-                model, tokenizer, dataset,
-                max_new_tokens=max_new_tokens,
-            )
-            rollback_cudagraph_patches(originals)
+            with patch_real_model(model, row, strict_kernel_use=False) as stats:
+                outputs, total_ms = _evaluate_row(
+                    model, tokenizer, dataset,
+                    max_new_tokens=max_new_tokens,
+                )
             row_result = _row_result(
                 row, outputs, total_ms, baseline_outputs,
-                {op: 1 for op in row.ops},
-                _resolve_selected_backends(row),
+                stats.calls, stats.selected_backends,
             )
         else:
             with patch_real_model(model, row, strict_kernel_use=True) as stats:
@@ -557,7 +543,7 @@ def run(
     )
     if cudagraph_row is not None:
         if _is_rank0():
-            print(f"Row {cudagraph_row.partition}/triton+cudagraph: flat decode + CUDA graph", flush=True)
+            print(f"Row {cudagraph_row.partition}/triton: flat decode + CUDA graph", flush=True)
         try:
             from benchmarks.gsm8k.flat_decode import build_flat_decode
 
@@ -610,19 +596,16 @@ def run(
                 max_new_tokens=max_new_tokens,
             )
             cg_result = _row_result(
-                RealKernelRow(
-                    partition_model=cudagraph_row.partition_model,
-                    partition=cudagraph_row.partition,
-                    backend="triton+cudagraph",
-                    kernel_root=kr,
-                    ops=cudagraph_row.ops,
-                    spec=cudagraph_row.spec,
-                ),
+                cudagraph_row,
                 outputs, total_ms, baseline_outputs,
                 {op: 1 for op in cudagraph_row.ops},
-                {op: ("triton",) for op in cudagraph_row.ops},
+                _resolve_selected_backends(cudagraph_row),
             )
-            row_results.append(cg_result)
+            # Replace the eager triton result with the CUDA graph result
+            row_results = [
+                cg_result if (r.partition == cudagraph_row.partition and r.backend == "triton") else r
+                for r in row_results
+            ]
             if _is_rank0():
                 print(f"  {total_ms:.1f}ms total", flush=True)
         except Exception as exc:
