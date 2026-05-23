@@ -57,19 +57,8 @@ def fused_norm_rope(
     )
 
 
-def fused_residual_norm(
-    residual,
-    update,
-    norm_weight,
-    *,
-    eps,
-    fallback,
-):
-    return fallback(residual, update, norm_weight, eps=eps)
-
-
-def fused_swiglu(gate, up, *, fallback):
-    return fallback(gate, up)
+# fused_residual_norm → see residual_norm.py
+# fused_swiglu → see swiglu.py
 
 
 def fused_full_topk_indexer(
