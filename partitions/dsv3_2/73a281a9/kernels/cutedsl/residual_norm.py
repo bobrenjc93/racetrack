@@ -1,131 +1,180 @@
-from __future__ import annotations
+"""Fused residual add + RMS norm for CuteDSL backend.
 
-from typing import Any
+Inline CUDA C++ kernel: one thread block per row computes
+residual + update → hidden, then RMS norm → normed. Single pass,
+warp-level reduction for variance, no intermediate tensors.
+"""
+from __future__ import annotations
 
 import torch
 
 try:
-    import cutlass
-    import cutlass.cute as cute
-    from cuda.bindings import driver as cuda
-    from cutlass.cute.runtime import from_dlpack
+    import cutlass  # noqa: F401
 
     BACKEND_AVAILABLE = True
 except Exception:
-    cutlass = None
-    cute = None
-    cuda = None
-    from_dlpack = None
     BACKEND_AVAILABLE = False
 
-
-_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
-
-BLOCK_SIZE = 256
-MIN_CUTE_ROWS = 512
+_cuda_module = None
 
 
-def _cute_tensor(tensor: torch.Tensor):
-    return from_dlpack(tensor.detach()).mark_layout_dynamic()
+def _get_cuda_module():
+    global _cuda_module
+    if _cuda_module is not None:
+        return _cuda_module
 
+    from torch.utils.cpp_extension import load_inline
 
-def _stream(device: torch.device):
-    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    cuda_src = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <float.h>
 
+template <typename T> __device__ __forceinline__ float to_float(T v);
+template <> __device__ __forceinline__ float to_float(float v) { return v; }
+template <> __device__ __forceinline__ float to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <> __device__ __forceinline__ float to_float(__nv_half v) { return __half2float(v); }
 
-if BACKEND_AVAILABLE:
+template <typename T> __device__ __forceinline__ T from_float(float v);
+template <> __device__ __forceinline__ float from_float(float v) { return v; }
+template <> __device__ __forceinline__ __nv_bfloat16 from_float(float v) { return __float2bfloat16(v); }
+template <> __device__ __forceinline__ __nv_half from_float(float v) { return __float2half(v); }
 
-    @cute.kernel
-    def _residual_norm_kernel(
-        residual: cute.Tensor,
-        update: cute.Tensor,
-        weight: cute.Tensor,
-        out_hidden: cute.Tensor,
-        out_normed: cute.Tensor,
-        rows: cutlass.Int32,
-        cols: cutlass.Int32,
-        eps: cutlass.Float32,
-    ):
-        row, _, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()
-        smem_ptr = cute.arch.alloc_smem(cutlass.Float32, BLOCK_SIZE)
-        if row < rows:
-            local_sum = cutlass.Float32(0.0)
-            col = tid
-            while col < cols:
-                hidden = (
-                    residual[row, col].to(cutlass.Float32)
-                    + update[row, col].to(cutlass.Float32)
-                )
-                out_hidden[row, col] = hidden.to(out_hidden.element_type)
-                local_sum += hidden * hidden
-                col += BLOCK_SIZE
-            cute.arch.store(smem_ptr + tid, local_sum)
-            cute.arch.sync_threads()
-            stride = BLOCK_SIZE // 2
-            while stride > 0:
-                if tid < stride:
-                    a = cute.arch.load(smem_ptr + tid, cutlass.Float32)
-                    b = cute.arch.load(smem_ptr + tid + stride, cutlass.Float32)
-                    cute.arch.store(smem_ptr + tid, a + b)
-                cute.arch.sync_threads()
-                stride = stride // 2
-            total = cute.arch.load(smem_ptr, cutlass.Float32)
-            scale = cute.math.rsqrt(total / cols + eps)
-            cute.arch.sync_threads()
-            col = tid
-            while col < cols:
-                hidden = out_hidden[row, col].to(cutlass.Float32)
-                w = weight[col].to(cutlass.Float32)
-                out_normed[row, col] = (hidden * scale * w).to(out_normed.element_type)
-                col += BLOCK_SIZE
+// Each thread block processes one row. blockDim.x = next_pow2(cols), capped at 1024.
+// For cols > 1024, each thread loops over multiple elements.
+template <typename T>
+__global__ void residual_norm_kernel(
+    const T* __restrict__ update,
+    const T* __restrict__ residual,
+    const float* __restrict__ weight,
+    T* __restrict__ out_hidden,
+    T* __restrict__ out_normed,
+    int cols,
+    float eps
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
 
-    @cute.jit
-    def _residual_norm_host(
-        residual: cute.Tensor,
-        update: cute.Tensor,
-        weight: cute.Tensor,
-        out_hidden: cute.Tensor,
-        out_normed: cute.Tensor,
-        rows: cutlass.Int32,
-        cols: cutlass.Int32,
-        eps: cutlass.Float32,
-        stream: cuda.CUstream,
-    ):
-        _residual_norm_kernel(
-            residual, update, weight, out_hidden, out_normed,
-            rows, cols, eps,
-        ).launch(
-            grid=[rows, 1, 1], block=[BLOCK_SIZE, 1, 1], stream=stream,
-        )
+    // Each thread accumulates partial sum of squares over its elements
+    float sum_sq = 0.0f;
+    for (int c = tid; c < cols; c += nthreads) {
+        float u = to_float(update[row * cols + c]);
+        float r = to_float(residual[row * cols + c]);
+        float h = u + r;
+        out_hidden[row * cols + c] = from_float<T>(h);
+        sum_sq += h * h;
+    }
+
+    // Warp-level reduction of sum_sq
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+
+    // Cross-warp reduction via shared memory (up to 32 warps for 1024 threads)
+    __shared__ float shared[32];
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int n_warps = (nthreads + 31) / 32;
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < n_warps; i++) total += shared[i];
+        shared[0] = total;
+    }
+    __syncthreads();
+
+    float variance = shared[0] / (float)cols;
+    float scale = rsqrtf(variance + eps);
+
+    for (int c = tid; c < cols; c += nthreads) {
+        float u = to_float(update[row * cols + c]);
+        float r = to_float(residual[row * cols + c]);
+        float h = u + r;
+        float w = weight[c];
+        out_normed[row * cols + c] = from_float<T>(h * scale * w);
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> residual_norm_cuda(
+    torch::Tensor update, torch::Tensor residual, torch::Tensor weight,
+    double eps
+) {
+    auto u_c = update.contiguous();
+    auto r_c = residual.contiguous();
+    auto w_c = weight.contiguous();
+    int64_t cols = u_c.size(-1);
+    int64_t n_rows = u_c.numel() / cols;
+
+    auto out_hidden = torch::empty_like(u_c);
+    auto out_normed = torch::empty_like(u_c);
+
+    // Use up to 1024 threads, round up to next multiple of 32
+    int nthreads = ((int)cols + 31) / 32 * 32;
+    if (nthreads > 1024) nthreads = 1024;
+
+    auto stream = c10::cuda::getCurrentCUDAStream();
+    if (u_c.dtype() == torch::kBFloat16) {
+        residual_norm_kernel<__nv_bfloat16><<<n_rows, nthreads, 0, stream>>>(
+            (const __nv_bfloat16*)u_c.data_ptr(),
+            (const __nv_bfloat16*)r_c.data_ptr(),
+            w_c.data_ptr<float>(),
+            (__nv_bfloat16*)out_hidden.data_ptr(),
+            (__nv_bfloat16*)out_normed.data_ptr(),
+            cols, (float)eps);
+    } else if (u_c.dtype() == torch::kFloat16) {
+        residual_norm_kernel<__nv_half><<<n_rows, nthreads, 0, stream>>>(
+            (const __nv_half*)u_c.data_ptr(),
+            (const __nv_half*)r_c.data_ptr(),
+            w_c.data_ptr<float>(),
+            (__nv_half*)out_hidden.data_ptr(),
+            (__nv_half*)out_normed.data_ptr(),
+            cols, (float)eps);
+    } else {
+        residual_norm_kernel<float><<<n_rows, nthreads, 0, stream>>>(
+            u_c.data_ptr<float>(),
+            r_c.data_ptr<float>(),
+            w_c.data_ptr<float>(),
+            out_hidden.data_ptr<float>(),
+            out_normed.data_ptr<float>(),
+            cols, (float)eps);
+    }
+    return {out_normed, out_hidden};
+}
+"""
+
+    cpp_src = r"""
+std::tuple<torch::Tensor, torch::Tensor> residual_norm_cuda(
+    torch::Tensor update, torch::Tensor residual, torch::Tensor weight,
+    double eps);
+"""
+
+    _cuda_module = load_inline(
+        name="cutedsl_residual_norm",
+        cpp_sources=[cpp_src],
+        cuda_sources=[cuda_src],
+        functions=["residual_norm_cuda"],
+        verbose=False,
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+    )
+    return _cuda_module
 
 
 def fused_residual_norm(
-    residual, update, norm_weight, *, eps, fallback,
-):
-    if residual.shape[0] < MIN_CUTE_ROWS:
-        return fallback(residual, update, norm_weight, eps=eps)
-    residual_c = residual.contiguous()
-    update_c = update.contiguous()
-    weight_c = norm_weight.contiguous()
-    out_hidden = torch.empty_like(residual_c)
-    out_normed = torch.empty_like(residual_c)
-    rows, cols = residual_c.shape
-    key = ("residual_norm", str(residual_c.device), residual_c.dtype, rows, cols)
-    if key not in _COMPILE_CACHE:
-        stream = _stream(residual_c.device)
-        _COMPILE_CACHE[key] = cute.compile(
-            _residual_norm_host,
-            _cute_tensor(residual_c), _cute_tensor(update_c), _cute_tensor(weight_c),
-            _cute_tensor(out_hidden), _cute_tensor(out_normed),
-            cutlass.Int32(rows), cutlass.Int32(cols),
-            cutlass.Float32(eps), stream,
-        )
-    stream = _stream(residual_c.device)
-    _COMPILE_CACHE[key](
-        _cute_tensor(residual_c), _cute_tensor(update_c), _cute_tensor(weight_c),
-        _cute_tensor(out_hidden), _cute_tensor(out_normed),
-        cutlass.Int32(rows), cutlass.Int32(cols),
-        cutlass.Float32(eps), stream,
-    )
-    return out_hidden, out_normed
+    update: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    *,
+    eps: float,
+    fallback,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del fallback
+    mod = _get_cuda_module()
+    shape = update.shape
+    normed, hidden = mod.residual_norm_cuda(update, residual, norm_weight, eps)
+    return normed.view(shape), hidden.view(shape)

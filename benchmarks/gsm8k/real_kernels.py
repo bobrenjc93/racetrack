@@ -287,13 +287,13 @@ class _StatsDispatcher:
         update_flat = update.contiguous().view(-1, cols)
         residual_flat = residual.contiguous().view(-1, cols)
 
-        def legacy_fallback(r, u, w, *, eps):
+        def flat_fallback(u, r, w, *, eps):
             normed, hidden = fallback(u.view(shape), r.view(shape), w, eps=eps)
-            return hidden.contiguous().view(-1, cols), normed.contiguous().view(-1, cols)
+            return normed.contiguous().view(-1, cols), hidden.contiguous().view(-1, cols)
 
-        hidden, normed = self._dispatcher.call(
-            "fused_residual_norm", legacy_fallback,
-            residual_flat, update_flat, weight, eps=eps,
+        normed, hidden = self._dispatcher.call(
+            "fused_residual_norm", flat_fallback,
+            update_flat, residual_flat, weight, eps=eps,
         )
         return normed.view(shape), hidden.view(shape)
 

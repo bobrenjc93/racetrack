@@ -15,7 +15,7 @@ import torch.distributed as dist
 
 def _load_kernel(kernel_root: Path, name: str, backend: str | None = None):
     """Load a kernel module by name from the specified backend only."""
-    backends = [backend] if backend else ("triton", "cutedsl", "helion")
+    backends = [backend] if backend else ("cutedsl", "triton", "helion")
     for b in backends:
         path = kernel_root / b / f"{name}.py"
         if path.exists():
@@ -28,6 +28,10 @@ def _load_kernel(kernel_root: Path, name: str, backend: str | None = None):
     return None
 
 
+_cached_layers = None
+_cached_model_id = None
+
+
 def build_flat_decode(model, kernel_root: Path | None = None, backend: str | None = None, max_seq_len: int | None = None):
     """Build a flat decode function from the model + optional partition kernels.
 
@@ -36,6 +40,8 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
     max_seq_len overrides the model's max_seq_len for cache/attention sizing.
     Returns (flat_decode, flat_decode_cg, update_bufs, static_logits).
     """
+    global _cached_layers, _cached_model_id
+
     from inference.model import apply_rotary_emb, weight_dequant
     from inference.kernel import fp8_gemm
     from inference import kernel as inf_kernel
@@ -70,10 +76,16 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
     head_scale = model.head.scale if hasattr(model.head, 'scale') else None
     max_t = max_seq_len or model.max_seq_len
 
-    layers = []
-    for layer in model.layers:
-        ld = _extract_layer(layer, aq, rn, ws, max_t)
-        layers.append(ld)
+    mid = id(model)
+    if _cached_layers is not None and _cached_model_id == mid:
+        layers = _cached_layers
+    else:
+        layers = []
+        for layer in model.layers:
+            ld = _extract_layer(layer, aq, rn, ws, max_t)
+            layers.append(ld)
+        _cached_layers = layers
+        _cached_model_id = mid
 
     def _do_act_quant(x):
         if aq is not None:

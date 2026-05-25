@@ -12,21 +12,6 @@ except Exception:
     BACKEND_AVAILABLE = False
 
 
-def fused_residual_norm(
-    x,
-    residual,
-    weight,
-    *,
-    eps,
-    fallback,
-):
-    return fallback(x, residual, weight, eps=eps)
-
-
-def fused_swiglu(gate, up, *, fallback):
-    return fallback(gate, up)
-
-
 def fused_full_topk_indexer(
     indexer,
     x: torch.Tensor,

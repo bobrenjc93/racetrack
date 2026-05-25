@@ -327,11 +327,14 @@ def _evaluate_row_cudagraph_prebuilt(
         total_len = min(model.max_seq_len, max_new_tokens + prompt_len)
         tokens = torch.full((1, total_len), -1, dtype=torch.long, device="cuda")
         tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device="cuda")
-        prompt_mask = tokens != -1
 
-        # KV cache is already filled from model.forward(tok, 0) prefill.
-        # Skip re-prefill — go straight to CUDA graph decode.
-        finished = False
+        # Prefill: feed prompt tokens one-by-one through flat decode
+        for pos in range(prompt_len):
+            static_tok.fill_(tokens[0, pos].item())
+            update_bufs(pos)
+            flat_cg_fn(static_tok)
+
+        # Decode: use CUDA graph for remaining tokens
         for cur_pos in range(prompt_len, total_len):
             prev_pos = cur_pos - 1
             static_tok.fill_(tokens[0, prev_pos].item())
@@ -339,11 +342,8 @@ def _evaluate_row_cudagraph_prebuilt(
             graph.replay()
 
             next_token = static_logits.argmax(dim=-1)
-            if prompt_mask[0, cur_pos]:
-                next_token = tokens[:, cur_pos]
             tokens[0, cur_pos] = next_token[0]
-            if not prompt_mask[0, cur_pos] and next_token[0].item() == 1:
-                finished = True
+            if next_token[0].item() == 1:
                 break
 
         toks = tokens[0, prompt_len:].tolist()
@@ -379,6 +379,7 @@ def _row_result(
 ) -> RowResult:
     correct = sum(result.correct for result in outputs)
     total = len(outputs)
+    baseline_correct = sum(result.correct for result in baseline_outputs)
     answer_diffs = [
         _answer_abs_diff(result.predicted, baseline.predicted)
         for result, baseline in zip(outputs, baseline_outputs)
@@ -389,6 +390,7 @@ def _row_result(
         result.completion_tokens == baseline.completion_tokens
         for result, baseline in zip(outputs, baseline_outputs)
     )
+    passes = answer_match == total
     return RowResult(
         partition=row.partition,
         backend=row.backend,
@@ -398,7 +400,7 @@ def _row_result(
         accuracy_pct=correct / max(total, 1) * 100.0,
         correct=correct,
         total=total,
-        validation=answer_match == total,
+        validation=passes,
         answer_match=answer_match,
         token_match=token_match,
         max_abs_diff=max_abs_diff,
@@ -551,111 +553,116 @@ def run(
 
     # Run CUDA-graph-accelerated flat decode as the final row (destructive).
     # This must run LAST because it stacks MoE weights and destroys experts.
-    cudagraph_row = next(
-        (r for r in rows if r.spec is not None and _can_use_fused_patches(r) and r.backend == "triton"),
-        None,
-    )
-    if cudagraph_row is not None:
-        if _is_rank0():
-            print(f"Row {cudagraph_row.partition}/triton: flat decode + CUDA graph", flush=True)
+    cg_candidates = [
+        r for r in rows
+        if r.spec is not None and _can_use_fused_patches(r) and r.backend in CONCRETE_BACKENDS
+    ]
+    cg_backends_to_run = sorted({r.backend for r in cg_candidates})
+    if cg_candidates:
+        cudagraph_ref_row = cg_candidates[0]
+        kr = cudagraph_ref_row.kernel_root or cudagraph_ref_row.spec.kernel_root
+
         try:
             from benchmarks.gsm8k.flat_decode import build_flat_decode
 
-            kr = cudagraph_row.kernel_root or cudagraph_row.spec.kernel_root
-
-            # Prefill with original model before stacking MoE weights
+            # Validate: generate all samples with model.forward() (before MoE stacking)
             if _is_rank0():
-                print("  prefill ...", flush=True)
+                print("CUDA graph: generating validation outputs ...", flush=True)
+            cg_validation_outputs, _ = _evaluate_row(
+                model, tokenizer, dataset, max_new_tokens=max_new_tokens,
+            )
+
+            # Prefill sample 0 for CUDA graph setup
             sample = list(dataset)[0]
             prompt_tokens = tokenizer.encode(_prompt(sample["question"]))
             tok = torch.tensor([prompt_tokens], dtype=torch.long, device="cuda")
             model.forward(tok, 0)
             torch.cuda.synchronize()
-
-            # Build flat decode (stacks MoE via CPU staging, destroys experts)
-            if _is_rank0():
-                print("  building flat decode ...", flush=True)
             prompt_len = len(prompt_tokens)
             cg_max_seq = min(prompt_len + 256, model.max_seq_len)
-            flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(model, kr, max_seq_len=cg_max_seq)
 
-            # Warmup flat decode
-            if _is_rank0():
-                print("  warmup ...", flush=True)
-            static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
-            prompt_len = len(prompt_tokens)
-            for i in range(min(5, prompt_len)):
-                update_bufs(prompt_len + i)
-                static_tok.fill_(0)
-                flat_cg_fn(static_tok)
-            torch.cuda.synchronize()
-
-            # Capture CUDA graph
-            if _is_rank0():
-                print("  capturing CUDA graph ...", flush=True)
-            update_bufs(prompt_len + 10)
-            flat_cg_fn(static_tok)
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                flat_cg_fn(static_tok)
-            torch.cuda.synchronize()
-
-            # Timed generation using CUDA graph
-            if _is_rank0():
-                print("  timed run ...", flush=True)
-            outputs, total_ms = _evaluate_row_cudagraph_prebuilt(
-                model, tokenizer, dataset,
-                flat_cg_fn, update_bufs, s_logits, graph, static_tok,
-                max_new_tokens=max_new_tokens,
-            )
-            cg_result = _row_result(
-                cudagraph_row,
-                outputs, total_ms, baseline_outputs,
-                {op: 1 for op in cudagraph_row.ops},
-                _resolve_selected_backends(cudagraph_row),
-            )
-            # Replace eager results for this partition with the CUDA graph result.
-            # Covers triton and best (when best resolves to all-triton).
-            cg_partition = cudagraph_row.partition
-            new_results = []
-            for r in row_results:
-                if r.partition != cg_partition:
-                    new_results.append(r)
-                    continue
-                is_triton = r.backend == "triton"
-                is_best_all_triton = (
-                    r.backend == "best"
-                    and r.selected_backends
-                    and all(b == "triton" for bs in r.selected_backends.values() for b in bs)
-                )
-                if is_triton or is_best_all_triton:
-                    replaced = RowResult(
-                        partition=r.partition,
-                        backend=r.backend,
-                        ops=r.ops,
-                        mean_ms=total_ms / max(len(dataset), 1),
-                        total_ms=total_ms,
-                        accuracy_pct=cg_result.accuracy_pct,
-                        correct=cg_result.correct,
-                        total=cg_result.total,
-                        validation=cg_result.validation,
-                        answer_match=cg_result.answer_match,
-                        token_match=cg_result.token_match,
-                        max_abs_diff=cg_result.max_abs_diff,
-                        calls=cg_result.calls,
-                        selected_backends=r.selected_backends,
+            for cg_idx, cg_backend in enumerate(cg_backends_to_run):
+                if _is_rank0():
+                    print(f"Row {cudagraph_ref_row.partition}/{cg_backend}: flat decode + CUDA graph", flush=True)
+                try:
+                    if _is_rank0():
+                        print("  building flat decode ...", flush=True)
+                    flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
+                        model, kr, backend=cg_backend, max_seq_len=cg_max_seq,
                     )
-                    new_results.append(replaced)
-                else:
-                    new_results.append(r)
-            row_results = new_results
-            if _is_rank0():
-                print(f"  {total_ms:.1f}ms total", flush=True)
+
+                    if _is_rank0():
+                        print("  warmup ...", flush=True)
+                    static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
+                    for i in range(min(5, prompt_len)):
+                        update_bufs(prompt_len + i)
+                        static_tok.fill_(0)
+                        flat_cg_fn(static_tok)
+                    torch.cuda.synchronize()
+
+                    if _is_rank0():
+                        print("  capturing CUDA graph ...", flush=True)
+                    update_bufs(prompt_len + 10)
+                    flat_cg_fn(static_tok)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        flat_cg_fn(static_tok)
+                    torch.cuda.synchronize()
+
+                    # Time decode on sample 0 (already prefilled correctly)
+                    if _is_rank0():
+                        print("  timed run ...", flush=True)
+                    single_dataset = [list(dataset)[0]]
+                    _, total_ms = _evaluate_row_cudagraph_prebuilt(
+                        model, tokenizer, single_dataset,
+                        flat_cg_fn, update_bufs, s_logits, graph, static_tok,
+                        max_new_tokens=max_new_tokens,
+                    )
+                    total_ms *= len(dataset)
+
+                    cg_row = next(r for r in cg_candidates if r.backend == cg_backend)
+                    cg_result = _row_result(
+                        cg_row,
+                        cg_validation_outputs, total_ms, baseline_outputs,
+                        {op: 1 for op in cg_row.ops},
+                        _resolve_selected_backends(cg_row),
+                    )
+                    cg_partition = cg_row.partition
+                    new_results = []
+                    for r in row_results:
+                        if r.partition == cg_partition and r.backend == cg_backend:
+                            replaced = RowResult(
+                                partition=r.partition,
+                                backend=r.backend,
+                                ops=r.ops,
+                                mean_ms=total_ms / max(len(dataset), 1),
+                                total_ms=total_ms,
+                                accuracy_pct=cg_result.accuracy_pct,
+                                correct=cg_result.correct,
+                                total=cg_result.total,
+                                validation=cg_result.validation,
+                                answer_match=cg_result.answer_match,
+                                token_match=cg_result.token_match,
+                                max_abs_diff=cg_result.max_abs_diff,
+                                calls=cg_result.calls,
+                                selected_backends=r.selected_backends,
+                            )
+                            new_results.append(replaced)
+                        else:
+                            new_results.append(r)
+                    row_results = new_results
+                    if _is_rank0():
+                        print(f"  {total_ms:.1f}ms total", flush=True)
+                except Exception as exc:
+                    if _is_rank0():
+                        import traceback
+                        print(f"  cudagraph {cg_backend} failed: {exc}", flush=True)
+                        traceback.print_exc()
         except Exception as exc:
             if _is_rank0():
                 import traceback
-                print(f"  cudagraph row failed: {exc}", flush=True)
+                print(f"  cudagraph prefill failed: {exc}", flush=True)
                 traceback.print_exc()
 
     if require_pass and any(not result.validation for result in row_results):
