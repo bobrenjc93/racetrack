@@ -1,8 +1,8 @@
 """Real-weight arithmetic benchmark with flat_decode + CUDA graph.
 
-Loads the real DeepSeek-V3.2 checkpoint, runs short arithmetic prompts
-through flat_decode with CUDA graph capture, and reports per-backend
-decode latency.
+Mirrors GSM8K real_bench: loads the real DeepSeek-V3.2 checkpoint, runs
+all partitions/backends in eager mode, then CUDA graph decode rows for
+partitions with act_quant.
 
 Usage:
     torchrun --standalone --nproc-per-node=8 -m benchmarks.arithmetic.real_bench \
@@ -19,15 +19,17 @@ from pathlib import Path
 
 import torch
 
-from benchmarks.gsm8k.eval import DSV3_2_CONFIG, EVAL_MODEL
+from benchmarks.gsm8k.eval import DSV3_2_CONFIG, EVAL_MODEL, _generate_greedy
 from benchmarks.gsm8k.hf_auth import require_hf_token
 from benchmarks.common import (
     TORCH_COMPILE_BACKEND,
     CONCRETE_BACKENDS,
     hardware_info as _hardware_info,
     hardware_slug as _hardware_slug,
+    cleanup_compile_state,
 )
 from benchmarks.gsm8k.real_kernels import (
+    RealKernelRow,
     discover_real_kernel_rows,
     patch_real_model,
 )
@@ -39,6 +41,7 @@ PROMPTS = [
     "480129381029381 - 0 =",
     "98273465000123 / 1 =",
 ]
+MAX_NEW_TOKENS = 64
 
 
 def _rank():
@@ -107,16 +110,23 @@ def _load_model_and_tokenizer(*, ckpt_path, hf_token, hf_direct):
     return model, tokenizer
 
 
-@torch.inference_mode()
-def _time_baseline(model, tokenizer, prompts, *, max_new_tokens, warmup, repeat):
-    from benchmarks.gsm8k.eval import _generate_greedy
+def _can_use_fused_patches(row) -> bool:
+    if row.kernel_root is None or row.spec is None:
+        return False
+    kr = row.kernel_root or row.spec.kernel_root
+    for backend in CONCRETE_BACKENDS:
+        if (kr / backend / "act_quant.py").exists():
+            return True
+    return False
 
+
+@torch.inference_mode()
+def _time_generation(model, tokenizer, prompts, *, max_new_tokens, warmup, repeat):
     encoded = [tokenizer.encode(p) for p in prompts]
     for _ in range(warmup):
         for p in encoded:
             _generate_greedy(model, [p], max_new_tokens, eos_id=1)
     torch.cuda.synchronize()
-
     times = []
     for _ in range(repeat):
         torch.cuda.synchronize()
@@ -128,66 +138,29 @@ def _time_baseline(model, tokenizer, prompts, *, max_new_tokens, warmup, repeat)
     return sum(times) / len(times)
 
 
-@torch.inference_mode()
-def _time_cudagraph_backends(model, tokenizer, prompts, kr, backends, *, max_new_tokens, warmup, repeat):
-    from benchmarks.gsm8k.flat_decode import build_flat_decode
+@dataclass
+class RowResult:
+    partition: str
+    backend: str
+    total_ms: float
+    selected_backends: dict
 
-    encoded = [tokenizer.encode(p) for p in prompts]
-    max_prompt = max(len(e) for e in encoded)
-    max_seq = max_prompt + max_new_tokens
 
-    first_prompt = encoded[0]
-    tok = torch.tensor([first_prompt], dtype=torch.long, device="cuda")
-    model.forward(tok, 0)
-    torch.cuda.synchronize()
-    prompt_len = len(first_prompt)
-    n_decode_tokens = max_new_tokens * len(prompts)
-
-    results = {}
-    for backend in backends:
-        try:
-            flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
-                model, kr, backend=backend, max_seq_len=max_seq,
-            )
-
-            static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
-            for i in range(min(5, prompt_len)):
-                update_bufs(prompt_len + i)
-                static_tok.fill_(0)
-                flat_cg_fn(static_tok)
-            torch.cuda.synchronize()
-
-            update_bufs(prompt_len + 10)
-            flat_cg_fn(static_tok)
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                flat_cg_fn(static_tok)
-            torch.cuda.synchronize()
-
-            for _ in range(warmup):
-                for i in range(n_decode_tokens):
-                    update_bufs(prompt_len + (i % max_new_tokens))
-                    graph.replay()
-            torch.cuda.synchronize()
-
-            times = []
-            for _ in range(repeat):
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for i in range(n_decode_tokens):
-                    update_bufs(prompt_len + (i % max_new_tokens))
-                    graph.replay()
-                end.record()
-                torch.cuda.synchronize()
-                times.append(start.elapsed_time(end))
-            results[backend] = sum(times) / len(times)
-        except Exception as exc:
-            rank = int(os.environ.get("RANK", "0"))
-            if rank == 0:
-                print(f"  {backend} failed: {exc}", flush=True)
-    return results
+def _resolve_selected_backends(row):
+    if row.backend != "best":
+        return {op: (row.backend,) for op in row.ops}
+    kr = row.kernel_root or (row.spec.kernel_root if row.spec else None)
+    if kr is None:
+        return {op: ("best",) for op in row.ops}
+    from racetrack.runtime.dispatch import KernelDispatcher
+    dispatcher = KernelDispatcher(kr)
+    result = {}
+    for op in row.ops:
+        for backend in CONCRETE_BACKENDS:
+            if dispatcher._resolve(backend, op) is not None:
+                result[op] = (backend,)
+                break
+    return result
 
 
 def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warmup, repeat):
@@ -197,16 +170,17 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
 
     if _is_rank0():
         print("Timing baseline ...", flush=True)
-    baseline_ms = _time_baseline(model, tokenizer, PROMPTS,
-                                  max_new_tokens=64, warmup=2, repeat=3)
+    baseline_ms = _time_generation(model, tokenizer, PROMPTS,
+                                    max_new_tokens=MAX_NEW_TOKENS, warmup=2, repeat=3)
+    row_results = [RowResult("baseline", "torch", baseline_ms, {})]
 
     if _is_rank0():
         print("Timing torch.compile ...", flush=True)
     compiled = torch.compile(model)
-    compile_ms = _time_baseline(compiled, tokenizer, PROMPTS,
-                                 max_new_tokens=64, warmup=2, repeat=3)
+    compile_ms = _time_generation(compiled, tokenizer, PROMPTS,
+                                   max_new_tokens=MAX_NEW_TOKENS, warmup=2, repeat=3)
+    row_results.append(RowResult("baseline", TORCH_COMPILE_BACKEND, compile_ms, {}))
     del compiled
-    from benchmarks.common import cleanup_compile_state
     cleanup_compile_state(torch.device("cuda"))
 
     rows = discover_real_kernel_rows(
@@ -214,86 +188,161 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
         partition_filter="all",
         backend_filter=backend_filter,
     )
-    cg_rows = [r for r in rows if r.spec is not None
-               and r.backend in CONCRETE_BACKENDS
-               and r.kernel_root is not None
-               and (r.kernel_root / r.backend / "act_quant.py").exists()]
 
-    seen_backends = set()
-    backends_to_time = []
-    partition_for_cg = None
-    kr_for_cg = None
-    for row in cg_rows:
-        if row.backend not in seen_backends:
-            seen_backends.add(row.backend)
-            backends_to_time.append(row.backend)
-            if partition_for_cg is None:
-                partition_for_cg = row.partition
-                kr_for_cg = row.kernel_root
-
-    cg_results = {}
-    if backends_to_time and kr_for_cg is not None:
+    for row in rows[1:]:
+        if row.backend == TORCH_COMPILE_BACKEND:
+            continue
+        if row.spec is None:
+            continue
         if _is_rank0():
-            print(f"Timing CUDA graph backends: {', '.join(backends_to_time)} ...", flush=True)
+            print(f"Row {row.partition}/{row.backend}: {len(row.ops)} ops", flush=True)
         try:
-            timing = _time_cudagraph_backends(
-                model, tokenizer, PROMPTS, kr_for_cg, backends_to_time,
-                max_new_tokens=64, warmup=warmup, repeat=repeat,
-            )
-            for backend, ms in timing.items():
-                cg_results[backend] = (partition_for_cg, ms)
+            with patch_real_model(model, row, strict_kernel_use=False) as stats:
                 if _is_rank0():
-                    print(f"  {backend}: {ms:.1f}ms", flush=True)
+                    print("  warmup ...", flush=True)
+                _time_generation(model, tokenizer, PROMPTS,
+                                  max_new_tokens=MAX_NEW_TOKENS, warmup=1, repeat=1)
+                if _is_rank0():
+                    print("  timed run ...", flush=True)
+                ms = _time_generation(model, tokenizer, PROMPTS,
+                                       max_new_tokens=MAX_NEW_TOKENS, warmup=0, repeat=3)
+            row_results.append(RowResult(
+                row.partition, row.backend, ms, _resolve_selected_backends(row),
+            ))
+            if _is_rank0():
+                print(f"  {ms:.1f}ms", flush=True)
+        except Exception as exc:
+            if _is_rank0():
+                print(f"  Skipping: {exc}", flush=True)
+
+    cg_candidates = [
+        r for r in rows
+        if r.spec is not None and _can_use_fused_patches(r) and r.backend in CONCRETE_BACKENDS
+    ]
+    cg_backends = sorted({r.backend for r in cg_candidates})
+
+    if cg_candidates:
+        ref_row = cg_candidates[0]
+        kr = ref_row.kernel_root or ref_row.spec.kernel_root
+
+        try:
+            from benchmarks.gsm8k.flat_decode import build_flat_decode
+
+            if _is_rank0():
+                print("CUDA graph: prefill ...", flush=True)
+            first_prompt = tokenizer.encode(PROMPTS[0])
+            tok = torch.tensor([first_prompt], dtype=torch.long, device="cuda")
+            model.forward(tok, 0)
+            torch.cuda.synchronize()
+            prompt_len = len(first_prompt)
+            max_seq = prompt_len + MAX_NEW_TOKENS
+            n_decode = MAX_NEW_TOKENS * len(PROMPTS)
+
+            for cg_backend in cg_backends:
+                if _is_rank0():
+                    print(f"Row {ref_row.partition}/{cg_backend}: flat decode + CUDA graph", flush=True)
+                try:
+                    flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
+                        model, kr, backend=cg_backend, max_seq_len=max_seq,
+                    )
+                    static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
+                    for i in range(min(5, prompt_len)):
+                        update_bufs(prompt_len + i)
+                        static_tok.fill_(0)
+                        flat_cg_fn(static_tok)
+                    torch.cuda.synchronize()
+
+                    update_bufs(prompt_len + 10)
+                    flat_cg_fn(static_tok)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        flat_cg_fn(static_tok)
+                    torch.cuda.synchronize()
+
+                    for _ in range(warmup):
+                        for i in range(n_decode):
+                            update_bufs(prompt_len + (i % MAX_NEW_TOKENS))
+                            graph.replay()
+                    torch.cuda.synchronize()
+
+                    times = []
+                    for _ in range(repeat):
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        for i in range(n_decode):
+                            update_bufs(prompt_len + (i % MAX_NEW_TOKENS))
+                            graph.replay()
+                        end.record()
+                        torch.cuda.synchronize()
+                        times.append(start.elapsed_time(end))
+                    ms = sum(times) / len(times)
+
+                    cg_partition = ref_row.partition
+                    new_results = []
+                    for r in row_results:
+                        if r.partition == cg_partition and r.backend == cg_backend:
+                            new_results.append(RowResult(r.partition, r.backend, ms, r.selected_backends))
+                        else:
+                            new_results.append(r)
+                    row_results = new_results
+                    if _is_rank0():
+                        print(f"  {ms:.1f}ms", flush=True)
+                except Exception as exc:
+                    if _is_rank0():
+                        print(f"  {cg_backend} failed: {exc}", flush=True)
         except Exception as exc:
             if _is_rank0():
                 import traceback
-                print(f"  FAILED: {exc}", flush=True)
+                print(f"  CUDA graph prefill failed: {exc}", flush=True)
                 traceback.print_exc()
 
     return {
+        "rows": row_results,
         "baseline_ms": baseline_ms,
-        "compile_ms": compile_ms,
-        "cg_results": cg_results,
         "partition_model": partition_model,
         "hardware": _hardware_info("cuda:0"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
+def _format_backend(r):
+    if r.backend == "best" and r.selected_backends:
+        ops = ", ".join(f"{k}={v[0]}" for k, v in sorted(r.selected_backends.items()))
+        return f"best ({ops})"
+    return r.backend
+
+
 def _render_markdown(report, slug):
+    rows = sorted(report["rows"], key=lambda r: r.total_ms)
+    baseline_ms = report["baseline_ms"]
+    winner = rows[0]
+
     lines = [
         f"# Real Arithmetic Benchmark: {slug}",
         "",
         f"**Model**: {EVAL_MODEL}",
         f"**Partition model**: {report['partition_model']}",
         f"**GPU**: {report['hardware'].get('gpu', 'unknown')}",
+        f"**CUDA**: {report['hardware'].get('cuda', 'unknown')}",
         f"**PyTorch**: {torch.__version__}",
         f"**Date**: {report['timestamp']}",
-        f"**Decode tokens**: {64 * len(PROMPTS)} ({len(PROMPTS)} prompts x 64 tokens)",
+        f"**Prompts**: {len(PROMPTS)} arithmetic identities, {MAX_NEW_TOKENS} decode tokens each",
         "",
+        "## Winner",
+        "",
+        f"**{winner.partition}/{_format_backend(winner)}** ({baseline_ms / winner.total_ms:.3f}x vs baseline)",
+        f"Aggregate: {winner.total_ms:.1f}ms",
+        "",
+        "## Leaderboard",
+        "",
+        "| # | partition | backend | total (ms) | vs baseline |",
+        "|---|---|---|---|---|",
     ]
-
-    rows = []
-    rows.append(("baseline", "torch", report["baseline_ms"]))
-    rows.append(("baseline", "torch.compile", report["compile_ms"]))
-    for backend, (partition, ms) in report["cg_results"].items():
-        rows.append((partition, backend, ms))
-    rows.sort(key=lambda r: r[2])
-
-    baseline_ms = report["baseline_ms"]
-    winner = rows[0]
-    lines.append(f"## Winner")
-    lines.append(f"")
-    lines.append(f"**{winner[0]}/{winner[1]}** ({baseline_ms / winner[2]:.3f}x vs baseline)")
-    lines.append(f"Aggregate: {winner[2]:.1f}ms")
-    lines.append("")
-    lines.append("## Leaderboard")
-    lines.append("")
-    lines.append("| # | partition | backend | total (ms) | vs baseline |")
-    lines.append("|---|---|---|---|---|")
-    for i, (partition, backend, ms) in enumerate(rows):
-        speedup = baseline_ms / ms
-        lines.append(f"| {i+1} | {partition} | {backend} | {ms:.1f} | {speedup:.3f}x |")
+    for i, r in enumerate(rows):
+        speedup = baseline_ms / r.total_ms
+        lines.append(f"| {i+1} | {r.partition} | {_format_backend(r)} | {r.total_ms:.1f} | {speedup:.3f}x |")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -325,7 +374,7 @@ def main(argv=None):
         return
 
     slug = _hardware_slug("cuda:0")
-    output = args.output or Path(__file__).parent / "results" / args.partition_model / f"{slug}_real.md"
+    output = args.output or Path(__file__).parent / "results" / args.partition_model / f"{slug}.md"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_render_markdown(report, slug))
     print(f"\nSaved to {output}")
