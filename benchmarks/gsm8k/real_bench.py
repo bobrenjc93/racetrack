@@ -328,13 +328,7 @@ def _evaluate_row_cudagraph_prebuilt(
         tokens = torch.full((1, total_len), -1, dtype=torch.long, device="cuda")
         tokens[0, :prompt_len] = torch.tensor(prompt_tokens, dtype=torch.long, device="cuda")
 
-        # Prefill: feed prompt tokens one-by-one through flat decode
-        for pos in range(prompt_len):
-            static_tok.fill_(tokens[0, pos].item())
-            update_bufs(pos)
-            flat_cg_fn(static_tok)
-
-        # Decode: use CUDA graph for remaining tokens
+        # Decode: use CUDA graph (KV cache prefilled by model.forward before build_flat_decode)
         for cur_pos in range(prompt_len, total_len):
             prev_pos = cur_pos - 1
             static_tok.fill_(tokens[0, prev_pos].item())
