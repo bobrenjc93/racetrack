@@ -5,8 +5,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 try:
-    import cutlass  # noqa: F401
-    import cutlass.cute as cute  # noqa: F401
+    import helion  # noqa: F401
 
     BACKEND_AVAILABLE = True
 except Exception:
@@ -39,26 +38,27 @@ def _cached_cat(*tensors: torch.Tensor | None) -> torch.Tensor | None:
     return cached
 
 
-def fused_norm_rope(
-    q_c,
-    q_weight,
-    kv_c,
-    kv_weight,
-    k_pe,
-    positions,
+def fused_rope(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
     *,
-    eps,
-    rope_base,
     fallback,
-):
+) -> torch.Tensor:
+    return fallback(x, freqs_cis)
+
+
+def fused_score_softmax(
+    scores_nope: torch.Tensor,
+    scores_rope: torch.Tensor,
+    index_mask: torch.Tensor,
+    *,
+    softmax_scale: float,
+    fallback,
+) -> torch.Tensor:
     return fallback(
-        q_c, q_weight, kv_c, kv_weight, k_pe, positions,
-        eps=eps, rope_base=rope_base,
+        scores_nope, scores_rope, index_mask,
+        softmax_scale=softmax_scale,
     )
-
-
-# fused_residual_norm → see residual_norm.py
-# fused_swiglu → see swiglu.py
 
 
 def fused_full_topk_indexer(
@@ -181,42 +181,3 @@ def fused_single_token_moe(
     if real_model.world_size > 1:
         dist.all_reduce(y)
     return y.type_as(flat).view(shape)
-
-
-def fused_rope(
-    x: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    *,
-    fallback,
-) -> torch.Tensor:
-    return fallback(x, freqs_cis)
-
-
-def fused_score_softmax(
-    scores_nope: torch.Tensor,
-    scores_rope: torch.Tensor,
-    index_mask: torch.Tensor,
-    *,
-    softmax_scale: float,
-    fallback,
-) -> torch.Tensor:
-    return fallback(
-        scores_nope, scores_rope, index_mask,
-        softmax_scale=softmax_scale,
-    )
-
-
-def hc_head(
-    hidden_states,
-    hc_fn,
-    hc_scale,
-    hc_base,
-    *,
-    rms_norm_eps,
-    hc_eps,
-    fallback,
-):
-    return fallback(
-        hidden_states, hc_fn, hc_scale, hc_base,
-        rms_norm_eps=rms_norm_eps, hc_eps=hc_eps,
-    )

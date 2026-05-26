@@ -107,6 +107,16 @@ def fused_single_token_moe(
     return y.type_as(flat).view(shape)
 
 
+def fused_norm_rope(
+    q_c, q_weight, kv_c, kv_weight, k_pe, positions,
+    *, eps, rope_base, fallback,
+):
+    return fallback(
+        q_c, q_weight, kv_c, kv_weight, k_pe, positions,
+        eps=eps, rope_base=rope_base,
+    )
+
+
 def fused_qkv_proj(
     normed_x,
     wq_a_weight,
