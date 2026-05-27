@@ -102,8 +102,8 @@ def fp8_gemm_tc(
 
     if M > 16:
         # Large M: fallback to original (well-tuned for larger M)
-        from inference.kernel import act_quant, fp8_gemm
-        from inference.model import block_size
+        from racetrack.models.deepseek import act_quant, fp8_gemm
+        from racetrack.models.deepseek import block_size
         xq, xs = act_quant(a_bf16, block_size)
         return fp8_gemm(xq, xs, b_fp8, b_scale).view(*orig_shape[:-1], N)
 

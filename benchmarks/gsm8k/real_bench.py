@@ -1,6 +1,6 @@
 """Real-weight end-to-end GSM8K leaderboard for patched partition kernels.
 
-This runner loads the checkpoint-backed ``inference.model.Transformer`` once,
+This runner loads the checkpoint-backed ``racetrack.models.deepseek.Transformer`` once,
 evaluates the baseline, and then evaluates full-model rows where compatible
 partition-local kernels are patched into the real model. Unlike
 ``benchmarks.gsm8k.bench``, rows here generate GSM8K answers with real weights
@@ -140,7 +140,7 @@ def _load_model_and_tokenizer(
         load_hf_sharded_weights,
         run_post_load_transforms,
     )
-    from inference.model import ModelArgs, Transformer
+    from racetrack.models.deepseek import ModelArgs, Transformer
 
     world_size = _world_size()
     rank = _rank()

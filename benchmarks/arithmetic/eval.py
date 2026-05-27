@@ -165,7 +165,7 @@ def evaluate(
     from safetensors.torch import load_model
     from transformers import PreTrainedTokenizerFast
 
-    from inference.model import ModelArgs, Transformer
+    from racetrack.models.deepseek import ModelArgs, Transformer
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))

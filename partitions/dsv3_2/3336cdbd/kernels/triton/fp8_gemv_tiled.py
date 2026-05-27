@@ -91,8 +91,8 @@ def fp8_gemv_tiled(
     x_flat = x_bf16.contiguous().view(-1, K)
 
     if x_flat.shape[0] != 1:
-        from inference.kernel import act_quant, fp8_gemm
-        from inference.model import block_size
+        from racetrack.models.deepseek import act_quant, fp8_gemm
+        from racetrack.models.deepseek import block_size
         xq, xs = act_quant(x_flat, block_size)
         return fp8_gemm(xq, xs, w_fp8, w_scale).view(*orig_shape[:-1], w_fp8.shape[0])
 

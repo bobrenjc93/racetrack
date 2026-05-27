@@ -238,7 +238,7 @@ def _attach_kernel_dispatcher_for_fx_ops(
     modules and routes through it. This handles fused_swiglu on MLP/Expert
     and fused_residual_norm on RMSNorm when NOT using torch.compile.
     """
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     from racetrack.pre_trace import _set_attr
 
     fx_op_names = {op.name for op in spec.fx_ops}

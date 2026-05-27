@@ -87,7 +87,7 @@ def _patch_full_topk_indexer(
     dispatcher: KernelDispatcher,
     originals: Originals,
 ) -> None:
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
 
     kernel_fn = _resolve_kernel(dispatcher, "fused_full_topk_indexer")
 
@@ -130,7 +130,7 @@ def _patch_full_topk_indexer(
 
 
 def _mla_full_topk_forward(module, x, start_pos, freqs_cis, mask):
-    from inference import model as real_model
+    from racetrack.models import deepseek as real_model
 
     bsz, seqlen, _ = x.size()
     end_pos = start_pos + seqlen
@@ -179,7 +179,7 @@ def _patch_single_token_moe(
     dispatcher: KernelDispatcher,
     originals: Originals,
 ) -> None:
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
 
     kernel_fn = _resolve_kernel(dispatcher, "fused_single_token_moe")
     if kernel_fn is None:
@@ -206,7 +206,7 @@ def _patch_mlp_gate_up_proj(
     dispatcher: KernelDispatcher,
     originals: Originals,
 ) -> None:
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
 
     gate_up_fn = _resolve_kernel(dispatcher, "fused_mlp_gate_up_proj")
     swiglu_fn = _resolve_kernel(dispatcher, "fused_swiglu")
@@ -255,7 +255,7 @@ def _patch_attn_norm_qkv(
     kernel_fn = _resolve_kernel(dispatcher, "fused_attn_norm_qkv")
     if kernel_fn is None:
         return
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if not isinstance(module, rm.RMSNorm):
             _set_attr(module, "kernel_dispatcher", dispatcher, originals)
@@ -271,7 +271,7 @@ def _patch_qkv_proj_rope(
     kernel_fn = _resolve_kernel(dispatcher, "fused_qkv_proj_rope")
     if kernel_fn is None:
         return
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if not isinstance(module, rm.MLA):
             continue
@@ -293,7 +293,7 @@ def _patch_ar_rms_qkv_proj(
     kernel_fn = _resolve_kernel(dispatcher, "fused_ar_rms_qkv_proj")
     if kernel_fn is None:
         return
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if isinstance(module, (rm.RMSNorm, rm.MLA)):
             _set_attr(module, "kernel_dispatcher", dispatcher, originals)
@@ -309,7 +309,7 @@ def _patch_indexer_k_path(
     kernel_fn = _resolve_kernel(dispatcher, "fused_indexer_k_path")
     if kernel_fn is None:
         return
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if isinstance(module, rm.Indexer):
             _set_attr(module, "kernel_dispatcher", dispatcher, originals)
@@ -325,7 +325,7 @@ def _patch_q_indexer_score(
     kernel_fn = _resolve_kernel(dispatcher, "fused_q_indexer_score")
     if kernel_fn is None:
         return
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if isinstance(module, rm.MLA):
             _set_attr(module, "kernel_dispatcher", dispatcher, originals)
@@ -341,7 +341,7 @@ def _patch_q_rope_quant(
     kernel_fn = _resolve_kernel(dispatcher, "fused_q_rope_quant")
     if kernel_fn is None:
         return
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if isinstance(module, rm.MLA):
             _set_attr(module, "kernel_dispatcher", dispatcher, originals)
@@ -357,7 +357,7 @@ def _patch_prefill_qkv_b_rope_cache(
     kernel_fn = _resolve_kernel(dispatcher, "fused_prefill_qkv_b_rope_cache")
     if kernel_fn is None:
         return
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if isinstance(module, rm.MLA):
             _set_attr(module, "kernel_dispatcher", dispatcher, originals)

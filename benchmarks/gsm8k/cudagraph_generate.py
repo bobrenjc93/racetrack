@@ -37,7 +37,7 @@ def patch_for_cudagraph(model: torch.nn.Module, kernel_root: Path, *, stack_moe:
 
     Returns a list of (module, attr_name, original_value) for rollback.
     """
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
 
     kernels = {}
     for name in ("residual_norm", "swiglu", "act_quant", "fused_rope"):
@@ -113,7 +113,7 @@ def _make_linear_forward(module, kernels):
         return module.forward
 
     def forward(x):
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
         xq, xs = aq.fused_act_quant(x, fallback=None)
         y = fp8_gemm(xq, xs, module.weight, module.weight.scale)
         if getattr(module, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
@@ -170,7 +170,7 @@ def _make_mlp_forward(module, kernels):
     w2_fp8 = module.w2.weight.dtype == torch.float8_e4m3fn
 
     def forward(x):
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
         gate = _fused_linear(x, module.w1, aq)
         up = _fused_linear(x, module.w3, aq)
         if w2_fp8:
@@ -190,7 +190,7 @@ def _make_mlp_forward(module, kernels):
 
 def _fused_linear(x, linear_mod, aq):
     if linear_mod.weight.dtype == torch.float8_e4m3fn:
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
         xq, xs = aq.fused_act_quant(x, fallback=None)
         y = fp8_gemm(xq, xs, linear_mod.weight, linear_mod.weight.scale)
         if getattr(linear_mod, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
@@ -203,7 +203,7 @@ def _fused_linear(x, linear_mod, aq):
 
 def _make_gate_forward(module):
     def forward(x):
-        from inference.model import linear
+        from racetrack.models.deepseek import linear
         scores = linear(x.float(), module.weight.float())
         if module.score_func == "softmax":
             scores = scores.softmax(dim=-1)
@@ -269,7 +269,7 @@ def _make_moe_forward(module, kernels):
     torch.cuda.empty_cache()
 
     def forward(x):
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
         shape = x.size()
         x_flat = x.view(-1, module.dim)
         weights, indices = module.gate(x_flat)
@@ -315,8 +315,8 @@ def _make_mla_forward(module, kernels):
     def forward(x, start_pos, freqs_cis, mask):
         if mask is not None:
             return original(x, start_pos, freqs_cis, mask)
-        from inference.model import apply_rotary_emb, weight_dequant
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import apply_rotary_emb, weight_dequant
+        from racetrack.models.deepseek import fp8_gemm
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
 
@@ -369,7 +369,7 @@ def _make_mla_forward(module, kernels):
 
 
 def _get_wkv_b(module):
-    from inference.model import weight_dequant
+    from racetrack.models.deepseek import weight_dequant
     if module.dequant_wkv_b is None and module.wkv_b.scale is not None:
         module.dequant_wkv_b = weight_dequant(module.wkv_b.weight, module.wkv_b.scale)
     wkv_b = module.wkv_b.weight if module.dequant_wkv_b is None else module.dequant_wkv_b
@@ -412,7 +412,7 @@ def _patch_mla_for_cudagraph_gen(model, max_seq_len):
     Instead of kv_cache[:, :end_pos] (variable slice), reads full cache
     and masks out future positions via static_attn_mask.
     """
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
 
     originals = []
     attn_masks = []
@@ -443,7 +443,7 @@ def _patch_mla_for_cudagraph_gen(model, max_seq_len):
 
 def _mla_cudagraph_decode(module, x, freqs_cis, attn_mask):
     """MLA decode step that reads full cache + uses attn_mask. CUDA-graph-safe."""
-    from inference.model import apply_rotary_emb, weight_dequant
+    from racetrack.models.deepseek import apply_rotary_emb, weight_dequant
 
     bsz, seqlen, _ = x.size()
     max_t = module.kv_cache.shape[1]

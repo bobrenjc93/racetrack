@@ -35,16 +35,16 @@ _cached_model_id = None
 def build_flat_decode(model, kernel_root: Path | None = None, backend: str | None = None, max_seq_len: int | None = None):
     """Build a flat decode function from the model + optional partition kernels.
 
-    When kernel_root is None, uses inference.kernel defaults (baseline mode).
+    When kernel_root is None, uses racetrack.models.deepseek defaults (baseline mode).
     When backend is specified, only loads kernels from that backend directory.
     max_seq_len overrides the model's max_seq_len for cache/attention sizing.
     Returns (flat_decode, flat_decode_cg, update_bufs, static_logits).
     """
     global _cached_layers, _cached_model_id
 
-    from inference.model import apply_rotary_emb, weight_dequant
-    from inference.kernel import fp8_gemm
-    from inference import kernel as inf_kernel
+    from racetrack.models.deepseek import apply_rotary_emb, weight_dequant
+    from racetrack.models.deepseek import fp8_gemm
+    from racetrack.models import deepseek as inf_kernel
 
     aq = _load_kernel(kernel_root, "act_quant", backend) if kernel_root else None
     rn = _load_kernel(kernel_root, "residual_norm", backend) if kernel_root else None
@@ -329,7 +329,7 @@ def _get_or_alloc_cache(mla, name, dim, max_t=4096):
 
 def _extract_layer(layer, aq, rn, ws, max_t=4096):
     """Extract all parameters from a layer into a flat dict for fast access."""
-    from inference.model import weight_dequant, MoE, MLP
+    from racetrack.models.deepseek import weight_dequant, MoE, MLP
 
     mla = layer.attn
     ffn = layer.ffn

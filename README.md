@@ -143,7 +143,7 @@ torchrun --standalone --nproc-per-node=8 \
 The runner requires a Hugging Face token via `--hf-token`, `HF_TOKEN`, or
 `hf_token=...` in `~/.env`. Rows are only emitted for partition kernels with a
 real-model adapter; unsupported synthetic-only fusions are excluded until they
-can be bound to checkpoint-backed `inference.model.Transformer` modules.
+can be bound to checkpoint-backed `racetrack.models.deepseek.Transformer` modules.
 If the converted checkpoint is not available, pass `--hf-direct` to stream the
 Hugging Face shards and slice the tensor-parallel weights on each rank.
 After loading weights, the runner calls module post-load hooks such as

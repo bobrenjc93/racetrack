@@ -23,7 +23,7 @@ def fused_single_token_moe(
     if flat.shape[0] != 1:
         return fallback(moe, x)
 
-    from inference import model as real_model
+    from racetrack.models import deepseek as real_model
 
     weights, indices = moe.gate(flat)
     y = torch.zeros_like(flat, dtype=torch.float32)

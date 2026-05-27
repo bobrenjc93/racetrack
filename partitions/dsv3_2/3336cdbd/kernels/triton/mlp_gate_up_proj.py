@@ -52,7 +52,7 @@ def fused_mlp_gate_up_proj(
     if w1_weight.dtype != torch.float8_e4m3fn:
         gate_up = F.linear(x, _cached_cat(w1_weight, w3_weight))
     else:
-        from inference import model as real_model
+        from racetrack.models import deepseek as real_model
 
         x_fp8, x_scale = real_model.act_quant(x, real_model.block_size, scale_fmt)
         gate_up = real_model.fp8_gemm(

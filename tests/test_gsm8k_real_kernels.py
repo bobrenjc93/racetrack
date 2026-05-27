@@ -46,7 +46,7 @@ def test_real_kernel_patcher_uses_real_module_weights(tmp_path) -> None:
         )
     )
 
-    from inference.model import MLP, RMSNorm
+    from racetrack.models.deepseek import MLP, RMSNorm
 
     class Tiny(torch.nn.Module):
         def __init__(self) -> None:
@@ -111,7 +111,7 @@ def test_dsv3_2_residual_norm_adapter_handles_legacy_kernel_contract(tmp_path) -
         )
     )
 
-    from inference.model import RMSNorm
+    from racetrack.models.deepseek import RMSNorm
 
     class Tiny(torch.nn.Module):
         def __init__(self) -> None:
@@ -167,7 +167,7 @@ def test_dsv3_2_swiglu_adapter_handles_legacy_kernel_contract(tmp_path) -> None:
         )
     )
 
-    from inference.model import MLP
+    from racetrack.models.deepseek import MLP
 
     model = MLP(8, 16).float().eval()
     with torch.no_grad():
@@ -253,7 +253,7 @@ def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
         )
     )
 
-    from inference.model import MLP
+    from racetrack.models.deepseek import MLP
 
     model = MLP(8, 16).float().eval()
     x = torch.randn(2, 3, 8)
@@ -301,7 +301,7 @@ def test_real_kernel_patcher_can_route_indexer_forward(tmp_path) -> None:
         )
     )
 
-    from inference import model as real_model
+    from racetrack.models import deepseek as real_model
 
     class TinyIndexer(real_model.Indexer):
         def __init__(self) -> None:
@@ -354,7 +354,7 @@ def test_real_kernel_patcher_can_route_moe_forward(tmp_path) -> None:
         )
     )
 
-    from inference import model as real_model
+    from racetrack.models import deepseek as real_model
 
     class TinyMoE(real_model.MoE):
         def __init__(self) -> None:
@@ -409,7 +409,7 @@ def test_real_kernel_patcher_can_route_mlp_gate_up_projection(tmp_path) -> None:
         )
     )
 
-    from inference.model import MLP
+    from racetrack.models.deepseek import MLP
 
     model = MLP(8, 16).float().eval()
     with torch.no_grad():

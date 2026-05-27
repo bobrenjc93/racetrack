@@ -28,7 +28,7 @@ def load_hf_sharded_weights(
     rank: int,
     world_size: int,
 ) -> int:
-    """Load HF-format shards into ``inference.model.Transformer``.
+    """Load HF-format shards into ``racetrack.models.deepseek.Transformer``.
 
     The HF checkpoint stores full tensors. The inference model is tensor
     parallel, so this loader slices column-parallel rows, row-parallel columns,

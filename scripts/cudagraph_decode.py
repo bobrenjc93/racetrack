@@ -39,7 +39,7 @@ def main():
 
     from benchmarks.gsm8k.hf_model_loader import load_hf_sharded_weights, run_post_load_transforms
     from benchmarks.gsm8k.eval import DSV3_2_CONFIG
-    from inference.model import ModelArgs, Transformer
+    from racetrack.models.deepseek import ModelArgs, Transformer
     from benchmarks.gsm8k.hf_auth import require_hf_token
 
     config = dict(DSV3_2_CONFIG)
@@ -145,7 +145,7 @@ def main():
 
 
 def patch_for_cudagraph(model):
-    from inference import model as rm
+    from racetrack.models import deepseek as rm
     for module in model.modules():
         if isinstance(module, rm.Indexer):
             _patch_indexer_shortcircuit(module)
@@ -185,7 +185,7 @@ def _patch_linear_global(module):
     """Patch ALL FP8 Linear modules: fused_act_quant + fp8_gemm, no redundant casts."""
     aq = KERNELS['act_quant']
     def forward(x):
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
         xq, xs = aq.fused_act_quant(x, fallback=None)
         y = fp8_gemm(xq, xs, module.weight, module.weight.scale)
         if getattr(module, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
@@ -244,7 +244,7 @@ def _patch_mlp(module):
     w2_is_fp8 = module.w2.weight.dtype == torch.float8_e4m3fn
 
     def forward(x):
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
         gate = _fused_linear(x, module.w1, aq)
         up = _fused_linear(x, module.w3, aq)
         if w2_is_fp8:
@@ -299,7 +299,7 @@ def _patch_moe(module):
     aq_kernel = KERNELS['act_quant']
 
     def forward(x):
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
 
         shape = x.size()
         x_flat = x.view(-1, module.dim)
@@ -352,7 +352,7 @@ def _patch_moe(module):
 
 def _patch_gate(module):
     def forward(x):
-        from inference.model import linear
+        from racetrack.models.deepseek import linear
         scores = linear(x.float(), module.weight.float())
         if module.score_func == "softmax": scores = scores.softmax(dim=-1)
         else: scores = scores.sigmoid()
@@ -376,7 +376,7 @@ def _patch_gate(module):
 def _fused_linear(x, linear_mod, aq_kernel):
     """Replace Linear.forward: fused_act_quant + fp8_gemm, minimal casts."""
     if linear_mod.weight.dtype == torch.float8_e4m3fn:
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
         x_q, x_s = aq_kernel.fused_act_quant(x, fallback=None)
         y = fp8_gemm(x_q, x_s, linear_mod.weight, linear_mod.weight.scale)
         if getattr(linear_mod, 'reduce_output', False) and dist.is_initialized() and dist.get_world_size() > 1:
@@ -393,7 +393,7 @@ def _patch_mla(module):
 
     def forward(x, start_pos, freqs_cis, mask):
         if mask is not None: return original(x, start_pos, freqs_cis, mask)
-        from inference.model import apply_rotary_emb as _orig_rope, weight_dequant
+        from racetrack.models.deepseek import apply_rotary_emb as _orig_rope, weight_dequant
         ri = KERNELS.get('rope_inline')
         def apply_rope(t, fc, interleaved=True):
             if ri and interleaved:
@@ -403,7 +403,7 @@ def _patch_mla(module):
         end_pos = start_pos + seqlen
 
         # Fused act_quant for wq_a — shared with wkv_a (same input x)
-        from inference.kernel import fp8_gemm
+        from racetrack.models.deepseek import fp8_gemm
 
         # Share act_quant(x) for BOTH wq_a and wkv_a (same input)
         # Inductor does this in 1 kernel; we do 1 quant + 2 GEMMs

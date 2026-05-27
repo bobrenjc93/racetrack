@@ -56,7 +56,7 @@ def _write_indexer_k_cache(
     bsz, seqlen, _ = x.size()
     end_pos = start_pos + seqlen
 
-    from inference import model as real_model
+    from racetrack.models import deepseek as real_model
 
     k = indexer.wk(x)
     k = indexer.k_norm(k)

@@ -59,7 +59,7 @@ def _is_rank0():
 def _load_model_and_tokenizer(*, ckpt_path, hf_token, hf_direct):
     import torch.distributed as dist
     from transformers import PreTrainedTokenizerFast
-    from inference.model import ModelArgs, Transformer
+    from racetrack.models.deepseek import ModelArgs, Transformer
     from benchmarks.gsm8k.hf_model_loader import (
         load_hf_sharded_weights,
         run_post_load_transforms,
