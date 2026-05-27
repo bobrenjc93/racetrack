@@ -240,10 +240,6 @@ def _read_fused_op_graph(model_py: Path, model_dir: Path) -> dict[str, list[str]
     graph = _parse_fused_op_graph(text)
     if graph:
         return graph
-    if "partition_common" in text:
-        base_model = model_dir / "3336cdbd" / "model.py"
-        if base_model.exists():
-            return _parse_fused_op_graph(base_model.read_text())
     return {}
 
 
