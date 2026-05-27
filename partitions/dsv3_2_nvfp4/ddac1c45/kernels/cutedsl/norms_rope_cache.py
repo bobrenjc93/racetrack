@@ -65,7 +65,7 @@ def _act_quant_unit_scale(x, block_size, act_quant):
         return x.float(), None
 
 
-def fused_norms_rope_cache(
+def fused_indexer_k_path(
     q_c, q_norm_weight,
     kv_c, kv_norm_weight,
     k_pe, indexer_k,

@@ -52,7 +52,7 @@ def _fp8_index_unit_k_scale(q, q_s, k):
     return logits.sum(dim=2)
 
 
-def fused_q_rope_indexer_score(
+def fused_q_rope_quant(
     q_pe, idx_q, indexer_w,
     freqs_cis, H,
     idx_k_cache, idx_k_scale_cache,

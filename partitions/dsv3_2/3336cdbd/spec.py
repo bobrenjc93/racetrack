@@ -13,7 +13,6 @@ FUSED_OPS = [
     {"name": "fused_swiglu", "kind": "fx_pattern"},
     {"name": "fused_residual_norm", "kind": "fx_pattern"},
     {"name": "fused_act_quant", "kind": "fx_pattern"},
-    {"name": "fused_rms_norm", "kind": "fx_pattern"},
     {"name": "fused_full_topk_indexer", "kind": "pre_trace"},
     {"name": "fused_single_token_moe", "kind": "pre_trace"},
     {"name": "fused_mlp_gate_up_proj", "kind": "module_patch"},

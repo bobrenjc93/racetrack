@@ -154,7 +154,7 @@ def _cutedsl_rms_norm(x, weight, eps):
     return out.view_as(x_c)
 
 
-def fused_norms_rope_cache(
+def fused_indexer_k_path(
     q_c, q_norm_weight,
     kv_c, kv_norm_weight,
     k_pe, indexer_k,

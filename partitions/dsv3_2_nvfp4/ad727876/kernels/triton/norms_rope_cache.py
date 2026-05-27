@@ -162,7 +162,7 @@ def _rope_cache(positions, rotary_dim, *, base, dtype):
     return torch.cos(freqs).to(dtype), torch.sin(freqs).to(dtype)
 
 
-def fused_norms_rope_cache(
+def fused_indexer_k_path(
     q_c, q_norm_weight,
     kv_c, kv_norm_weight,
     k_pe, indexer_k,

@@ -56,7 +56,7 @@ def _cached_float_weight(weight):
     return cached
 
 
-def fused_qkv_proj(
+def fused_ar_rms_qkv_proj(
     normed_x, wq_a_weight, wkv_a_weight,
     indexer_wk_weight, indexer_wp_weight,
     *, q_lora_rank, kv_lora_rank, qk_rope_head_dim, fallback,

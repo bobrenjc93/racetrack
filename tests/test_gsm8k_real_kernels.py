@@ -569,8 +569,8 @@ def test_partition_spec_loads_and_discovers() -> None:
     spec = load_spec("dsv3_2", "3336cdbd")
     assert spec.model == "dsv3_2"
     assert spec.partition_hash == "3336cdbd"
-    assert len(spec.fused_ops) == 7
-    assert len(spec.fx_ops) == 4
+    assert len(spec.fused_ops) == 6
+    assert len(spec.fx_ops) == 3
     assert len(spec.pre_trace_ops) == 2
     assert len(spec.module_patch_ops) == 1
 

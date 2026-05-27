@@ -36,7 +36,7 @@ def _cached_cat_weights(*weights):
     return cached
 
 
-def fused_q_indexer_proj(
+def fused_q_indexer_score(
     qr, wq_b_weight, idx_wq_b_weight, wkv_b_weight,
     *, n_heads, qk_head_dim, qk_nope_head_dim,
     kv_lora_rank, idx_n_heads, idx_head_dim,

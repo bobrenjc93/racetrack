@@ -88,7 +88,7 @@ if BACKEND_AVAILABLE:
         return out
 
 
-def fused_q_rope_indexer_score(
+def fused_q_rope_quant(
     q_pe, idx_q, indexer_w,
     freqs_cis, H,
     idx_k_cache, idx_k_scale_cache,
