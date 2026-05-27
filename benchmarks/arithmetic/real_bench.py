@@ -244,8 +244,7 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
                     print(f"Row {ref_row.partition}/{cg_backend}: flat decode + CUDA graph", flush=True)
                 try:
                     flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
-                        model, kr,
-                        backend=None if cg_backend == "best" else cg_backend,
+                        model, kr, backend=cg_backend,
                         max_seq_len=max_seq,
                     )
                     static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")

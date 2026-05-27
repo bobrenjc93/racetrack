@@ -583,8 +583,7 @@ def run(
                     if _is_rank0():
                         print("  building flat decode ...", flush=True)
                     flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
-                        model, kr,
-                        backend=None if cg_backend == "best" else cg_backend,
+                        model, kr, backend=cg_backend,
                         max_seq_len=cg_max_seq,
                     )
 

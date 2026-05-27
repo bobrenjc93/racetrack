@@ -28,6 +28,18 @@ def _load_kernel(kernel_root: Path, name: str, backend: str | None = None):
     return None
 
 
+def _load_best_json(kernel_root: Path) -> dict[str, str]:
+    import json
+    path = kernel_root / "best.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 _cached_layers = None
 _cached_model_id = None
 
@@ -37,6 +49,7 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
 
     When kernel_root is None, uses racetrack.models.deepseek defaults (baseline mode).
     When backend is specified, only loads kernels from that backend directory.
+    When backend is "best", reads best.json to pick the winning backend per op.
     max_seq_len overrides the model's max_seq_len for cache/attention sizing.
     Returns (flat_decode, flat_decode_cg, update_bufs, static_logits).
     """
@@ -46,9 +59,18 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
     from racetrack.models.deepseek import fp8_gemm
     from racetrack.models import deepseek as inf_kernel
 
-    aq = _load_kernel(kernel_root, "act_quant", backend) if kernel_root else None
-    rn = _load_kernel(kernel_root, "residual_norm", backend) if kernel_root else None
-    fr = _load_kernel(kernel_root, "fused_rope", backend) if kernel_root else None
+    if backend == "best" and kernel_root:
+        best_map = _load_best_json(kernel_root)
+        def _load_best(name):
+            b = best_map.get(f"fused_{name}") or best_map.get(name)
+            return _load_kernel(kernel_root, name, b)
+        aq = _load_best("act_quant")
+        rn = _load_best("residual_norm")
+        fr = _load_best("fused_rope")
+    else:
+        aq = _load_kernel(kernel_root, "act_quant", backend) if kernel_root else None
+        rn = _load_kernel(kernel_root, "residual_norm", backend) if kernel_root else None
+        fr = _load_kernel(kernel_root, "fused_rope", backend) if kernel_root else None
 
     ws = dist.get_world_size() if dist.is_initialized() else 1
 
