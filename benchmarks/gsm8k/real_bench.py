@@ -549,7 +549,8 @@ def run(
     # This must run LAST because it stacks MoE weights and destroys experts.
     cg_candidates = [
         r for r in rows
-        if r.spec is not None and _can_use_fused_patches(r) and r.backend in CONCRETE_BACKENDS
+        if r.spec is not None and _can_use_fused_patches(r)
+        and r.backend in (*CONCRETE_BACKENDS, "best")
     ]
     cg_backends_to_run = sorted({r.backend for r in cg_candidates})
     if cg_candidates:
@@ -582,7 +583,9 @@ def run(
                     if _is_rank0():
                         print("  building flat decode ...", flush=True)
                     flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
-                        model, kr, backend=cg_backend, max_seq_len=cg_max_seq,
+                        model, kr,
+                        backend=None if cg_backend == "best" else cg_backend,
+                        max_seq_len=cg_max_seq,
                     )
 
                     if _is_rank0():

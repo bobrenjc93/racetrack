@@ -217,7 +217,8 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
 
     cg_candidates = [
         r for r in rows
-        if r.spec is not None and _can_use_fused_patches(r) and r.backend in CONCRETE_BACKENDS
+        if r.spec is not None and _can_use_fused_patches(r)
+        and r.backend in (*CONCRETE_BACKENDS, "best")
     ]
     cg_backends = sorted({r.backend for r in cg_candidates})
 
@@ -243,7 +244,9 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
                     print(f"Row {ref_row.partition}/{cg_backend}: flat decode + CUDA graph", flush=True)
                 try:
                     flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
-                        model, kr, backend=cg_backend, max_seq_len=max_seq,
+                        model, kr,
+                        backend=None if cg_backend == "best" else cg_backend,
+                        max_seq_len=max_seq,
                     )
                     static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
                     for i in range(min(5, prompt_len)):
