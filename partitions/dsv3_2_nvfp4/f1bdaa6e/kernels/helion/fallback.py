@@ -11,16 +11,6 @@ except Exception:
     BACKEND_AVAILABLE = False
 
 
-def fused_norm_rope(
-    q_c, q_weight, kv_c, kv_weight, k_pe, positions,
-    *, eps, rope_base, fallback,
-):
-    return fallback(
-        q_c, q_weight, kv_c, kv_weight, k_pe, positions,
-        eps=eps, rope_base=rope_base,
-    )
-
-
 def fused_full_topk_indexer(
     indexer,
     x: torch.Tensor,
@@ -114,21 +104,6 @@ def fused_single_token_moe(
     if real_model.world_size > 1:
         dist.all_reduce(y)
     return y.type_as(flat).view(shape)
-
-
-def fused_residual_norm(
-    x,
-    residual,
-    weight,
-    *,
-    eps,
-    fallback,
-):
-    return fallback(x, residual, weight, eps=eps)
-
-
-def fused_swiglu(gate, up, *, fallback):
-    return fallback(gate, up)
 
 
 def fused_qkv_proj(

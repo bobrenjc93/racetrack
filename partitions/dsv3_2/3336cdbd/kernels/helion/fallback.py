@@ -38,29 +38,6 @@ def _cached_cat(*tensors: torch.Tensor | None) -> torch.Tensor | None:
     return cached
 
 
-def fused_rope(
-    x: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    *,
-    fallback,
-) -> torch.Tensor:
-    return fallback(x, freqs_cis)
-
-
-def fused_score_softmax(
-    scores_nope: torch.Tensor,
-    scores_rope: torch.Tensor,
-    index_mask: torch.Tensor,
-    *,
-    softmax_scale: float,
-    fallback,
-) -> torch.Tensor:
-    return fallback(
-        scores_nope, scores_rope, index_mask,
-        softmax_scale=softmax_scale,
-    )
-
-
 def fused_full_topk_indexer(
     indexer,
     x: torch.Tensor,

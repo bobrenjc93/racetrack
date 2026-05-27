@@ -106,21 +106,6 @@ def fused_single_token_moe(
     return y.type_as(flat).view(shape)
 
 
-def fused_residual_norm(
-    x,
-    residual,
-    weight,
-    *,
-    eps,
-    fallback,
-):
-    return fallback(x, residual, weight, eps=eps)
-
-
-def fused_swiglu(gate, up, *, fallback):
-    return fallback(gate, up)
-
-
 def fused_qkv_proj(
     normed_x,
     wq_a_weight,
