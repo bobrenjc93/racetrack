@@ -182,3 +182,33 @@ def test_best_backend_not_slower_than_concrete(md_path):
             f"{md_path.name} has {len(violations)} 'best' violation(s):\n"
             + "\n".join(violations)
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 3: every non-baseline partition has all 3 backends in the leaderboard
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("md_path", RESULT_FILES, ids=[str(p.relative_to(PROJECT_ROOT)) for p in RESULT_FILES])
+def test_all_partitions_have_all_backends(md_path):
+    """Every non-baseline partition in the leaderboard must have a row for
+    each of the three concrete backends (triton, cutedsl, helion) plus best.
+    A missing backend means the benchmark runner skipped or crashed on it.
+    """
+    rows = _parse_leaderboard(md_path)
+    if not rows:
+        pytest.skip("No leaderboard rows found")
+
+    expected = set(BACKENDS) | {"best"}
+    partitions = {r["partition"] for r in rows if r["partition"] != "baseline"}
+    missing = []
+
+    for partition in sorted(partitions):
+        present = {r["backend"] for r in rows if r["partition"] == partition}
+        for backend in sorted(expected - present):
+            missing.append(f"  {partition}/{backend}")
+
+    if missing:
+        pytest.fail(
+            f"{md_path.name} is missing {len(missing)} partition/backend row(s):\n"
+            + "\n".join(missing)
+        )
