@@ -65,7 +65,7 @@ def _act_quant_unit_scale(x, block_size, act_quant):
 
 
 def _autotune_effort() -> str:
-    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "quick")
+    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "none")
 
 
 if BACKEND_AVAILABLE:

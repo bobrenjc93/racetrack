@@ -60,7 +60,7 @@ def _fp8_index_unit_k_scale(q, q_s, k):
 
 
 def _autotune_effort() -> str:
-    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "quick")
+    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "none")
 
 
 if BACKEND_AVAILABLE:
