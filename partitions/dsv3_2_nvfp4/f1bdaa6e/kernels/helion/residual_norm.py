@@ -52,6 +52,12 @@ def fused_residual_norm(
     fallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del fallback
-    return _residual_norm_kernel(
-        residual.contiguous(), update.contiguous(), norm_weight.contiguous(), eps,
+    shape = residual.shape
+    cols = shape[-1]
+    n_rows = residual.numel() // cols
+    hidden, normed = _residual_norm_kernel(
+        residual.contiguous().view(n_rows, cols),
+        update.contiguous().view(n_rows, cols),
+        norm_weight.contiguous(), eps,
     )
+    return normed.view(shape), hidden.view(shape)
