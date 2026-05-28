@@ -38,9 +38,7 @@ from benchmarks.common import (
 )
 
 BACKENDS = ("torch", TORCH_COMPILE_BACKEND, *CONCRETE_BACKENDS, "best")
-REAL_DISABLED_BACKENDS = {
-    "dsv3_2": frozenset({"helion"}),
-}
+REAL_DISABLED_BACKENDS: dict[str, frozenset[str]] = {}
 
 
 @dataclass(frozen=True)

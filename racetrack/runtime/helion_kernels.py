@@ -118,14 +118,18 @@ def fused_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del fallback
     _require_helion_cuda(q_c, q_weight, kv_c, kv_weight, k_pe, positions)
-    if q_c.dim() != 2 or kv_c.dim() != 2 or k_pe.dim() != 2:
-        raise RuntimeError("Helion fused_norm_rope expects 2D tensors")
     if k_pe.shape[-1] % 2 != 0:
         raise RuntimeError("Helion fused_norm_rope requires an even RoPE dimension")
+    q_shape = q_c.shape
+    kv_shape = kv_c.shape
+    pe_shape = k_pe.shape
+    q_2d = q_c.contiguous().view(-1, q_shape[-1])
+    kv_2d = kv_c.contiguous().view(-1, kv_shape[-1])
+    pe_2d = k_pe.contiguous().view(-1, pe_shape[-1])
     return (
-        _rms_norm_kernel(q_c.contiguous(), q_weight.contiguous(), eps),
-        _rms_norm_kernel(kv_c.contiguous(), kv_weight.contiguous(), eps),
-        _rope_kernel(k_pe.contiguous(), positions.contiguous(), math.log(rope_base)),
+        _rms_norm_kernel(q_2d, q_weight.contiguous(), eps).view(q_shape),
+        _rms_norm_kernel(kv_2d, kv_weight.contiguous(), eps).view(kv_shape),
+        _rope_kernel(pe_2d, positions.contiguous(), math.log(rope_base)).view(pe_shape),
     )
 
 
@@ -139,18 +143,20 @@ def fused_residual_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del fallback
     _require_helion_cuda(residual, update, norm_weight)
-    if residual.dim() != 2 or update.dim() != 2:
-        raise RuntimeError("Helion fused_residual_norm expects 2D tensors")
     if residual.shape != update.shape:
         raise RuntimeError("Helion residual and update shapes must match")
     if norm_weight.dim() != 1 or norm_weight.shape[0] != residual.shape[-1]:
         raise RuntimeError("Helion norm weight shape must match hidden dimension")
-    return _residual_norm_kernel(
-        residual.contiguous(),
-        update.contiguous(),
+    shape = residual.shape
+    r_2d = residual.contiguous().view(-1, shape[-1])
+    u_2d = update.contiguous().view(-1, shape[-1])
+    hidden, normed = _residual_norm_kernel(
+        r_2d,
+        u_2d,
         norm_weight.contiguous(),
         eps,
     )
+    return hidden.view(shape), normed.view(shape)
 
 
 def fused_swiglu(
@@ -161,8 +167,9 @@ def fused_swiglu(
 ) -> torch.Tensor:
     del fallback
     _require_helion_cuda(gate, up)
-    if gate.dim() != 2:
-        raise RuntimeError("Helion fused_swiglu expects 2D tensors")
     if gate.shape != up.shape:
         raise RuntimeError("Helion fused_swiglu inputs must have matching shapes")
-    return _swiglu_kernel(gate.contiguous(), up.contiguous())
+    shape = gate.shape
+    gate_2d = gate.contiguous().view(-1, shape[-1])
+    up_2d = up.contiguous().view(-1, shape[-1])
+    return _swiglu_kernel(gate_2d, up_2d).view(shape)

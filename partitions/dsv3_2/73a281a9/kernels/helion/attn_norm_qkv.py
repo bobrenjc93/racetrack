@@ -46,7 +46,9 @@ def fused_attn_norm_qkv(
     *, eps, q_lora_rank, kv_lora_rank, qk_rope_head_dim, fallback,
 ):
     del fallback
-    x = _rms_norm_kernel(hidden_states.contiguous(), norm_weight.contiguous(), eps)
+    shape = hidden_states.shape
+    h_2d = hidden_states.contiguous().view(-1, shape[-1])
+    x = _rms_norm_kernel(h_2d, norm_weight.contiguous(), eps).view(shape)
     qkv = F.linear(x, qkv_weight)
     q_c, kv_c, k_pe = qkv.split(
         [q_lora_rank, kv_lora_rank, qk_rope_head_dim], dim=-1,

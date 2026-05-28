@@ -75,7 +75,8 @@ def fused_qkv_proj_rope(
     tokens = q_c.shape[0]
     log_base = math.log(rope_base)
 
-    q_c = _rms_norm_kernel(q_c.contiguous(), q_norm_weight.contiguous(), eps)
+    q_c_2d = q_c.contiguous().view(-1, q_c.shape[-1])
+    q_c = _rms_norm_kernel(q_c_2d, q_norm_weight.contiguous(), eps).view_as(q_c)
     q = F.linear(q_c, q_b_weight).view(tokens, num_heads, head_dim)
     q_nope, q_pe = q.split([nope_dim, rope_dim], dim=-1)
     q_pe_flat = q_pe.reshape(-1, rope_dim).contiguous()
@@ -83,8 +84,10 @@ def fused_qkv_proj_rope(
     q_pe_roped = _rope_kernel(q_pe_flat, pos_expanded, log_base)
     q = torch.cat((q_nope, q_pe_roped.view_as(q_pe)), dim=-1)
 
-    kv_c = _rms_norm_kernel(kv_c.contiguous(), kv_norm_weight.contiguous(), eps)
-    k_pe = _rope_kernel(k_pe.contiguous(), positions.contiguous(), log_base)
+    kv_c_2d = kv_c.contiguous().view(-1, kv_c.shape[-1])
+    kv_c = _rms_norm_kernel(kv_c_2d, kv_norm_weight.contiguous(), eps).view_as(kv_c)
+    k_pe_2d = k_pe.contiguous().view(-1, k_pe.shape[-1])
+    k_pe = _rope_kernel(k_pe_2d, positions.contiguous(), log_base).view_as(k_pe)
     kv = F.linear(kv_c, kv_b_weight).view(tokens, num_heads, nope_dim + v_head_dim)
     k_nope, v = kv.split([nope_dim, v_head_dim], dim=-1)
     k = torch.cat((k_nope, k_pe.unsqueeze(1).expand(-1, num_heads, -1)), dim=-1)

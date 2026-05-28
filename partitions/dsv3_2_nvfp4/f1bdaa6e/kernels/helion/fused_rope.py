@@ -63,7 +63,11 @@ def fused_norm_rope(
     *, eps, rope_base, fallback,
 ):
     del fallback
-    q_out = _rms_norm_kernel(q_c.contiguous(), q_weight.contiguous(), eps)
-    kv_out = _rms_norm_kernel(kv_c.contiguous(), kv_weight.contiguous(), eps)
+    q_shape = q_c.shape
+    kv_shape = kv_c.shape
+    q_2d = q_c.contiguous().view(-1, q_shape[-1])
+    kv_2d = kv_c.contiguous().view(-1, kv_shape[-1])
+    q_out = _rms_norm_kernel(q_2d, q_weight.contiguous(), eps).view(q_shape)
+    kv_out = _rms_norm_kernel(kv_2d, kv_weight.contiguous(), eps).view(kv_shape)
     k_pe_out = _apply_rope(k_pe.contiguous(), positions, rope_base=rope_base)
     return q_out, kv_out, k_pe_out

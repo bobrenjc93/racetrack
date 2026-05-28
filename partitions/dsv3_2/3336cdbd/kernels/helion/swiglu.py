@@ -43,4 +43,7 @@ def fused_swiglu(
     fallback,
 ) -> torch.Tensor:
     del fallback
-    return _swiglu_kernel(gate.contiguous(), up.contiguous())
+    shape = gate.shape
+    gate_2d = gate.contiguous().view(-1, shape[-1])
+    up_2d = up.contiguous().view(-1, shape[-1])
+    return _swiglu_kernel(gate_2d, up_2d).view(shape)

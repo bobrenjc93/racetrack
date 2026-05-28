@@ -76,8 +76,14 @@ def fused_norm_rope(
     fallback,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del fallback
+    q_shape = q_c.shape
+    kv_shape = kv_c.shape
+    pe_shape = k_pe.shape
+    q_2d = q_c.contiguous().view(-1, q_shape[-1])
+    kv_2d = kv_c.contiguous().view(-1, kv_shape[-1])
+    pe_2d = k_pe.contiguous().view(-1, pe_shape[-1])
     return (
-        _rms_norm_kernel(q_c.contiguous(), q_weight.contiguous(), eps),
-        _rms_norm_kernel(kv_c.contiguous(), kv_weight.contiguous(), eps),
-        _rope_kernel(k_pe.contiguous(), positions.contiguous(), math.log(rope_base)),
+        _rms_norm_kernel(q_2d, q_weight.contiguous(), eps).view(q_shape),
+        _rms_norm_kernel(kv_2d, kv_weight.contiguous(), eps).view(kv_shape),
+        _rope_kernel(pe_2d, positions.contiguous(), math.log(rope_base)).view(pe_shape),
     )
