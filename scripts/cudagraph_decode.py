@@ -38,7 +38,7 @@ def main():
     torch.set_default_dtype(torch.bfloat16)
 
     from benchmarks.gsm8k.hf_model_loader import load_hf_sharded_weights, run_post_load_transforms
-    from benchmarks.gsm8k.eval import DSV3_2_CONFIG
+    from benchmarks.common import DSV3_2_CONFIG
     from racetrack.models.deepseek import ModelArgs, Transformer
     from benchmarks.gsm8k.hf_auth import require_hf_token
 

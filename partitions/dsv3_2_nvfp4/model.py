@@ -1,34 +1,27 @@
 from __future__ import annotations
 
-import importlib.util
-import json
 import math
-import os
-import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import ModuleType
 from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-MODEL_NAME = "dsv3_2_nvfp4"
+from partitions._base import (
+    Fallback,
+    KernelDispatcher,
+    SwiGLUExpert,
+    rms_norm,
+)
 
-Fallback = Callable[..., Any]
+MODEL_NAME = "dsv3_2_nvfp4"
 
 
 # ---------------------------------------------------------------------------
 # Ops
 # ---------------------------------------------------------------------------
-
-
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    orig_dtype = x.dtype
-    x_float = x.float()
-    scale = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + eps)
-    return (x_float * scale * weight.float()).to(orig_dtype)
 
 
 def rms_norm_with_residual(
@@ -182,208 +175,6 @@ def causal_attention(
         scores = scores + mask.unsqueeze(2)
     scores = torch.softmax(scores, dim=-1).to(v.dtype)
     return torch.einsum("bsht,bthd->bshd", scores, v)
-
-
-# ---------------------------------------------------------------------------
-# Kernel dispatch
-# ---------------------------------------------------------------------------
-
-
-class KernelDispatcher:
-    BACKENDS = ("triton", "cutedsl", "helion")
-
-    def __init__(self, kernel_root: str | Path | None = None):
-        self.kernel_root = Path(kernel_root) if kernel_root is not None else None
-        self._modules: dict[tuple[str, str], ModuleType | None] = {}
-        self._backend_modules_cache: dict[str, list[ModuleType]] = {}
-        self._best: dict[tuple[Any, ...], str] = {}
-        self._best_ops: dict[str, set[str]] = {}
-        self._best_fast_path: dict[str, str] = {}
-        self._load_best_config()
-
-    @staticmethod
-    def selected_backend(default: str = "torch") -> str:
-        raw = os.getenv("RACETRACK_KERNEL_BACKEND", default).strip().lower()
-        if raw == "cutedl":
-            return "cutedsl"
-        return raw
-
-    def backend_status(self, backend: str) -> str:
-        if backend == "torch":
-            return "native"
-        modules = self._load_backend_modules(backend)
-        if not modules:
-            return "missing"
-        if any(bool(getattr(m, "BACKEND_AVAILABLE", False)) for m in modules):
-            return "native"
-        return "missing"
-
-    def call(
-        self,
-        op_name: str,
-        fallback: Fallback,
-        *args: Any,
-        backend: str | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        selected = backend or self.selected_backend(default="torch")
-        if selected == "all":
-            selected = "torch"
-        if selected == "torch":
-            return fallback(*args, **kwargs)
-        if selected == "best":
-            selected = self._best_fast_path.get(op_name)
-            if selected is not None and selected != "torch" and self._resolve(selected, op_name) is None:
-                selected = None
-            if selected is None:
-                selected = self._select_best(op_name, fallback, *args, **kwargs)
-                self._best_fast_path[op_name] = selected
-                self._save_best_config()
-            self._best_ops.setdefault(op_name, set()).add(selected)
-        if selected == "torch":
-            return fallback(*args, **kwargs)
-        fn = self._resolve(selected, op_name)
-        if fn is None:
-            self._handle_missing(selected, op_name)
-        return fn(*args, fallback=fallback, **kwargs)
-
-    def _handle_missing(self, backend: str, op_name: str) -> None:
-        raise RuntimeError(f"No available {backend} kernel found for {op_name}")
-
-    def _resolve(self, backend: str, op_name: str) -> Callable[..., Any] | None:
-        for module in self._load_backend_modules(backend):
-            if not bool(getattr(module, "BACKEND_AVAILABLE", False)):
-                continue
-            fn = getattr(module, op_name, None)
-            if callable(fn):
-                return fn
-        return None
-
-    def _load_backend_modules(self, backend: str) -> list[ModuleType]:
-        if backend in self._backend_modules_cache:
-            return self._backend_modules_cache[backend]
-        if self.kernel_root is None:
-            return []
-        backend_dir = self.kernel_root / backend
-        if not backend_dir.is_dir():
-            self._backend_modules_cache[backend] = []
-            return []
-        modules: list[ModuleType] = []
-        for path in sorted(backend_dir.glob("*.py")):
-            if path.name.startswith("_"):
-                continue
-            module = self._load_module(backend, path.stem)
-            if module is not None:
-                modules.append(module)
-        self._backend_modules_cache[backend] = modules
-        return modules
-
-    def _load_module(self, backend: str, module_name: str) -> ModuleType | None:
-        if self.kernel_root is None:
-            return None
-        key = (backend, module_name)
-        if key in self._modules:
-            return self._modules[key]
-        path = self.kernel_root / backend / f"{module_name}.py"
-        if not path.exists():
-            self._modules[key] = None
-            return None
-        spec_name = f"racetrack_partition_kernel_{abs(hash(path))}_{backend}_{module_name}"
-        spec = importlib.util.spec_from_file_location(spec_name, path)
-        if spec is None or spec.loader is None:
-            self._modules[key] = None
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self._modules[key] = module
-        return module
-
-    def _select_best(
-        self, op_name: str, fallback: Fallback, *args: Any, **kwargs: Any,
-    ) -> str:
-        key = self._best_key(op_name, args, kwargs)
-        if key in self._best:
-            selected = self._best[key]
-            self._best_ops.setdefault(op_name, set()).add(selected)
-            return selected
-        timings: list[tuple[float, str]] = []
-        _fb = fallback
-        torch_elapsed = self._time_candidate(
-            "torch", lambda *a, fallback=None, **kw: _fb(*a, **kw),
-            fallback, *args, **kwargs,
-        )
-        timings.append((torch_elapsed, "torch"))
-        for candidate in self.BACKENDS:
-            fn = self._resolve(candidate, op_name)
-            if fn is None:
-                continue
-            try:
-                elapsed = self._time_candidate(candidate, fn, fallback, *args, **kwargs)
-            except Exception:
-                if os.getenv("RACETRACK_KERNEL_STRICT", "0") == "1":
-                    raise
-                continue
-            timings.append((elapsed, candidate))
-        selected = min(timings)[1]
-        self._best[key] = selected
-        self._best_ops.setdefault(op_name, set()).add(selected)
-        return selected
-
-    @staticmethod
-    def _best_key(op_name, args, kwargs):
-        tensor_parts = []
-        for arg in args:
-            if isinstance(arg, torch.Tensor):
-                tensor_parts.append((tuple(arg.shape), str(arg.dtype), str(arg.device), tuple(arg.stride())))
-        scalar_parts = tuple(sorted(
-            (k, v) for k, v in kwargs.items()
-            if isinstance(v, (str, int, float, bool, type(None)))
-        ))
-        return (op_name, tuple(tensor_parts), scalar_parts)
-
-    @staticmethod
-    def _time_candidate(backend, fn, fallback, *args, **kwargs):
-        def run_once():
-            return fn(*args, fallback=fallback, **kwargs)
-        run_once()
-        iterations = int(os.getenv("RACETRACK_BEST_ITERS", "10"))
-        tensor_arg = next((a for a in args if isinstance(a, torch.Tensor)), None)
-        if tensor_arg is not None and tensor_arg.device.type == "cuda":
-            torch.cuda.synchronize(tensor_arg.device)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(iterations):
-                run_once()
-            end.record()
-            torch.cuda.synchronize(tensor_arg.device)
-            return float(start.elapsed_time(end)) / iterations
-        start_time = time.perf_counter()
-        for _ in range(iterations):
-            run_once()
-        return (time.perf_counter() - start_time) * 1000.0 / iterations
-
-    def _load_best_config(self):
-        if self.kernel_root is None:
-            return
-        path = self.kernel_root / "best.json"
-        if not path.exists():
-            return
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self._best_fast_path.update(data)
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    def _save_best_config(self):
-        if self.kernel_root is None:
-            return
-        path = self.kernel_root / "best.json"
-        with open(path, "w") as f:
-            json.dump(self._best_fast_path, f, indent=2, sort_keys=True)
-            f.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -669,17 +460,6 @@ class FlattenedMLAAttention(nn.Module):
 
         x = self.wo(x.flatten(2))
         return x
-
-
-class SwiGLUExpert(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(swiglu(self.w1(x), self.w3(x)))
 
 
 class Gate(nn.Module):

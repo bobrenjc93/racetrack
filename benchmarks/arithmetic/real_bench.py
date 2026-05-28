@@ -11,7 +11,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,19 +18,29 @@ from pathlib import Path
 
 import torch
 
-from benchmarks.gsm8k.eval import DSV3_2_CONFIG, EVAL_MODEL, _generate_greedy
-from benchmarks.gsm8k.hf_auth import require_hf_token
 from benchmarks.common import (
+    EVAL_MODEL,
     TORCH_COMPILE_BACKEND,
     CONCRETE_BACKENDS,
     hardware_info as _hardware_info,
     hardware_slug as _hardware_slug,
     cleanup_compile_state,
 )
+from benchmarks.gsm8k.eval import _generate_greedy
+from benchmarks.gsm8k.hf_auth import require_hf_token
 from benchmarks.gsm8k.real_kernels import (
     RealKernelRow,
     discover_real_kernel_rows,
     patch_real_model,
+)
+from benchmarks.real_bench_common import (
+    _rank,
+    _world_size,
+    _is_rank0,
+    can_use_fused_patches as _can_use_fused_patches,
+    resolve_selected_backends as _resolve_selected_backends,
+    load_model_and_tokenizer,
+    build_and_capture_cudagraph,
 )
 
 
@@ -42,82 +51,6 @@ PROMPTS = [
     "98273465000123 / 1 =",
 ]
 MAX_NEW_TOKENS = 64
-
-
-def _rank():
-    return int(os.environ.get("RANK", "0"))
-
-
-def _world_size():
-    return int(os.environ.get("WORLD_SIZE", "1"))
-
-
-def _is_rank0():
-    return _rank() == 0
-
-
-def _load_model_and_tokenizer(*, ckpt_path, hf_token, hf_direct):
-    import torch.distributed as dist
-    from transformers import PreTrainedTokenizerFast
-    from racetrack.models.deepseek import ModelArgs, Transformer
-    from benchmarks.gsm8k.hf_model_loader import (
-        load_hf_sharded_weights,
-        run_post_load_transforms,
-    )
-
-    world_size = _world_size()
-    rank = _rank()
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group("nccl")
-    torch.cuda.set_device(local_rank)
-    torch.set_default_dtype(torch.bfloat16)
-
-    config = dict(DSV3_2_CONFIG)
-    config["max_batch_size"] = 1
-    config["max_seq_len"] = 512
-    config["dtype"] = "fp8"
-    args = ModelArgs(**config)
-
-    ckpt_file = ckpt_path / f"model{rank}-mp{world_size}.safetensors"
-    use_converted = ckpt_file.exists()
-    if not use_converted and not hf_direct:
-        raise FileNotFoundError("Pass --hf-direct to load HF shards")
-
-    if _is_rank0():
-        print(f"Loading real model (world_size={world_size}) ...", flush=True)
-
-    with torch.device("cuda"):
-        model = Transformer(args)
-    if use_converted:
-        from safetensors.torch import load_model
-        load_model(model, str(ckpt_file), strict=False)
-    else:
-        loaded = load_hf_sharded_weights(
-            model, repo_id=EVAL_MODEL, hf_token=hf_token,
-            rank=rank, world_size=world_size,
-        )
-        if _is_rank0():
-            print(f"Loaded {loaded} HF tensors for rank 0", flush=True)
-    transforms = run_post_load_transforms(model)
-    if _is_rank0():
-        print(f"Ran {len(transforms)} post-load model transforms", flush=True)
-    model.eval()
-
-    from huggingface_hub import hf_hub_download
-    tok_path = hf_hub_download(EVAL_MODEL, "tokenizer.json", token=hf_token)
-    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tok_path)
-    return model, tokenizer
-
-
-def _can_use_fused_patches(row) -> bool:
-    if row.kernel_root is None or row.spec is None:
-        return False
-    kr = row.kernel_root or row.spec.kernel_root
-    for backend in CONCRETE_BACKENDS:
-        if (kr / backend / "act_quant.py").exists():
-            return True
-    return False
 
 
 @torch.inference_mode()
@@ -146,26 +79,10 @@ class RowResult:
     selected_backends: dict
 
 
-def _resolve_selected_backends(row):
-    if row.backend != "best":
-        return {op: (row.backend,) for op in row.ops}
-    kr = row.kernel_root or (row.spec.kernel_root if row.spec else None)
-    if kr is None:
-        return {op: ("best",) for op in row.ops}
-    from racetrack.runtime.dispatch import KernelDispatcher
-    dispatcher = KernelDispatcher(kr)
-    result = {}
-    for op in row.ops:
-        for backend in CONCRETE_BACKENDS:
-            if dispatcher._resolve(backend, op) is not None:
-                result[op] = (backend,)
-                break
-    return result
-
-
 def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warmup, repeat):
-    model, tokenizer = _load_model_and_tokenizer(
-        ckpt_path=ckpt_path, hf_token=hf_token, hf_direct=hf_direct,
+    model, tokenizer = load_model_and_tokenizer(
+        ckpt_path=ckpt_path, hf_token=hf_token, max_seq_len=512,
+        hf_direct=hf_direct, strict=False,
     )
 
     if _is_rank0():
@@ -227,8 +144,6 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
         kr = ref_row.kernel_root or ref_row.spec.kernel_root
 
         try:
-            from benchmarks.gsm8k.flat_decode import build_flat_decode
-
             if _is_rank0():
                 print("CUDA graph: prefill ...", flush=True)
             first_prompt = tokenizer.encode(PROMPTS[0])
@@ -243,24 +158,10 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
                 if _is_rank0():
                     print(f"Row {ref_row.partition}/{cg_backend}: flat decode + CUDA graph", flush=True)
                 try:
-                    flat_fn, flat_cg_fn, update_bufs, s_logits = build_flat_decode(
-                        model, kr, backend=cg_backend,
-                        max_seq_len=max_seq,
-                    )
-                    static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
-                    for i in range(min(5, prompt_len)):
-                        update_bufs(prompt_len + i)
-                        static_tok.fill_(0)
-                        flat_cg_fn(static_tok)
-                    torch.cuda.synchronize()
-
-                    update_bufs(prompt_len + 10)
-                    flat_cg_fn(static_tok)
-                    torch.cuda.synchronize()
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        flat_cg_fn(static_tok)
-                    torch.cuda.synchronize()
+                    flat_fn, flat_cg_fn, update_bufs, s_logits, graph, static_tok = \
+                        build_and_capture_cudagraph(
+                            model, kr, cg_backend, prompt_len, max_seq,
+                        )
 
                     for _ in range(warmup):
                         for i in range(n_decode):

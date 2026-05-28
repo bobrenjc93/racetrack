@@ -26,41 +26,10 @@ for _tv_mod in ("torchvision", "torchvision.transforms"):
 import torch
 
 from benchmarks.arithmetic.bench import CASES
+from benchmarks.common import DSV3_2_CONFIG, EVAL_MODEL
 
-EVAL_MODEL = "deepseek-ai/DeepSeek-V3.2"
 MAX_NEW_TOKENS = 64
 CACHE_PATH = Path(__file__).parent / "results" / "eval_cache.json"
-
-DSV3_2_CONFIG = {
-    "vocab_size": 129280,
-    "dim": 7168,
-    "inter_dim": 18432,
-    "moe_inter_dim": 2048,
-    "n_layers": 61,
-    "n_dense_layers": 3,
-    "n_heads": 128,
-    "n_routed_experts": 256,
-    "n_shared_experts": 1,
-    "n_activated_experts": 8,
-    "n_expert_groups": 8,
-    "n_limited_groups": 4,
-    "score_func": "sigmoid",
-    "route_scale": 2.5,
-    "q_lora_rank": 1536,
-    "kv_lora_rank": 512,
-    "qk_nope_head_dim": 128,
-    "qk_rope_head_dim": 64,
-    "v_head_dim": 128,
-    "original_seq_len": 4096,
-    "rope_theta": 10000.0,
-    "rope_factor": 40,
-    "beta_fast": 32,
-    "beta_slow": 1,
-    "mscale": 1.0,
-    "index_n_heads": 64,
-    "index_head_dim": 128,
-    "index_topk": 2048,
-}
 
 
 def _load_cache() -> dict:
