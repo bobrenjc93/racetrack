@@ -81,10 +81,9 @@ for every callsite, the end-to-end report uses the pure backend row for clarity.
 
 CUTEDSL and Helion are optional dependencies. Explicitly selecting a backend
 whose real kernel is unavailable is an error. The runner does not silently
-substitute torch. Helion's default autotune effort is `none` (to avoid OOM during
-autotuning); set `RACETRACK_HELION_AUTOTUNE_EFFORT=quick` or `=full` before
-running to search harder, or `HELION_FORCE_AUTOTUNE=1` to ignore cached configs
-and re-run the search.
+substitute torch. Helion kernels ship with hardcoded `helion.Config` tuned on
+H100 at DeepSeek-scale shapes (full autotune search, ~450-1500 configs per
+kernel). No runtime autotuning is needed.
 
 ## Quick Start
 

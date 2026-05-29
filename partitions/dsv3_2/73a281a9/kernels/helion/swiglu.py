@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 
 import torch
 
@@ -15,13 +14,21 @@ except Exception:
     BACKEND_AVAILABLE = False
 
 
-def _autotune_effort() -> str:
-    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "none")
 
 
 if BACKEND_AVAILABLE:
 
-    @helion.kernel(autotune_effort=_autotune_effort())
+    @helion.kernel(config=helion.Config(
+            block_sizes=[1, 1024], flatten_loops=[True],
+            indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor'],
+            l2_groupings=[8],
+            load_eviction_policies=['last', 'first'],
+            loop_orders=[[0, 1]], num_stages=4, num_warps=4, pid_type='xyz',
+            range_flattens=[None], range_multi_buffers=[None],
+            range_num_stages=[0], range_unroll_factors=[0],
+            range_warp_specializes=[],
+        )
+    )
     def _swiglu_kernel(
         gate: torch.Tensor,
         up: torch.Tensor,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 
@@ -59,13 +58,22 @@ def _fp8_index_unit_k_scale(q, q_s, k):
     return logits.sum(dim=2)
 
 
-def _autotune_effort() -> str:
-    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "none")
 
 
 if BACKEND_AVAILABLE:
 
-    @helion.kernel(autotune_effort=_autotune_effort())
+    @helion.kernel(config=helion.Config(
+            block_sizes=[1, 2],
+            indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor',
+                      'tensor_descriptor', 'tensor_descriptor'],
+            l2_groupings=[16],
+            load_eviction_policies=['first', 'first', 'first'],
+            loop_orders=[[0, 1]], num_stages=7, num_warps=4, pid_type='flat',
+            range_flattens=[None], range_multi_buffers=[None],
+            range_num_stages=[0], range_unroll_factors=[0],
+            range_warp_specializes=[],
+        )
+    )
     def _rope_kernel(
         x: torch.Tensor,
         positions: torch.Tensor,
