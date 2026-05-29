@@ -172,7 +172,11 @@ def benchmark_kernel(
     dtype = kinfo["dtype"]
 
     if custom_shape:
-        shapes = {"custom": {list(list(kinfo["shapes"].values())[0].keys())[0]: custom_shape}}
+        # Multi-input kernels (swiglu, residual_norm) have gen lambdas that
+        # index every key of the shape spec, so a custom shape must be
+        # broadcast to all keys or gen() raises KeyError before timing.
+        template = list(kinfo["shapes"].values())[0]
+        shapes = {"custom": {k: custom_shape for k in template}}
     else:
         shapes = kinfo["shapes"]
 
@@ -313,6 +317,11 @@ def main():
 
     if not args.kernel:
         parser.error("--kernel is required (or use --list-kernels)")
+
+    if args.repeat < 1:
+        parser.error("--repeat must be at least 1 (need a timed iteration)")
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
 
     backends = [args.backend] if args.backend else list(BACKENDS)
     custom_shape = tuple(int(x) for x in args.shape.split(",")) if args.shape else None

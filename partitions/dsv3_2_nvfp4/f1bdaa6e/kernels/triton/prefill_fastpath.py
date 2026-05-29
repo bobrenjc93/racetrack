@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-import importlib
 
 try:
     import triton
@@ -136,9 +135,8 @@ def fused_norms_rope_cache_prefill(
     *, eps, start_pos, fallback,
 ):
     del fallback
-    apply_rotary_emb = importlib.import_module(
-        "partitions.dsv3_2_nvfp4.f1bdaa6e.model"
-    ).apply_rotary_emb
+    from racetrack.models import deepseek as real_model
+    apply_rotary_emb = real_model.apply_rotary_emb
 
     bsz, seqlen = q_c.shape[0], q_c.shape[1]
     end_pos = start_pos + seqlen
@@ -163,8 +161,5 @@ def fused_q_prefill_proj(
 
 def fused_q_rope_prefill(q_pe, freqs_cis, *, fallback):
     del fallback
-    apply_rotary_emb = importlib.import_module(
-        "partitions.dsv3_2_nvfp4.f1bdaa6e.model"
-    ).apply_rotary_emb
-
-    return apply_rotary_emb(q_pe, freqs_cis, interleaved=True)
+    from racetrack.models import deepseek as real_model
+    return real_model.apply_rotary_emb(q_pe, freqs_cis, interleaved=True)

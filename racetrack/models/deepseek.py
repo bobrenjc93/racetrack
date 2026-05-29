@@ -87,10 +87,15 @@ def act_quant(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x = x.contiguous()
     N = x.size(-1)
-    if N % block_size != 0:
-        return x.to(torch.float8_e4m3fn), torch.ones(
-            *x.shape[:-1], 1, dtype=torch.float32, device=x.device,
-        )
+    # The previous non-divisible branch returned unscaled fp8 with a scale of 1.0
+    # and a single scale group, which both saturates values beyond 448 and gives
+    # fp8_gemm a scale tensor of the wrong shape (its K-loop and the FX fake op
+    # expect ceil(N/block_size) groups). Real model dims are all multiples of
+    # block_size, so we assert rather than silently producing wrong results.
+    assert N % block_size == 0, (
+        f"act_quant requires the last dim ({N}) to be a multiple of "
+        f"block_size ({block_size})"
+    )
     n_groups = N // block_size
     shape = x.shape
     x_flat = x.float().reshape(-1, n_groups, block_size)
@@ -106,6 +111,13 @@ def fp8_gemm(
     a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor
 ) -> torch.Tensor:
     if not (_TRITON_AVAILABLE and a.is_cuda and b.dtype == torch.float8_e4m3fn):
+        if a.dtype == torch.float8_e4m3fn:
+            # The Triton fast path multiplies the accumulator by the per-128-block
+            # activation scale (a_s) before storing; the fallback must do the same.
+            # We expand a_s back across each block (each scale group covers
+            # block_size columns) and dequantize the activation before the matmul.
+            a_s_expanded = a_s.repeat_interleave(block_size, dim=-1)[..., : a.shape[-1]]
+            a = (a.to(torch.float32) * a_s_expanded).to(torch.bfloat16)
         return F.linear(a.to(torch.bfloat16), _block_dequant(b, b_s))
 
     orig_shape = a.shape
@@ -669,7 +681,8 @@ class Indexer(torch.nn.Module):
         if mask is not None:
             index_score += mask
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
-        dist.broadcast(topk_indices, src=0)
+        if world_size > 1:
+            dist.broadcast(topk_indices, src=0)
         return topk_indices
 
 

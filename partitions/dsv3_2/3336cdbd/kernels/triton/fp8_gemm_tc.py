@@ -71,9 +71,12 @@ if BACKEND_AVAILABLE:
                 mask=(offs_n[:, None] < N) & (offs_k[None, :] < K), other=0.0,
             )
 
-            # B scale
+            # B scale: weights are block-quantized along N with one scale per
+            # 128-row block (shape [ceil(N/128), ceil(K/128)]), so index the
+            # scale by the N-block, not by the raw row, mirroring _fp8_gemm_kernel.
+            b_n_block = offs_n // 128
             b_scale = tl.load(
-                B_s_ptr + offs_n * stride_bs_n + k_idx * stride_bs_k,
+                B_s_ptr + b_n_block * stride_bs_n + k_idx * stride_bs_k,
                 mask=offs_n < N, other=1.0,
             )
 

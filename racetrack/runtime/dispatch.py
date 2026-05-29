@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -29,7 +30,7 @@ class KernelDispatcher:
         self.kernel_root = Path(kernel_root) if kernel_root is not None else None
         self._modules: dict[tuple[str, str], ModuleType | None] = {}
         self._backend_modules_cache: dict[str, list[ModuleType]] = {}
-        self._best: dict[tuple[Any, ...], str] = {}
+        self._best: dict[str, str] = {}
         self._best_ops: dict[str, set[str]] = {}
         self._best_fast_path: dict[str, str] = {}
         self._load_best_config()
@@ -65,14 +66,7 @@ class KernelDispatcher:
         if selected == "torch":
             return fallback(*args, **kwargs)
         if selected == "best":
-            selected = self._best_fast_path.get(op_name)
-            if selected is not None and selected != "torch" and self._resolve(selected, op_name) is None:
-                selected = None
-            if selected is None:
-                selected = self._select_best(op_name, fallback, *args, **kwargs)
-                self._best_fast_path[op_name] = selected
-                self._save_best_config()
-            self._best_ops.setdefault(op_name, set()).add(selected)
+            selected = self._select_best(op_name, fallback, *args, **kwargs)
         if selected == "torch":
             return fallback(*args, **kwargs)
         fn = self._resolve(selected, op_name)
@@ -155,10 +149,11 @@ class KernelDispatcher:
         **kwargs: Any,
     ) -> str:
         key = self._best_key(op_name, args, kwargs)
-        if key in self._best:
-            selected = self._best[key]
-            self._best_ops.setdefault(op_name, set()).add(selected)
-            return selected
+        cached = self._best.get(key)
+        if cached is not None and (cached == "torch" or self._resolve(cached, op_name) is not None):
+            if cached != "torch":
+                self._best_ops.setdefault(op_name, set()).add(cached)
+            return cached
 
         timings: list[tuple[float, str]] = []
         for candidate in self.BACKENDS:
@@ -177,7 +172,10 @@ class KernelDispatcher:
         else:
             selected = min(timings)[1]
         self._best[key] = selected
-        self._best_ops.setdefault(op_name, set()).add(selected)
+        if selected != "torch":
+            self._best_ops.setdefault(op_name, set()).add(selected)
+            self._best_fast_path[op_name] = selected
+        self._save_best_config()
         return selected
 
     @staticmethod
@@ -185,7 +183,7 @@ class KernelDispatcher:
         op_name: str,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> tuple[Any, ...]:
+    ) -> str:
         tensor_parts = []
         for arg in args:
             if isinstance(arg, torch.Tensor):
@@ -204,7 +202,17 @@ class KernelDispatcher:
                 if isinstance(value, (str, int, float, bool, type(None)))
             )
         )
-        return (op_name, tuple(tensor_parts), scalar_parts)
+        return repr((op_name, tuple(tensor_parts), scalar_parts))
+
+    @staticmethod
+    def _op_name_from_signature(signature: str) -> str:
+        try:
+            parsed = ast.literal_eval(signature)
+        except (ValueError, SyntaxError):
+            return signature
+        if isinstance(parsed, tuple) and parsed and isinstance(parsed[0], str):
+            return parsed[0]
+        return signature
 
     @staticmethod
     def _time_candidate(
@@ -245,15 +253,42 @@ class KernelDispatcher:
         try:
             with open(path) as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                self._best_fast_path.update(data)
         except (json.JSONDecodeError, OSError):
-            pass
+            return
+        if not isinstance(data, dict):
+            return
+        for op_name, per_shape in data.items():
+            # Backward-compat: older best.json caches used a flat
+            # {op_name: backend} layout before selection became shape-keyed.
+            # Treat a bare string as an op-level fast-path default so legacy
+            # caches (and any non-shape-keyed report) keep working until a fresh
+            # 'best' run rewrites the file in the nested {op: {sig: backend}} form.
+            if isinstance(per_shape, str):
+                if per_shape != "torch":
+                    self._best_fast_path[op_name] = per_shape
+                continue
+            if not isinstance(per_shape, dict):
+                continue
+            for signature, backend in per_shape.items():
+                if not isinstance(signature, str) or not isinstance(backend, str):
+                    continue
+                self._best[signature] = backend
+                if backend != "torch":
+                    self._best_fast_path[op_name] = backend
 
     def _save_best_config(self) -> None:
         if self.kernel_root is None:
             return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+        nested: dict[str, dict[str, str]] = {}
+        for signature, backend in self._best.items():
+            op_name = self._op_name_from_signature(signature)
+            nested.setdefault(op_name, {})[signature] = backend
         path = self.kernel_root / "best.json"
-        with open(path, "w") as f:
-            json.dump(self._best_fast_path, f, indent=2, sort_keys=True)
+        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(nested, f, indent=2, sort_keys=True)
             f.write("\n")
+        os.replace(tmp_path, path)

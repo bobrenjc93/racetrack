@@ -503,12 +503,21 @@ def generate_greedy_cudagraph(
     prompt_mask = tokens != -1
     world_size_val = dist.get_world_size() if dist.is_initialized() else 1
 
+    bsz = len(prompt_tokens)
+    if world_size_val > 1 and bsz > 1:
+        raise ValueError(
+            "generate_greedy_cudagraph only supports batch size 1 when "
+            "world_size > 1: the vocab-sharded all_gather_into_tensor "
+            "concatenates shards along dim 0, which collides with the "
+            "batch dimension for bsz > 1 and would corrupt the logits."
+        )
+
     mla_originals, attn_masks = _patch_mla_for_cudagraph_gen(model, max_seq_len)
 
     graph = None
-    static_tok = torch.zeros(1, 1, dtype=torch.long, device="cuda")
+    static_tok = torch.zeros(bsz, 1, dtype=torch.long, device="cuda")
     vocab_shard = model.head.weight.shape[0]
-    static_logits = torch.empty(1, vocab_shard * world_size_val, device="cuda", dtype=torch.float32)
+    static_logits = torch.empty(bsz, vocab_shard * world_size_val, device="cuda", dtype=torch.float32)
 
     def _update_attn_masks(end_pos):
         finfo_min = torch.finfo(torch.float32).min
@@ -525,7 +534,7 @@ def generate_greedy_cudagraph(
             is_decode = (cur_pos - prev_pos) == 1
 
             if is_decode and graph is not None:
-                static_tok.fill_(tokens[0, prev_pos].item())
+                static_tok.copy_(tokens[:, prev_pos:prev_pos+1])
                 fc = model.freqs_cis[prev_pos:prev_pos+1]
                 _update_attn_masks(cur_pos)
                 graph.replay()

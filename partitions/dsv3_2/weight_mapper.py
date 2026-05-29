@@ -73,7 +73,6 @@ SKIP_PATTERNS = [
     r"\.enorm\.",
     r"\.hnorm\.",
     r"\.e_score_correction_bias$",
-    r"_scale_inv$",
     r"layers\.\d+\.embed_tokens\.",
 ]
 _SKIP_RE = re.compile("|".join(SKIP_PATTERNS))

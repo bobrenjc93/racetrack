@@ -45,10 +45,20 @@ def fused_act_quant(x, *, fallback):
     N = shape[-1]
     n_rows = x_c.numel() // N
     n_groups = (N + QUANT_BLOCK - 1) // QUANT_BLOCK
+    N_padded = n_groups * QUANT_BLOCK
 
-    x_flat = x_c.float().view(n_rows * n_groups, QUANT_BLOCK)
+    x_2d = x_c.float().reshape(n_rows, N)
+    if N_padded != N:
+        # The helion kernel reshapes into exact (n_blocks, 128) rows, so a tail
+        # smaller than QUANT_BLOCK cannot be expressed as a view. Pad the last
+        # dim with zeros to mirror the triton kernel's masked load (other=0.0):
+        # zeros never raise amax and the padded fp8 columns are sliced off below.
+        x_2d = torch.nn.functional.pad(x_2d, (0, N_padded - N))
+
+    x_flat = x_2d.reshape(n_rows * n_groups, QUANT_BLOCK)
     fp8_flat, scale_flat = _act_quant_kernel(x_flat)
-    return fp8_flat.view(shape), scale_flat.view(*shape[:-1], n_groups)
+    fp8 = fp8_flat.reshape(n_rows, N_padded)[:, :N].reshape(shape)
+    return fp8, scale_flat.view(*shape[:-1], n_groups)
 
 
 def fused_swiglu_quant(gate, up, *, fallback):

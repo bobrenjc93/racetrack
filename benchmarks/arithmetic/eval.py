@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -121,7 +122,10 @@ def evaluate(
     force: bool = False,
 ) -> dict:
     cache = _load_cache()
-    cache_key = f"{EVAL_MODEL}:arithmetic:{len(CASES)}:{max_new_tokens}:v1"
+    cases_digest = hashlib.sha256(repr(CASES).encode("utf-8")).hexdigest()[:12]
+    cache_key = (
+        f"{EVAL_MODEL}:arithmetic:{len(CASES)}:{cases_digest}:{max_new_tokens}:v1"
+    )
     if not force and cache_key in cache:
         result = cache[cache_key]
         print(

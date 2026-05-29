@@ -63,13 +63,13 @@ def fused_q_rope_quant(
     fallback,
 ):
     del fallback
-    from partitions.dsv3_2_nvfp4.ddac1c45.model import (
-        apply_rotary_emb, act_quant, fp8_index,
+    from partitions.dsv3_2_nvfp4.model import (
+        DSV3_2_NVFP4_CONFIG, apply_rotary_emb, act_quant, fp8_index,
     )
     bsz, seqlen = q_pe.shape[0], q_pe.shape[1]
 
     q_pe = apply_rotary_emb(q_pe, freqs_cis, interleaved=True)
-    topk_count = min(end_pos, seqlen * 2)
+    topk_count = min(DSV3_2_NVFP4_CONFIG.index_topk, end_pos)
     if topk_count == end_pos:
         topk_indices = torch.arange(
             end_pos, device=q_pe.device, dtype=torch.long,

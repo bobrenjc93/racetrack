@@ -77,7 +77,7 @@ def fused_indexer_k_path(
 ):
     del fallback
     import importlib
-    _model = importlib.import_module("partitions.dsv3_2_nvfp4.86945bc1.model")
+    _model = importlib.import_module("partitions.dsv3_2_nvfp4.model")
     apply_rotary_emb = _model.apply_rotary_emb
     act_quant = _model.act_quant
     bsz, seqlen = q_c.shape[0], q_c.shape[1]

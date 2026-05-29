@@ -121,9 +121,36 @@ def _time_forward(
 
 
 def _load_model(model_name: str, partition: str):
+    del partition
+    return importlib.import_module(f"partitions.{model_name}.model")
+
+
+def _partition_root(model_name: str, partition: str) -> Path | None:
     if partition == "baseline":
-        return importlib.import_module(f"partitions.{model_name}.model")
-    return importlib.import_module(f"partitions.{model_name}.{partition}.model")
+        return None
+    root = Path(__file__).resolve().parents[1] / "partitions" / model_name / partition
+    return root if root.is_dir() else None
+
+
+def _build_model_with_partition(module, partition_root: Path | None):
+    """Build the baseline model and attach a partition kernel dispatcher.
+
+    Spec partitions no longer ship a model submodule -- they reuse the
+    baseline model and dispatch fusible ops through a KernelDispatcher
+    rooted at the partition's kernels/ directory. When partition_root is
+    None this returns the plain baseline model with no dispatcher.
+    """
+    model = module.build_model()
+    if partition_root is not None:
+        from racetrack.runtime.dispatch import KernelDispatcher
+
+        dispatcher = KernelDispatcher(partition_root / "kernels")
+        model.dispatcher = dispatcher
+        for layer in model.layers:
+            layer.dispatcher = dispatcher
+            if hasattr(layer, "attn"):
+                layer.attn.dispatcher = dispatcher
+    return model
 
 
 def _normalize_backend_name(backend: str) -> str:
@@ -164,6 +191,7 @@ def _discover_partitions(model_name: str, partition_filter: str) -> list[str]:
         p.name
         for p in root.iterdir()
         if p.is_dir()
+        and (p / "kernels").is_dir()
         and ((p / "spec.py").exists() or (p / "model.py").exists())
         and not p.name.startswith("__")
     )
@@ -215,7 +243,12 @@ def _benchmark_backend(
 ) -> BenchResult:
     os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
     module = _load_model(model_name, partition)
-    model = module.build_model().to(device=device, dtype=dtype).eval()
+    partition_root = _partition_root(model_name, partition)
+    model = (
+        _build_model_with_partition(module, partition_root)
+        .to(device=device, dtype=dtype)
+        .eval()
+    )
     status_map = getattr(model, "backend_status", {"torch": "native"})
     backend_status = (
         "compiled" if backend == TORCH_COMPILE_BACKEND else status_map.get(backend, "native")

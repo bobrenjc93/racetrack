@@ -76,7 +76,7 @@ def fused_indexer_k_path(
     fallback,
 ):
     del fallback
-    from partitions.dsv3_2_nvfp4.cd91301b.model import (
+    from partitions.dsv3_2_nvfp4.model import (
         apply_rotary_emb, act_quant,
     )
     bsz, seqlen = q_c.shape[0], q_c.shape[1]

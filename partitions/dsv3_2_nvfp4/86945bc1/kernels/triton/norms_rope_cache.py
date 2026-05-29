@@ -190,7 +190,7 @@ def fused_indexer_k_path(
         rope_head_dim=rope_head_dim, start_pos=start_pos, block_size=block_size,
     ) if False else None
 
-    model = importlib.import_module("partitions.dsv3_2_nvfp4.86945bc1.model")
+    model = importlib.import_module("partitions.dsv3_2_nvfp4.model")
     apply_rotary_emb = model.apply_rotary_emb
     act_quant = model.act_quant
 

@@ -32,6 +32,7 @@ from benchmarks.common import (
     TORCH_COMPILE_BACKEND,
     TORCH_COMPILE_ALIASES,
     CONCRETE_BACKENDS,
+    EVAL_MODEL,
     MODELS,
     normalize_backend_name,
     env_backend as _env_backend,
@@ -281,6 +282,9 @@ def _time_forward(
     _sync(device)
 
     if device.type == "cuda":
+        if output is None:
+            output = model(input_ids, positions)
+            _sync(device)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = model(input_ids, positions)
@@ -499,8 +503,10 @@ def _synthesize_best(results: list[Result]) -> list[Result]:
             single_backend = _single_backend_mixed_plan(runs[0].backend_status)
             if single_backend in concrete_backends:
                 continue
-        dispatched_ops = _discover_dispatched_ops(results, partition)
-        kernel_map = {op: best_backend for op in dispatched_ops} if dispatched_ops else None
+        kernel_map = None
+        if best_backend in CONCRETE_BACKENDS:
+            dispatched_ops = _discover_dispatched_ops(results, partition)
+            kernel_map = {op: best_backend for op in dispatched_ops} if dispatched_ops else None
         for result in runs:
             best_results.append(
                 Result(
@@ -653,8 +659,25 @@ def _load_cached_eval() -> dict | None:
         return None
     if not isinstance(cache, dict) or not cache:
         return None
-    latest_key = sorted(cache)[-1]
-    result = cache.get(latest_key)
+    # Mirror eval.evaluate()'s cache_key exactly:
+    #   f"{EVAL_MODEL}:arithmetic:{len(CASES)}:{cases_digest}:{max_new_tokens}:v1"
+    # Pinning the content digest ensures we only reuse an eval computed for the
+    # CURRENT cases (edited prompts/expected invalidate it), and the digest
+    # delimiter keeps the trailing segment a bare max_new_tokens we can rank.
+    import hashlib
+
+    cases_digest = hashlib.sha256(repr(CASES).encode("utf-8")).hexdigest()[:12]
+    prefix = f"{EVAL_MODEL}:arithmetic:{len(CASES)}:{cases_digest}:"
+    matched = [key for key in cache if key.startswith(prefix) and key.endswith(":v1")]
+    if not matched:
+        return None
+
+    def _max_new_tokens(key: str) -> int:
+        middle = key[len(prefix):].removesuffix(":v1")
+        return int(middle) if middle.isdigit() else -1
+
+    selected_key = max(matched, key=_max_new_tokens)
+    result = cache.get(selected_key)
     return result if isinstance(result, dict) else None
 
 

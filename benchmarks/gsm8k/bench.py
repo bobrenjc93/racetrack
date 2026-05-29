@@ -88,10 +88,44 @@ class Result:
     kernels: dict[str, str] | None = None
 
 
-def _load_partition_module(model_name: str, partition: str):
+def _load_partition_module(model_name: str):
+    return importlib.import_module(f"partitions.{model_name}.model")
+
+
+def _partition_dir(model_name: str, partition: str) -> Path:
+    return Path(__file__).resolve().parents[2] / "partitions" / model_name / partition
+
+
+def _resolve_config(module):
+    """Locate the module-level benchmark config object for a baseline model.
+
+    The two baseline models export differently named config constants
+    (``DSV3_2_CONFIG`` and ``DSV3_2_NVFP4_CONFIG``), so this scans for the
+    single dataclass instance exposing ``for_benchmark`` rather than
+    hard-coding either name into the runner.
+    """
+    for name in dir(module):
+        if name.startswith("_"):
+            continue
+        candidate = getattr(module, name)
+        if not isinstance(candidate, type) and callable(getattr(candidate, "for_benchmark", None)):
+            return candidate
+    raise AttributeError(f"No benchmark config with for_benchmark() in {module.__name__}")
+
+
+def _build_partition_model(model_name: str, partition: str) -> torch.nn.Module:
+    """Build the baseline model.py, wiring the partition kernel root for dispatch.
+
+    All partitions share the single baseline ``model.py``; a non-baseline
+    partition is realized by pointing the model's internal ``KernelDispatcher``
+    at that partition's ``kernels/`` directory so ops route to the backend
+    selected via ``RACETRACK_KERNEL_BACKEND``.
+    """
+    module = _load_partition_module(model_name)
     if partition == "baseline":
-        return importlib.import_module(f"partitions.{model_name}.model")
-    return importlib.import_module(f"partitions.{model_name}.{partition}.model")
+        return module.build_model(**MODEL_OVERRIDES)
+    config = _resolve_config(module).for_benchmark(**MODEL_OVERRIDES)
+    return module.FlattenedDeepSeekModel(config, partition_root=str(_partition_dir(model_name, partition)))
 
 
 def _normalize_backend_name(backend: str) -> str:
@@ -129,7 +163,10 @@ def _discover_partitions(model_name: str) -> list[str]:
     partitions = sorted(
         p.name
         for p in root.iterdir()
-        if p.is_dir() and (p / "model.py").exists() and not p.name.startswith("__")
+        if p.is_dir()
+        and (p / "spec.py").exists()
+        and (p / "kernels").is_dir()
+        and not p.name.startswith("__")
     )
     return ["baseline", *partitions]
 
@@ -254,8 +291,7 @@ def _benchmark_backend(
     rtol: float,
 ) -> tuple[Result, torch.Tensor]:
     os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
-    module = _load_partition_module(model_name, partition)
-    model = module.build_model(**MODEL_OVERRIDES).to(device=device, dtype=dtype).eval()
+    model = _build_partition_model(model_name, partition).to(device=device, dtype=dtype).eval()
     model = _compile_model_if_requested(model, backend)
 
     output, times = _time_forward(
@@ -321,12 +357,21 @@ def run(
     dtype = _resolve_dtype(dtype_str, device)
 
     results: list[Result] = []
+    # A partition hash typically belongs to one model only, but MODELS is swept
+    # for every run. Validate the filter once against the union of all models'
+    # partitions (so a genuine typo still errors), then skip models the filter
+    # does not match instead of raising on the first model that lacks the hash.
+    selected = None if partition_filter == "all" else set(partition_filter.split(","))
+    if selected is not None:
+        known = {p for m in MODELS for p in _discover_partitions(m)}
+        if not selected & known:
+            raise KeyError(f"No partitions matched filter {partition_filter!r}")
     for model_name in MODELS:
         all_partitions = _discover_partitions(model_name)
-        if partition_filter != "all":
-            all_partitions = [p for p in all_partitions if p in partition_filter.split(",")]
+        if selected is not None:
+            all_partitions = [p for p in all_partitions if p in selected]
             if not all_partitions:
-                raise KeyError(f"No partitions matched filter {partition_filter!r}")
+                continue
         for case_name, tokens in CASES:
             input_ids = torch.arange(tokens, device=device, dtype=torch.long) % 4096
             positions = torch.arange(tokens, device=device, dtype=torch.long)
@@ -480,8 +525,7 @@ def _discover_dispatched_ops(results: list[Result], partition: str) -> list[str]
     for r in results:
         if r.partition != partition or r.backend in ("torch", TORCH_COMPILE_BACKEND):
             continue
-        module = _load_partition_module(r.model, partition)
-        model = module.build_model(**MODEL_OVERRIDES)
+        model = _build_partition_model(r.model, partition)
         dispatcher = getattr(model, "dispatcher", None)
         if dispatcher is None:
             return []
