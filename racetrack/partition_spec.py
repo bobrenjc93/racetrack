@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,11 +37,21 @@ class PartitionSpec:
 
     @property
     def partition_id(self) -> str:
-        canonical = json.dumps(
-            {"model": self.model, "ops": [op.to_dict() for op in self.fused_ops]},
-            sort_keys=True,
-        )
-        return hashlib.sha256(canonical.encode()).hexdigest()[:8]
+        # The directory name <hash> is the first 8 hex chars of SHA-256 of the
+        # spec.py file bytes (see scripts/gen_partition.py). Hashing only
+        # model+fused_ops here would collide across partitions that share
+        # FUSED_OPS but differ in GRAPH_NODES/PARTITION_NOTES, so we hash the
+        # actual spec.py content to faithfully reproduce the directory name.
+        spec_path = self.partition_dir / "spec.py"
+        if not spec_path.exists():
+            # Synthetic specs with no on-disk spec.py (e.g. the in-memory
+            # BASELINE_SPEC) cannot reproduce a directory hash, so fall back to a
+            # deterministic id over the in-memory fields rather than raising.
+            canonical = repr((self.model, self.partition_hash, self.notes,
+                              self.graph_nodes, self.fused_ops))
+            return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+        spec_bytes = spec_path.read_bytes()
+        return hashlib.sha256(spec_bytes).hexdigest()[:8]
 
     @property
     def partition_dir(self) -> Path:

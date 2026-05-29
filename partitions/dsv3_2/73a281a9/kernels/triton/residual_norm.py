@@ -57,4 +57,4 @@ def fused_residual_norm(
         eps, cols, residual.stride(0), update.stride(0), block_size,
         num_warps=8 if block_size >= 2048 else 4,
     )
-    return out_hidden, out_normed
+    return out_normed, out_hidden

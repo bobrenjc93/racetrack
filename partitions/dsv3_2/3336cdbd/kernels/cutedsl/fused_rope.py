@@ -89,17 +89,17 @@ __global__ void rope_kernel(
     int pair = threadIdx.x;
     if (pair >= half_d) return;
 
-    int idx_even = row * half_d * 2 + pair * 2;
-    int idx_odd = idx_even + 1;
+    int idx_low = row * half_d * 2 + pair;
+    int idx_high = idx_low + half_d;
     int freq_idx = row * half_d + pair;
 
-    float x0 = to_float(x[idx_even]);
-    float x1 = to_float(x[idx_odd]);
+    float x0 = to_float(x[idx_low]);
+    float x1 = to_float(x[idx_high]);
     float c = cos_cache[freq_idx];
     float s = sin_cache[freq_idx];
 
-    out[idx_even] = from_float<T>(x0 * c - x1 * s);
-    out[idx_odd] = from_float<T>(x0 * s + x1 * c);
+    out[idx_low] = from_float<T>(x0 * c - x1 * s);
+    out[idx_high] = from_float<T>(x1 * c + x0 * s);
 }
 
 void rms_norm_cuda(

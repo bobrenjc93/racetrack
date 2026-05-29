@@ -74,7 +74,13 @@ def compile_with_partition(
     Returns (compiled_model, originals_for_rollback).
     """
     if backend_override is not None:
-        prev = os.environ.get("RACETRACK_KERNEL_BACKEND")
+        # torch.compile is lazy: RacetrackBackend.__call__ -> rewrite_graph and
+        # all runtime KernelDispatcher.call dispatch read RACETRACK_KERNEL_BACKEND
+        # only when the compiled model is FIRST EXECUTED, not here. Restoring the
+        # var now would mean those lazy reads see the previous value and silently
+        # drop the override, so we set it and leave it set for the lifetime of the
+        # returned compiled model. Callers that need the prior value restored must
+        # save/restore it around their own use of the compiled model.
         os.environ["RACETRACK_KERNEL_BACKEND"] = backend_override
 
     if spec.kernel_root.is_dir():
@@ -85,12 +91,6 @@ def compile_with_partition(
     originals = apply_pre_trace_patches(model, spec, dispatcher)
     backend = RacetrackBackend(spec)
     compiled = torch.compile(model, backend=backend)
-
-    if backend_override is not None:
-        if prev is None:
-            os.environ.pop("RACETRACK_KERNEL_BACKEND", None)
-        else:
-            os.environ["RACETRACK_KERNEL_BACKEND"] = prev
 
     return compiled, originals
 

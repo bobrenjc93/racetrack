@@ -45,6 +45,15 @@ def resolve_selected_backends(row) -> dict[str, tuple[str, ...]]:
     dispatcher = KernelDispatcher(kr)
     result = {}
     for op in row.ops:
+        # The actual "best" selection is timing-based and cached in best.json,
+        # which the dispatcher loads into _best_fast_path on construction. Report
+        # the cached timed winner so the labels match the kernels build_flat_decode
+        # actually executes; only fall back to first-available when no cache entry
+        # exists for this op (or it recorded the torch fallback as fastest).
+        cached = dispatcher._best_fast_path.get(op)
+        if cached and cached != "torch" and dispatcher._resolve(cached, op) is not None:
+            result[op] = (cached,)
+            continue
         for backend in CONCRETE_BACKENDS:
             if dispatcher._resolve(backend, op) is not None:
                 result[op] = (backend,)

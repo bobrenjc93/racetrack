@@ -456,6 +456,27 @@ def _time_model(
     return out, times
 
 
+def _sync_best_selection(model: ShardedRealisticModel, device: torch.device) -> None:
+    # The 'best' dispatcher times candidate kernels independently on each rank,
+    # so per-rank CUDA jitter can yield divergent winners for the same op and a
+    # nondeterministic, last-writer-wins best.json. Broadcast rank 0's resolved
+    # selection map to every rank so the timed measurement, the reported
+    # best_summary, and the persisted cache all agree on one set of winners.
+    dispatcher = model.block.dispatcher
+    if dispatcher is None:
+        return
+    payload = [dispatcher._best, dispatcher._best_ops] if dist.get_rank() == 0 else [None, None]
+    dist.broadcast_object_list(payload, src=0, device=device)
+    best, best_ops = payload
+    # _best keys embed the source rank's device string (e.g. 'cuda:0'); rewrite
+    # it to this rank's device so the cached winner is actually hit here instead
+    # of silently re-timing and diverging again on the receiving rank.
+    src_device = "'cuda:0'"
+    dst_device = f"'{device}'"
+    dispatcher._best = {key.replace(src_device, dst_device): value for key, value in best.items()}
+    dispatcher._best_ops = {op: set(backends) for op, backends in best_ops.items()}
+
+
 def _run_backend(
     shape: RealisticShape,
     *,
@@ -487,6 +508,13 @@ def _run_backend(
         backend=backend,
         layers=layers,
     )
+    if backend == "best":
+        # Run one forward pass so every rank's dispatcher resolves and caches a
+        # per-op winner, then overwrite all ranks with rank 0's selection before
+        # the timed measurement so reported timings reflect a consistent config.
+        model.forward(hidden, positions)
+        torch.cuda.synchronize(device)
+        _sync_best_selection(model, device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     output, times = _time_model(

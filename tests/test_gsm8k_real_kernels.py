@@ -10,7 +10,11 @@ from benchmarks.gsm8k.real_kernels import (
     patch_real_model,
 )
 from benchmarks.gsm8k.real_bench import ExampleResult, _render_markdown, _row_result
-from benchmarks.gsm8k.hf_model_loader import _slice_for_rank, run_post_load_transforms
+from benchmarks.gsm8k.hf_model_loader import (
+    Assignment,
+    _slice_for_rank,
+    run_post_load_transforms,
+)
 from racetrack.partition_spec import FusedOp, PartitionSpec
 
 
@@ -441,13 +445,13 @@ def test_hf_loader_slices_rows_and_columns_by_target_shape() -> None:
 
     row_target = torch.empty(2, 4)
     assert torch.equal(
-        _slice_for_rank(value, row_target, "row", rank=2),
+        _slice_for_rank(value, Assignment("w", row_target, "row"), rank=2),
         value[4:6],
     )
 
     col_target = torch.empty(6, 2)
     assert torch.equal(
-        _slice_for_rank(value, col_target, "col", rank=1),
+        _slice_for_rank(value, Assignment("w", col_target, "col"), rank=1),
         value[:, 2:4],
     )
 

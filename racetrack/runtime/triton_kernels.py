@@ -37,17 +37,26 @@ if BACKEND_AVAILABLE:
         tl.store(out + token * cols + offsets, values * scale * weights, mask=mask)
 
     @triton.jit
-    def _rope_kernel(x, cos, sin, out, rotary_dim: tl.constexpr, stride_t: tl.constexpr):
+    def _rope_kernel(
+        x,
+        cos,
+        sin,
+        out,
+        rotary_dim: tl.constexpr,
+        stride_t: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
         token = tl.program_id(0)
         half: tl.constexpr = rotary_dim // 2
-        offsets = tl.arange(0, half)
+        offsets = tl.arange(0, block_size)
+        mask = offsets < half
         row = token * stride_t
-        x1 = tl.load(x + row + offsets).to(tl.float32)
-        x2 = tl.load(x + row + offsets + half).to(tl.float32)
-        c = tl.load(cos + token * half + offsets).to(tl.float32)
-        s = tl.load(sin + token * half + offsets).to(tl.float32)
-        tl.store(out + row + offsets, x1 * c - x2 * s)
-        tl.store(out + row + offsets + half, x2 * c + x1 * s)
+        x1 = tl.load(x + row + offsets, mask=mask, other=0.0).to(tl.float32)
+        x2 = tl.load(x + row + offsets + half, mask=mask, other=0.0).to(tl.float32)
+        c = tl.load(cos + token * half + offsets, mask=mask, other=0.0).to(tl.float32)
+        s = tl.load(sin + token * half + offsets, mask=mask, other=0.0).to(tl.float32)
+        tl.store(out + row + offsets, x1 * c - x2 * s, mask=mask)
+        tl.store(out + row + offsets + half, x2 * c + x1 * s, mask=mask)
 
     @triton.jit
     def _residual_norm_kernel(
@@ -147,6 +156,7 @@ def _apply_rope_triton(
         raise RuntimeError("Triton RoPE kernel requires an even RoPE dimension")
     cos, sin = torch_ops.rope_cache(positions, rotary_dim, base=rope_base, dtype=x.dtype)
     out = torch.empty_like(x)
+    block_size = triton.next_power_of_2(rotary_dim // 2)
     _rope_kernel[(x.shape[0],)](
         x,
         cos.contiguous(),
@@ -154,6 +164,7 @@ def _apply_rope_triton(
         out,
         rotary_dim,
         x.stride(0),
+        block_size,
         num_warps=1,
     )
     return out

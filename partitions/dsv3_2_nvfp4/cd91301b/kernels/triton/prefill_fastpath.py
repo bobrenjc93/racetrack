@@ -137,7 +137,7 @@ def fused_norms_rope_cache_prefill(
 ):
     del fallback
     apply_rotary_emb = importlib.import_module(
-        "partitions.dsv3_2_nvfp4.cd91301b.model"
+        "partitions.dsv3_2_nvfp4.model"
     ).apply_rotary_emb
 
     bsz, seqlen = q_c.shape[0], q_c.shape[1]
@@ -160,7 +160,7 @@ def fused_prefill_qkv_b_rope_cache(
 ):
     del fallback
     apply_rotary_emb = importlib.import_module(
-        "partitions.dsv3_2_nvfp4.cd91301b.model"
+        "partitions.dsv3_2_nvfp4.model"
     ).apply_rotary_emb
 
     bsz, seqlen = q_c.shape[0], q_c.shape[1]
@@ -196,7 +196,7 @@ def fused_q_prefill_proj(
 def fused_q_rope_prefill(q_pe, freqs_cis, *, fallback):
     del fallback
     apply_rotary_emb = importlib.import_module(
-        "partitions.dsv3_2_nvfp4.cd91301b.model"
+        "partitions.dsv3_2_nvfp4.model"
     ).apply_rotary_emb
 
     return apply_rotary_emb(q_pe, freqs_cis, interleaved=True)

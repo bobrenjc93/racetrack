@@ -109,6 +109,16 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
         _cached_layers = layers
         _cached_model_id = mid
 
+    # NOTE: the baseline MLA decode masks attention to the indexer's top-k cache
+    # positions (min(index_topk, end_pos)); this flat CUDA-graph path reads the
+    # full KV cache with no indexer mask. The two agree only while the running
+    # end_pos stays <= index_topk (the top-k then selects every position and the
+    # mask is all-zero), which holds for the short GSM8K sequences this fast path
+    # targets. Sequences that actually exceed index_topk at runtime would attend
+    # to extra positions and diverge from the baseline; that regime is
+    # unsupported here. max_t is the buffer size (not the runtime end_pos), so it
+    # is not a valid gate and must not be asserted against index_topk.
+
     def _do_act_quant(x):
         if aq is not None:
             return aq.fused_act_quant(x, fallback=None)

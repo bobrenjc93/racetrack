@@ -322,6 +322,7 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
@@ -357,6 +358,9 @@ class Indexer(nn.Module):
         k_s = self.k_scale_cache[:bsz, :end_pos].squeeze(-1).contiguous()
         k_cached = self.k_cache[:bsz, :end_pos].contiguous()
         index_score = fp8_index(q_fp8.float(), weights, k_cached, k_s)
+
+        if mask is not None:
+            index_score = index_score + mask
 
         topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
         return topk_indices
@@ -425,7 +429,16 @@ class FlattenedMLAAttention(nn.Module):
         self.kv_cache[:bsz, start_pos:end_pos] = kv_c
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
 
-        topk_indices = self.indexer(x, qr, start_pos, freqs_cis)
+        if mask is not None:
+            # The masked (prefill) path builds k/v from the current chunk only,
+            # so its score/index_mask space is (bsz, seqlen, seqlen). The indexer
+            # ranks over end_pos, so when start_pos>0 topk_indices can exceed
+            # seqlen and scatter out of bounds; require full prefill at pos 0.
+            # Checked before the indexer call so the constraint fails clearly
+            # rather than as a downstream shape mismatch inside the indexer.
+            assert start_pos == 0, "masked prefill path requires start_pos == 0; chunked prefill is unsupported"
+
+        topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
 
         if mask is not None:
             q = torch.cat([q_nope, q_pe], dim=-1)

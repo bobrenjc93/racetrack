@@ -116,6 +116,7 @@ def fused_q_indexer_score(
     rope_head_dim: int,
     softmax_scale: float,
     idx_softmax_scale: float,
+    index_topk: int,
     start_pos: int,
     end_pos: int,
     block_size: int,
@@ -136,7 +137,7 @@ def fused_q_indexer_score(
     k_s = k_scale_cache[:bsz, :end_pos].squeeze(-1).contiguous()
     k_cached = k_cache[:bsz, :end_pos].contiguous()
     index_score = fp8_index(idx_q_fp8.float(), weights, k_cached, k_s)
-    topk_indices = index_score.topk(min(end_pos, seqlen * 2), dim=-1)[1]
+    topk_indices = index_score.topk(min(index_topk, end_pos), dim=-1)[1]
     return q_nope, q_nope_absorbed, q_pe, topk_indices"""
 
 _Q_ROPE_QUANT_OPS = """\
@@ -145,7 +146,7 @@ def fused_q_rope_quant(
     freqs_cis: torch.Tensor,
     *,
     block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     q_pe = apply_rotary_emb(q_pe, freqs_cis, interleaved=True)
     return q_pe"""
 
@@ -312,6 +313,7 @@ _ATTN_FORWARD_NEW = """\
                 rope_head_dim=config.qk_rope_head_dim,
                 softmax_scale=self.softmax_scale,
                 idx_softmax_scale=self.indexer.softmax_scale,
+                index_topk=config.index_topk,
                 start_pos=start_pos, end_pos=end_pos,
                 block_size=config.block_size,
             )
@@ -333,6 +335,7 @@ _ATTN_FORWARD_NEW = """\
                 rope_head_dim=config.qk_rope_head_dim,
                 softmax_scale=self.softmax_scale,
                 idx_softmax_scale=self.indexer.softmax_scale,
+                index_topk=config.index_topk,
                 start_pos=start_pos, end_pos=end_pos,
                 block_size=config.block_size,
             )

@@ -46,6 +46,16 @@ def fused_act_quant(x, *, fallback):
     n_rows = x_c.numel() // N
     n_groups = (N + QUANT_BLOCK - 1) // QUANT_BLOCK
 
+    if N % QUANT_BLOCK != 0:
+        # The block-quant kernel reshapes into exact 128-wide groups, which is
+        # impossible when N is not a multiple of QUANT_BLOCK. Mirror the
+        # reference fallback by emitting unscaled fp8 with an all-ones scale,
+        # sized to the ceil(N/128) groups that the fx fake op declares so the
+        # downstream fp8_gemm sees a consistently shaped scale tensor.
+        fp8 = x_c.to(torch.float8_e4m3fn)
+        scale = torch.ones(*shape[:-1], n_groups, dtype=torch.float32, device=x_c.device)
+        return fp8, scale
+
     x_flat = x_c.float().view(n_rows * n_groups, QUANT_BLOCK)
     fp8_flat, scale_flat = _act_quant_kernel(x_flat)
     return fp8_flat.view(shape), scale_flat.view(*shape[:-1], n_groups)

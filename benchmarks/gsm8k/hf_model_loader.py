@@ -11,6 +11,7 @@ import torch
 
 SLICE = Literal["full", "row", "col"]
 POST_LOAD_TRANSFORM_HOOKS = ("rebuild_derived_weights", "fuse_indexer_weights")
+FP8_BLOCK_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class Assignment:
     source_key: str
     target: torch.Tensor
     slice_kind: SLICE
+    block_elems: int | None = None
 
 
 def load_hf_sharded_weights(
@@ -56,7 +58,7 @@ def load_hf_sharded_weights(
         with safe_open(str(shard_path), framework="pt", device="cpu") as shard:
             for assignment in by_shard[shard_name]:
                 value = shard.get_tensor(assignment.source_key)
-                value = _slice_for_rank(value, assignment.target, assignment.slice_kind, rank)
+                value = _slice_for_rank(value, assignment, rank)
                 _copy_into(assignment.target, value)
                 loaded += 1
     return loaded
@@ -74,14 +76,15 @@ def run_post_load_transforms(
     checkpoint parameters rather than stored directly in the checkpoint.
     """
     called: list[str] = []
-    for module_name, module in model.named_modules():
-        for hook_name in hook_names:
-            hook = getattr(module, hook_name, None)
-            if callable(hook):
-                hook()
-                label = module_name or module.__class__.__name__
-                called.append(f"{label}.{hook_name}")
-                break
+    with torch.no_grad():
+        for module_name, module in model.named_modules():
+            for hook_name in hook_names:
+                hook = getattr(module, hook_name, None)
+                if callable(hook):
+                    hook()
+                    label = module_name or module.__class__.__name__
+                    called.append(f"{label}.{hook_name}")
+                    break
     return called
 
 
@@ -96,19 +99,30 @@ def _copy_into(target: torch.Tensor, value: torch.Tensor) -> None:
 
 def _slice_for_rank(
     value: torch.Tensor,
-    target: torch.Tensor,
-    slice_kind: SLICE,
+    assignment: Assignment,
     rank: int,
 ) -> torch.Tensor:
+    slice_kind = assignment.slice_kind
+    target = assignment.target
     if slice_kind == "full":
         return value
-    if slice_kind == "row":
-        rows = target.shape[0]
-        return value.narrow(0, rank * rows, rows)
-    if slice_kind == "col":
-        cols = target.shape[1]
-        return value.narrow(1, rank * cols, cols)
-    raise AssertionError(slice_kind)
+    dim = 0 if slice_kind == "row" else 1
+    span = target.shape[dim]
+    if assignment.block_elems is None:
+        return value.narrow(dim, rank * span, span)
+    # FP8 block scales are stored one value per ``FP8_BLOCK_SIZE`` element block.
+    # The per-rank element span must be block-aligned, otherwise a single scale
+    # block straddles two ranks and cannot be sharded without corrupting the
+    # neighbouring rank; assert so the misalignment fails loudly instead of
+    # silently slicing at ``rank * ceil(span/block)`` (the prior behaviour).
+    block_elems = assignment.block_elems
+    if block_elems % FP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"FP8 sharded dim {block_elems} for {assignment.source_key} is not a "
+            f"multiple of block size {FP8_BLOCK_SIZE}; scale blocks would misalign"
+        )
+    block_start = (rank * block_elems) // FP8_BLOCK_SIZE
+    return value.narrow(dim, block_start, span)
 
 
 def _add_linear(
@@ -120,7 +134,19 @@ def _add_linear(
     assignments.append(Assignment(hf_weight_key, module.weight, slice_kind))
     scale = getattr(module, "scale", None)
     if scale is not None:
-        assignments.append(Assignment(hf_weight_key + "_scale_inv", scale, slice_kind))
+        # The scale tensor is block-wise (one value per FP8_BLOCK_SIZE block),
+        # so its rank slice cannot reuse the weight's element-unit slice math.
+        # Record the weight's per-rank element span along the sharded axis so
+        # ``_slice_for_rank`` can derive the block-aligned scale offset and
+        # reject spans that are not a multiple of the block size.
+        block_elems = None
+        if slice_kind == "row":
+            block_elems = module.weight.shape[0]
+        elif slice_kind == "col":
+            block_elems = module.weight.shape[1]
+        assignments.append(
+            Assignment(hf_weight_key + "_scale_inv", scale, slice_kind, block_elems)
+        )
 
 
 def _build_assignments(

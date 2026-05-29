@@ -81,6 +81,38 @@ def _resolve_kernel(dispatcher: KernelDispatcher, op_name: str):
 # ---------------------------------------------------------------------------
 
 
+def _write_indexer_k_cache(module, x, start_pos, freqs_cis) -> None:
+    """Populate the indexer K-cache for positions short-circuited by full-topk.
+
+    When end_pos <= index_topk the indexer returns arange instead of running
+    the real forward, so its k_cache/k_scale_cache buffers (which the fallback
+    indexer later reads over the whole [0, end_pos) prefix) would stay stale.
+    This mirrors the K-cache write in Indexer.forward so the cached keys for
+    short-circuited positions are correct once the fallback path eventually runs.
+    """
+    # Lightweight indexer stubs (and any variant without the K-cache buffers)
+    # have nothing to populate; skip so the short-circuit stays a pure arange
+    # return for callers that do not maintain a K-cache of their own.
+    if not hasattr(module, "k_cache"):
+        return
+
+    from racetrack.models import deepseek as rm
+
+    bsz, seqlen, _ = x.size()
+    end_pos = start_pos + seqlen
+    k = module.wk(x)
+    k = module.k_norm(k)
+    k_pe, k_nope = torch.split(
+        k, [module.rope_head_dim, module.head_dim - module.rope_head_dim], dim=-1,
+    )
+    k_pe = rm.apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, False).squeeze(2)
+    k = torch.cat([k_pe, k_nope], dim=-1)
+    k = rm.rotate_activation(k)
+    k_fp8, k_scale = rm.act_quant(k, rm.block_size, module.scale_fmt)
+    module.k_cache[:bsz, start_pos:end_pos] = k_fp8
+    module.k_scale_cache[:bsz, start_pos:end_pos] = k_scale
+
+
 @register_patcher("fused_full_topk_indexer")
 def _patch_full_topk_indexer(
     model: nn.Module,
@@ -98,32 +130,34 @@ def _patch_full_topk_indexer(
         topk = module.index_topk
 
         if kernel_fn is not None:
-            def _make_forward(orig, top_k, kfn):
+            def _make_forward(orig, top_k, kfn, indexer):
                 def forward(x, qr, start_pos, freqs_cis, mask):
                     bsz, seqlen, _ = x.size()
                     end_pos = start_pos + seqlen
                     if end_pos <= top_k:
+                        _write_indexer_k_cache(indexer, x, start_pos, freqs_cis)
                         return torch.arange(
                             end_pos, device=x.device, dtype=torch.long,
                         ).view(1, 1, end_pos).expand(bsz, seqlen, end_pos)
                     def fallback(indexer, hidden, q_residual, pos, freqs, attn_mask):
                         del indexer
                         return orig(hidden, q_residual, pos, freqs, attn_mask)
-                    return kfn(module, x, qr, start_pos, freqs_cis, mask, fallback=fallback)
+                    return kfn(indexer, x, qr, start_pos, freqs_cis, mask, fallback=fallback)
                 return forward
-            _set_attr(module, "forward", _make_forward(original_forward, topk, kernel_fn), originals)
+            _set_attr(module, "forward", _make_forward(original_forward, topk, kernel_fn, module), originals)
         else:
-            def _make_forward_shortcircuit(orig, top_k):
+            def _make_forward_shortcircuit(orig, top_k, indexer):
                 def forward(x, qr, start_pos, freqs_cis, mask):
                     bsz, seqlen, _ = x.size()
                     end_pos = start_pos + seqlen
                     if end_pos <= top_k:
+                        _write_indexer_k_cache(indexer, x, start_pos, freqs_cis)
                         return torch.arange(
                             end_pos, device=x.device, dtype=torch.long,
                         ).view(1, 1, end_pos).expand(bsz, seqlen, end_pos)
                     return orig(x, qr, start_pos, freqs_cis, mask)
                 return forward
-            _set_attr(module, "forward", _make_forward_shortcircuit(original_forward, topk), originals)
+            _set_attr(module, "forward", _make_forward_shortcircuit(original_forward, topk, module), originals)
 
     # MLA full-topk shortcircuit is handled by the indexer patch above.
     # Skipping MLA forward patching to avoid conflicts with other patchers.
@@ -257,7 +291,7 @@ def _patch_attn_norm_qkv(
         return
     from racetrack.models import deepseek as rm
     for module in model.modules():
-        if not isinstance(module, rm.RMSNorm):
+        if isinstance(module, (rm.RMSNorm, rm.MLA)):
             _set_attr(module, "kernel_dispatcher", dispatcher, originals)
             _set_attr(module, "kernel_stats", None, originals)
 

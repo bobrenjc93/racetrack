@@ -349,16 +349,16 @@ def _read_partition_notes(model_py: Path) -> str:
         return ""
     text = model_py.read_text()
     m = re.search(
-        r'PARTITION_NOTES\s*=\s*\(\s*((?:"[^"]*"\s*)+)\)',
+        r'PARTITION_NOTES\s*=\s*\(\s*((?:(["\'])[^"\']*\2\s*)+)\)',
         text, re.DOTALL,
     )
-    if not m:
-        m = re.search(r'PARTITION_NOTES\s*=\s*"([^"]*)"', text)
+    if m:
+        parts = re.findall(r'(["\'])([^"\']*)\1', m.group(1))
+        return "".join(p[1] for p in parts)
+    m = re.search(r'PARTITION_NOTES\s*=\s*(["\'])(.*?)\1', text)
     if not m:
         return ""
-    raw = m.group(1)
-    parts = re.findall(r'"([^"]*)"', raw)
-    return "".join(parts)
+    return m.group(2)
 
 
 def generate_baseline_graph(model_name: str, info: dict) -> Path:

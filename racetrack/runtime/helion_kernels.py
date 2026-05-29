@@ -17,7 +17,7 @@ except Exception:
 
 
 def _autotune_effort() -> str:
-    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "quick")
+    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "none")
 
 
 def _require_helion_cuda(*tensors: torch.Tensor) -> None:

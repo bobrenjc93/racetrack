@@ -230,7 +230,7 @@ def _patch_rmsnorm(module):
         cols = shape[-1]
         x_flat = x.view(-1, cols) if x.is_contiguous() else x.contiguous().view(-1, cols)
         r_flat = residual.view(-1, cols) if residual.is_contiguous() else residual.contiguous().view(-1, cols)
-        hidden, normed = kernel.fused_residual_norm(
+        normed, hidden = kernel.fused_residual_norm(
             r_flat, x_flat, module.weight, eps=module.eps, fallback=None,
         )
         return normed.view(shape), hidden.view(shape)
