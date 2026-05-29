@@ -55,7 +55,7 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
     """
     global _cached_layers, _cached_model_id
 
-    from racetrack.models.deepseek import apply_rotary_emb, weight_dequant
+    from racetrack.models.deepseek import apply_rotary_emb
     from racetrack.models.deepseek import fp8_gemm
     from racetrack.models import deepseek as inf_kernel
 
@@ -78,9 +78,6 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
     embed_vsi = model.embed.vocab_start_idx
     embed_vei = model.embed.vocab_end_idx
     embed_pvs = model.embed.part_vocab_size
-    _zero_scalar = torch.tensor(0, device="cuda", dtype=torch.long)
-    _zero_embed = torch.zeros(1, model.embed.dim, device="cuda", dtype=embed_weight.dtype)
-
     def _cg_safe_embed(x):
         if ws > 1:
             mask = (x < embed_vsi) | (x >= embed_vei)
@@ -95,7 +92,6 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
     norm_weight = model.norm.weight
     norm_eps = model.norm.eps
     head_weight = model.head.weight
-    head_scale = model.head.scale if hasattr(model.head, 'scale') else None
     max_t = max_seq_len or model.max_seq_len
 
     mid = id(model)
@@ -191,7 +187,6 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
         """Single decode step using static position buffers. CUDA-graph-safe."""
         bsz = 1
         fc = static_fc
-        pos = static_pos[0]
 
         h = _cg_safe_embed(tok)
         residual = None

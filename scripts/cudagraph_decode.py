@@ -6,7 +6,7 @@ Run with:
   PYTHONPATH=~/local/b/pytorch:. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     torchrun --standalone --nproc-per-node=8 /tmp/test_cg_fused.py
 """
-import os, sys, time, importlib.util, torch, torch.nn.functional as F, torch.distributed as dist
+import os, time, importlib.util, torch, torch.nn.functional as F, torch.distributed as dist
 
 # Load fused kernels directly (no dispatcher)
 def _load_kernel(name):
@@ -109,7 +109,7 @@ def main():
         graph = torch.cuda.CUDAGraph()
         try:
             with torch.cuda.graph(graph):
-                result = decode_step()
+                _ = decode_step()
             torch.cuda.synchronize()
             if rank == 0: print("Captured!", flush=True)
         except Exception as e:
@@ -220,7 +220,6 @@ def _fused_standalone_norm(x, weight, eps):
 def _patch_rmsnorm(module):
     """Use fused Triton kernels for both residual and standalone norm."""
     kernel = KERNELS['residual_norm']
-    original = module.forward
 
     def forward(x, residual=None):
         if residual is None:
@@ -271,7 +270,6 @@ def _patch_moe(module):
     n_local = len(local_experts)
 
     has_scales = hasattr(local_experts[0].w1.weight, 'scale') and local_experts[0].w1.weight.scale is not None
-    scale_fmt = local_experts[0].w1.scale_fmt if has_scales else None
 
     if has_scales:
         w1_s = torch.stack([e.w1.weight.scale for e in local_experts])
