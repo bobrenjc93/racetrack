@@ -29,13 +29,10 @@ from benchmarks.common import (
 from benchmarks.gsm8k.eval import _generate_greedy
 from benchmarks.gsm8k.hf_auth import require_hf_token
 from benchmarks.gsm8k.real_kernels import (
-    RealKernelRow,
     discover_real_kernel_rows,
     patch_real_model,
 )
 from benchmarks.real_bench_common import (
-    _rank,
-    _world_size,
     _is_rank0,
     can_use_fused_patches as _can_use_fused_patches,
     resolve_selected_backends as _resolve_selected_backends,
@@ -114,7 +111,7 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
         if _is_rank0():
             print(f"Row {row.partition}/{row.backend}: {len(row.ops)} ops", flush=True)
         try:
-            with patch_real_model(model, row, strict_kernel_use=False) as stats:
+            with patch_real_model(model, row, strict_kernel_use=False):
                 if _is_rank0():
                     print("  warmup ...", flush=True)
                 _time_generation(model, tokenizer, PROMPTS,

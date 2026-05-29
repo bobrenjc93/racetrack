@@ -533,7 +533,7 @@ def main() -> None:
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"  WARNING: graph generation failed: {e}", file=sys.stderr)
 
-    print(f"\nDone. Test with:")
+    print("\nDone. Test with:")
     print(
         f"  RACETRACK_KERNEL_BACKEND=triton \\\n"
         f"    python -m racetrack.bench \\\n"

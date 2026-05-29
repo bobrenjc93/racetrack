@@ -27,7 +27,7 @@ from torch.fx import GraphModule
 
 from racetrack.fx_patterns import rewrite_graph
 from racetrack.partition_spec import BASELINE_SPEC, PartitionSpec
-from racetrack.pre_trace import Originals, apply_pre_trace_patches, rollback_patches
+from racetrack.pre_trace import Originals, apply_pre_trace_patches
 from racetrack.runtime.dispatch import KernelDispatcher
 
 

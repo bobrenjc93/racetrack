@@ -5,7 +5,6 @@ timing, partition discovery, result ranking, and report rendering.
 """
 from __future__ import annotations
 
-import os
 import platform
 import time
 from pathlib import Path

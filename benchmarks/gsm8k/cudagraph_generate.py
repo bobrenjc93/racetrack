@@ -12,8 +12,6 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from racetrack.partition_spec import PartitionSpec
-from racetrack.runtime.dispatch import KernelDispatcher
 
 
 def _load_kernel(kernel_root: Path, name: str):
@@ -241,7 +239,6 @@ def _make_moe_forward(module, kernels):
 
     has_scales = hasattr(local_experts[0].w1.weight, 'scale') and local_experts[0].w1.weight.scale is not None
     aq = kernels.get("act_quant")
-    sw = kernels.get("swiglu")
 
     if has_scales:
         w1_s = torch.stack([e.w1.weight.scale for e in local_experts])
@@ -315,7 +312,7 @@ def _make_mla_forward(module, kernels):
     def forward(x, start_pos, freqs_cis, mask):
         if mask is not None:
             return original(x, start_pos, freqs_cis, mask)
-        from racetrack.models.deepseek import apply_rotary_emb, weight_dequant
+        from racetrack.models.deepseek import apply_rotary_emb
         from racetrack.models.deepseek import fp8_gemm
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
@@ -535,7 +532,6 @@ def generate_greedy_cudagraph(
 
             if is_decode and graph is not None:
                 static_tok.copy_(tokens[:, prev_pos:prev_pos+1])
-                fc = model.freqs_cis[prev_pos:prev_pos+1]
                 _update_attn_masks(cur_pos)
                 graph.replay()
                 logits = static_logits
@@ -570,7 +566,7 @@ def generate_greedy_cudagraph(
                         with torch.cuda.graph(graph):
                             _capture_decode()
                         torch.cuda.synchronize()
-                    except Exception as e:
+                    except Exception:
                         graph = None
 
             next_token = logits.argmax(dim=-1)
