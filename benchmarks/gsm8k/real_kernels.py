@@ -1,9 +1,9 @@
 """Attach partition-local kernels to real DeepSeek inference modules.
 
-Uses the new partition spec system: each partition is defined by a spec.py
-(which ops to fuse) + kernels/<backend>/<op>.py (implementations). The
-compile_with_partition() function applies pre-trace patches and wraps the
-model with a torch.compile custom backend for FX pattern matching.
+Uses the partition spec system: each partition is defined by a spec.py
+(which ops to fuse) + kernels/<backend>/ implementations. This module applies
+the spec's pre-trace/module patches via apply_pre_trace_patches and routes the
+fused ops through the kernel dispatcher on the real model's modules.
 
 A leaderboard row is:
     real full model + one partition spec + one backend
@@ -14,18 +14,13 @@ import contextlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Iterator
 
 import torch
 
-from racetrack.compile_backend import (
-    cleanup_compile_state,
-    compile_with_partition,
-)
 from racetrack.partition_spec import (
     PartitionSpec,
     discover_partitions,
-    load_spec,
 )
 from racetrack.pre_trace import Originals, rollback_patches
 from racetrack.runtime.dispatch import KernelDispatcher
@@ -186,7 +181,7 @@ def patch_real_model(
             if backend not in disabled
         }
 
-    from racetrack.pre_trace import apply_pre_trace_patches, _set_attr
+    from racetrack.pre_trace import apply_pre_trace_patches
     originals = apply_pre_trace_patches(model, spec, dispatcher)
 
     _attach_kernel_dispatcher_for_fx_ops(model, spec, dispatcher, stats, originals)

@@ -1,9 +1,9 @@
 """GSM8K benchmark harness.
 
-Measures throughput at sequence lengths representative of the GSM8K dataset:
-  - question:  96 tokens  (median question length)
-  - cot:      256 tokens  (chain-of-thought answer)
-  - full:     384 tokens  (question + full answer)
+Measures throughput across a prefill sequence-length sweep:
+  - prefill_512:   512 tokens
+  - prefill_2048: 2048 tokens
+  - prefill_4096: 4096 tokens
 
 Local optimization runs use dummy synthetic weights and validate each row's
 logits against the baseline implementation for the same synthetic inputs. A
@@ -778,10 +778,9 @@ def main() -> None:
         )
     else:
         try:
-            hf_token = require_hf_token(args.hf_token, purpose="GSM8K benchmark reports")
+            require_hf_token(args.hf_token, purpose="GSM8K benchmark reports")
         except ValueError as exc:
             parser.error(str(exc))
-        del hf_token
         raise SystemExit(REAL_WEIGHT_UNSUPPORTED)
 
     results = run(

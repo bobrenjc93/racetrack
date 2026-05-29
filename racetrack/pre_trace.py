@@ -10,12 +10,10 @@ as FX subgraph pattern matches.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Callable
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 
 from racetrack.partition_spec import PartitionSpec
 from racetrack.runtime.dispatch import KernelDispatcher
@@ -161,50 +159,6 @@ def _patch_full_topk_indexer(
 
     # MLA full-topk shortcircuit is handled by the indexer patch above.
     # Skipping MLA forward patching to avoid conflicts with other patchers.
-
-
-def _mla_full_topk_forward(module, x, start_pos, freqs_cis, mask):
-    from racetrack.models import deepseek as real_model
-
-    bsz, seqlen, _ = x.size()
-    end_pos = start_pos + seqlen
-    qr = module.q_norm(module.wq_a(x))
-    q = module.wq_b(qr)
-    q = q.view(bsz, seqlen, module.n_local_heads, module.qk_head_dim)
-    q_nope, q_pe = torch.split(q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
-    q_pe = real_model.apply_rotary_emb(q_pe, freqs_cis)
-    kv = module.wkv_a(x)
-    kv, k_pe = torch.split(kv, [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1)
-    kv = module.kv_norm(kv)
-    k_pe = real_model.apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-    module.kv_cache[:bsz, start_pos:end_pos] = kv
-    module.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-    module.indexer(x, qr, start_pos, freqs_cis, mask)
-
-    if mask is not None:
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        kv = module.wkv_b(kv)
-        kv = kv.view(bsz, seqlen, module.n_local_heads, module.qk_nope_head_dim + module.v_head_dim)
-        k_nope, v = torch.split(kv, [module.qk_nope_head_dim, module.v_head_dim], dim=-1)
-        k = torch.cat([k_nope, k_pe.expand(-1, -1, module.n_local_heads, -1)], dim=-1)
-        scores = torch.einsum("bshd,bthd->bsht", q, k).mul_(module.softmax_scale)
-        scores += mask.unsqueeze(0).unsqueeze(2)
-        scores = scores.softmax(dim=-1)
-        x = torch.einsum("bsht,bthd->bshd", scores, v)
-    else:
-        if module.dequant_wkv_b is None and module.wkv_b.scale is not None:
-            module.dequant_wkv_b = real_model.weight_dequant(module.wkv_b.weight, module.wkv_b.scale)
-        wkv_b = module.wkv_b.weight if module.dequant_wkv_b is None else module.dequant_wkv_b
-        wkv_b = wkv_b.view(module.n_local_heads, -1, module.kv_lora_rank)
-        q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :module.qk_nope_head_dim])
-        scores = (
-            torch.einsum("bshc,btc->bsht", q_nope, module.kv_cache[:bsz, :end_pos])
-            + torch.einsum("bshr,btr->bsht", q_pe, module.pe_cache[:bsz, :end_pos])
-        ) * module.softmax_scale
-        scores = scores.softmax(dim=-1)
-        x = torch.einsum("bsht,btc->bshc", scores, module.kv_cache[:bsz, :end_pos])
-        x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -module.v_head_dim:])
-    return module.wo(x.flatten(2))
 
 
 @register_patcher("fused_single_token_moe")

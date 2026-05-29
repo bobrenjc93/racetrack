@@ -47,8 +47,6 @@ from benchmarks.gsm8k.real_kernels import (
     patch_real_model,
 )
 from benchmarks.real_bench_common import (
-    _rank,
-    _world_size,
     _is_rank0,
     can_use_fused_patches as _can_use_fused_patches,
     resolve_selected_backends as _resolve_selected_backends,
@@ -198,7 +196,6 @@ def _evaluate_row_cudagraph_prebuilt(
     model,
     tokenizer,
     dataset,
-    flat_cg_fn,
     update_bufs,
     static_logits,
     graph,
@@ -265,7 +262,6 @@ def _row_result(
 ) -> RowResult:
     correct = sum(result.correct for result in outputs)
     total = len(outputs)
-    baseline_correct = sum(result.correct for result in baseline_outputs)
     answer_diffs = [
         _answer_abs_diff(result.predicted, baseline.predicted)
         for result, baseline in zip(outputs, baseline_outputs)
@@ -299,14 +295,6 @@ def _answer_abs_diff(left: float | None, right: float | None) -> float:
     if left is None or right is None:
         return 0.0 if left is None and right is None else math.inf
     return abs(left - right)
-
-
-def _format_diff(value: float | None) -> str:
-    if value is None:
-        return "-"
-    if not math.isfinite(value):
-        return "inf"
-    return f"{value:.3e}"
 
 
 def run(
@@ -484,7 +472,7 @@ def run(
                 try:
                     if _is_rank0():
                         print("  building flat decode + capturing CUDA graph ...", flush=True)
-                    flat_fn, flat_cg_fn, update_bufs, s_logits, graph, static_tok = \
+                    _, _, update_bufs, s_logits, graph, static_tok = \
                         build_and_capture_cudagraph(
                             model, kr, cg_backend, prompt_len, cg_max_seq,
                         )
@@ -497,7 +485,7 @@ def run(
                         print("  timed run ...", flush=True)
                     cg_outputs, total_ms = _evaluate_row_cudagraph_prebuilt(
                         model, tokenizer, single_dataset,
-                        flat_cg_fn, update_bufs, s_logits, graph, static_tok,
+                        update_bufs, s_logits, graph, static_tok,
                         max_new_tokens=max_new_tokens,
                     )
 
