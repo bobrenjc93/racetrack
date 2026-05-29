@@ -21,7 +21,6 @@ import importlib
 import os
 import platform
 import subprocess
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +29,6 @@ import torch
 
 from benchmarks.common import (
     TORCH_COMPILE_BACKEND,
-    TORCH_COMPILE_ALIASES,
     CONCRETE_BACKENDS,
     EVAL_MODEL,
     MODELS,
@@ -138,7 +136,7 @@ def _validate_cases(cases: tuple[ArithmeticCase, ...] = CASES) -> None:
             )
 
 
-def _load_partition_module(model_name: str, partition: str):
+def _load_partition_module(model_name: str):
     return importlib.import_module(f"partitions.{model_name}.model")
 
 
@@ -162,9 +160,6 @@ def _build_model_with_partition(module, partition_root: Path | None = None):
             if hasattr(layer, 'attn'):
                 layer.attn.dispatcher = dispatcher
     return model
-
-
-_normalize_backend_name = normalize_backend_name
 
 
 def _cleanup_compile_state(device: torch.device) -> None:
@@ -211,7 +206,7 @@ def _backend_list(
     kernel_filter: str,
     device: torch.device,
 ) -> list[str]:
-    kernel_filter = _normalize_backend_name(kernel_filter)
+    kernel_filter = normalize_backend_name(kernel_filter)
     if partition == "baseline":
         if kernel_filter in ("all", "available"):
             return ["torch", TORCH_COMPILE_BACKEND]
@@ -224,7 +219,7 @@ def _backend_list(
         backends = ["torch"]
         if device.type != "cuda":
             return backends
-        module = _load_partition_module(model_name, partition)
+        module = _load_partition_module(model_name)
         pr = _partition_root(model_name, partition)
         model = _build_model_with_partition(module, pr).eval()
         status_map = getattr(model, "backend_status", {"torch": "native"})
@@ -241,84 +236,9 @@ def _backend_list(
     return [kernel_filter]
 
 
-def _resolve_dtype(name: str, device: torch.device) -> torch.dtype:
-    if name == "auto":
-        return torch.bfloat16 if device.type == "cuda" else torch.float32
-    mapping = {
-        "float32": torch.float32,
-        "fp32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float16": torch.float16,
-        "fp16": torch.float16,
-    }
-    if name not in mapping:
-        raise KeyError(f"Unknown dtype {name!r}")
-    return mapping[name]
-
-
-def _sync(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
 def _encode_case(case: ArithmeticCase, *, device: torch.device, vocab_size: int) -> torch.Tensor:
     ids = [byte % vocab_size for byte in case.text.encode("ascii")]
     return torch.tensor(ids, device=device, dtype=torch.long)
-
-
-def _time_forward(
-    model: torch.nn.Module,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    warmup: int,
-    repeat: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, list[float]]:
-    output = None
-    for _ in range(warmup):
-        output = model(input_ids, positions)
-    _sync(device)
-
-    if device.type == "cuda":
-        if output is None:
-            output = model(input_ids, positions)
-            _sync(device)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            output = model(input_ids, positions)
-
-        times: list[float] = []
-        for _ in range(repeat):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            graph.replay()
-            end.record()
-            torch.cuda.synchronize(device)
-            times.append(float(start.elapsed_time(end)))
-    else:
-        times = []
-        for _ in range(repeat):
-            start_time = time.perf_counter()
-            output = model(input_ids, positions)
-            times.append((time.perf_counter() - start_time) * 1000.0)
-    assert output is not None
-    return output, times
-
-
-def _discover_kernel_map(dispatcher, backend: str) -> dict[str, str] | None:
-    kernel_map: dict[str, str] = {}
-    for mod in dispatcher._load_backend_modules(backend):
-        if not bool(getattr(mod, "BACKEND_AVAILABLE", False)):
-            continue
-        for name in dir(mod):
-            if name.startswith("_") or name == "BACKEND_AVAILABLE":
-                continue
-            if callable(getattr(mod, name)):
-                kernel_map[name] = backend
-    return kernel_map or None
 
 
 def _benchmark_backend(
@@ -335,7 +255,7 @@ def _benchmark_backend(
     repeat: int,
 ) -> Result:
     os.environ["RACETRACK_KERNEL_BACKEND"] = _env_backend(backend)
-    module = _load_partition_module(model_name, partition)
+    module = _load_partition_module(model_name)
     pr = _partition_root(model_name, partition)
     model = _build_model_with_partition(module, pr).to(device=device, dtype=dtype).eval()
     status_map = getattr(model, "backend_status", {"torch": "native"})
@@ -459,7 +379,7 @@ def _discover_dispatched_ops(results: list[Result], partition: str) -> list[str]
     for result in results:
         if result.partition != partition or result.backend in ("torch", TORCH_COMPILE_BACKEND):
             continue
-        module = _load_partition_module(result.model, partition)
+        module = _load_partition_module(result.model)
         pr = _partition_root(result.model, partition)
         model = _build_model_with_partition(module, pr)
         dispatcher = getattr(model, "dispatcher", None)

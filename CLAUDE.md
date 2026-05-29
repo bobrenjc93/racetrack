@@ -60,8 +60,9 @@ python scripts/gen_partition.py --list-recipes  # show available recipes
 python scripts/gen_partition.py --list-nodes    # show graph node IDs
 ```
 
-This creates `partitions/<model>/<hash>/spec.py` with the partition
-definition and kernel stubs. Then implement kernels in
+This creates `partitions/<model>/<hash>/spec.py` plus one stub per backend at
+`kernels/<backend>/ops.py`. Implement the kernels there; you may later split ops
+across multiple files since the dispatcher scans all non-`_` `.py` files under
 `kernels/<backend>/`.
 
 ## Writing kernels

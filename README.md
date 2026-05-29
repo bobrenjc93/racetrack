@@ -18,28 +18,53 @@ benchmarks/
   suites.py
 partitions/
   dsv3_2/
-    model.py                  # vanilla torch baseline
+    model.py                  # vanilla torch baseline (the thing to beat)
     a1f6d7e2/
-      model.py                # partition using backend-dispatched kernels
+      spec.py                 # declarative partition spec (FUSED_OPS, GRAPH_NODES)
       kernels/
         triton/fused_rope.py
         cutedsl/fused_rope.py
         helion/fused_rope.py
 racetrack/
   bench.py                    # benchmark runner
+  compile_backend.py          # RacetrackBackend: the torch.compile custom backend
+  partition_spec.py           # PartitionSpec data model + loader
+  pre_trace.py                # pre-trace / module-patch patchers
+  fx_patterns.py              # FX graph pattern matchers
   runtime/                    # dispatch, flattened model, backend kernels
 ```
 
-Each model folder has a baseline `model.py` that uses only torch operations.
-Each partition folder is named like a content hash and has its own `model.py`
-plus partition-local kernel entrypoints. The current partitions wrap fused
-RMSNorm/RoPE calls through the kernel dispatcher.
+Each model folder has a baseline `model.py` that uses only torch operations --
+the reference to beat. Each partition folder is named like the content hash of
+its `spec.py` and contains a declarative `spec.py` (which ops to fuse and how to
+patch the model) plus partition-local kernel implementations -- not a `model.py`.
+See [Partition Architecture](#partition-architecture) for how a spec is applied.
+
+## Partition Architecture
+
+A partition is `spec.py` + `kernels/`, driven by a `torch.compile` custom backend
+(`RacetrackBackend` in `racetrack/compile_backend.py`):
+
+1. Load `spec.py` into a `PartitionSpec` (`racetrack/partition_spec.py`).
+2. Apply pre-trace patches (`racetrack/pre_trace.py`) -- module-forward
+   replacements and control-flow changes that FX rewrites cannot express.
+3. `torch.compile(model, backend=RacetrackBackend(spec))` traces the model and
+   rewrites matched FX subgraphs (`racetrack/fx_patterns.py`) to dispatch fused
+   kernels.
+
+Fused ops come in three kinds: `fx_pattern` (matched after Dynamo traces, e.g.
+swiglu, residual_norm), `pre_trace` (control-flow changes, e.g. the indexer
+short-circuit), and `module_patch` (forward replacement, e.g. fused attn norm +
+qkv). Generate new partitions with `scripts/gen_partition.py` (see CLAUDE.md and
+"Adding A Partition" below).
 
 ## Kernel Selection
 
 Set `RACETRACK_KERNEL_BACKEND` or pass `--kernel-filter`:
 
 - `torch`: vanilla torch reference implementation
+- `torch.compile` (alias `torch_compile`): the baseline model run under
+  `torch.compile`; included in the baseline `all` sweep
 - `triton`: uses native Triton kernels for RMSNorm and RoPE on CUDA
 - `cutedsl` or `cutedl`: uses native CuTe/CUTLASS DSL kernels for RMSNorm and RoPE on CUDA
 - `helion`: uses Helion kernels for RMSNorm and RoPE, with Helion autotuning on first use
@@ -56,9 +81,10 @@ for every callsite, the end-to-end report uses the pure backend row for clarity.
 
 CUTEDSL and Helion are optional dependencies. Explicitly selecting a backend
 whose real kernel is unavailable is an error. The runner does not silently
-substitute torch. Helion's default autotune effort is `quick`; set
-`RACETRACK_HELION_AUTOTUNE_EFFORT=full` before running to search harder, or
-`HELION_FORCE_AUTOTUNE=1` to ignore cached configs and re-run the search.
+substitute torch. Helion's default autotune effort is `none` (to avoid OOM during
+autotuning); set `RACETRACK_HELION_AUTOTUNE_EFFORT=quick` or `=full` before
+running to search harder, or `HELION_FORCE_AUTOTUNE=1` to ignore cached configs
+and re-run the search.
 
 ## Quick Start
 
@@ -179,23 +205,20 @@ dsv3_2  a1f6d7e2   triton   native    smoke  cuda:0  37.462   427.1   1.562e-02 
 
 ## Adding A Partition
 
-1. Add a new directory under `partitions/dsv3_2/<hash>/`.
-2. Put the partition model in `model.py`.
-3. Put backend kernels under `kernels/triton`, `kernels/cutedsl`, and `kernels/helion`.
-4. Keep the public builder as `build_model(**overrides)`.
-5. Run:
+Use the generator, which writes `spec.py` + kernel stubs and names the directory
+by the `spec.py` content hash:
+
+```bash
+python scripts/gen_partition.py --fuse rms_norm_q,rms_norm_kv,rope_kpe
+python scripts/gen_partition.py --list-recipes   # available fusion recipes
+python scripts/gen_partition.py --list-nodes     # graph node IDs
+```
+
+Then implement the kernels under `kernels/<backend>/` (the dispatcher scans all
+non-underscore `.py` files there) and run:
 
 ```bash
 python -m racetrack.bench --model dsv3_2 --partition all --kernel-filter all
-```
-
-A practical hash command for a new partition file is:
-
-```bash
-python - <<'PY'
-import hashlib, pathlib
-print(hashlib.sha256(pathlib.Path("model.py").read_bytes()).hexdigest()[:8])
-PY
 ```
 
 ## Development Checks
