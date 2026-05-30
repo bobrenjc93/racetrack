@@ -106,8 +106,6 @@ python -m racetrack.bench --partition all --kernel-filter all --benchmark smoke
 After a benchmark run:
 - `benchmarks/<name>/results/<model>/<hardware>.md` has the winner, full
   leaderboard, baseline comparison, and hardware info.
-- `partitions/<model>/<hash>/kernels/best.json` is a runtime cache for per-op
-  backend winners (gitignored, not committed -- hardware-specific).
 
 ## Environment
 
@@ -120,5 +118,4 @@ pip install helion            # for helion kernels
 Set `RACETRACK_KERNEL_BACKEND` to control dispatch:
 - `torch` -- pure PyTorch fallbacks only
 - `triton` / `helion` / `cutedsl` -- force a specific backend
-- `best` -- benchmark all backends on first call, cache winner to `best.json`
 - `all` -- (bench.py only) sweep all backends

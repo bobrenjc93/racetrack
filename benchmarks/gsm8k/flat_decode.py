@@ -61,8 +61,17 @@ def build_flat_decode(model, kernel_root: Path | None = None, backend: str | Non
 
     if backend == "best" and kernel_root:
         best_map = _load_best_json(kernel_root)
+        def _resolve_backend(op_name):
+            entry = best_map.get(op_name)
+            if isinstance(entry, str):
+                return entry
+            if isinstance(entry, dict):
+                backends = set(entry.values()) - {"torch"}
+                if backends:
+                    return next(iter(backends))
+            return None
         def _load_best(name):
-            b = best_map.get(f"fused_{name}") or best_map.get(name)
+            b = _resolve_backend(f"fused_{name}") or _resolve_backend(name)
             return _load_kernel(kernel_root, name, b)
         aq = _load_best("act_quant")
         rn = _load_best("residual_norm")

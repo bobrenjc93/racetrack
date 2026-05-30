@@ -91,10 +91,6 @@ def test_all_spec_ops_have_all_backends(spec):
         )
 
 
-# ---------------------------------------------------------------------------
-# Test 2: 'best' backend results >= any single concrete backend
-# ---------------------------------------------------------------------------
-
 def _parse_leaderboard(md_path: Path) -> list[dict]:
     """Parse the markdown leaderboard table into a list of row dicts."""
     text = md_path.read_text()
@@ -139,51 +135,6 @@ def _find_result_files() -> list[Path]:
 RESULT_FILES = _find_result_files()
 
 
-@pytest.mark.parametrize("md_path", RESULT_FILES, ids=[str(p.relative_to(PROJECT_ROOT)) for p in RESULT_FILES])
-def test_best_backend_not_slower_than_concrete(md_path):
-    """For each partition, the 'best' row must have total_ms <= min(concrete backends).
-
-    'best' picks the fastest kernel per-op, so it should never be slower
-    than running a single backend for all ops. We allow 5% tolerance for
-    measurement noise.
-    """
-    rows = _parse_leaderboard(md_path)
-    if not rows:
-        pytest.skip("No leaderboard rows found")
-
-    partitions = {r["partition"] for r in rows}
-    violations = []
-    tolerance = 0.05
-
-    for partition in sorted(partitions):
-        if partition == "baseline":
-            continue
-        best_rows = [r for r in rows if r["partition"] == partition and r["backend"] == "best"]
-        concrete_rows = [
-            r for r in rows
-            if r["partition"] == partition and r["backend"] in BACKENDS
-        ]
-        if not best_rows or not concrete_rows:
-            continue
-
-        best_ms = min(r["total_ms"] for r in best_rows)
-        for cr in concrete_rows:
-            allowed = cr["total_ms"] * (1 + tolerance)
-            if best_ms > allowed:
-                pct_slower = (best_ms / cr["total_ms"] - 1) * 100
-                violations.append(
-                    f"  {partition}: best={best_ms:.1f}ms > "
-                    f"{cr['backend']}={cr['total_ms']:.1f}ms "
-                    f"(+{pct_slower:.1f}% slower, tolerance={tolerance*100:.0f}%)"
-                )
-
-    if violations:
-        pytest.fail(
-            f"{md_path.name} has {len(violations)} 'best' violation(s):\n"
-            + "\n".join(violations)
-        )
-
-
 # ---------------------------------------------------------------------------
 # Test 3: every non-baseline partition has all 3 backends in the leaderboard
 # ---------------------------------------------------------------------------
@@ -191,14 +142,14 @@ def test_best_backend_not_slower_than_concrete(md_path):
 @pytest.mark.parametrize("md_path", RESULT_FILES, ids=[str(p.relative_to(PROJECT_ROOT)) for p in RESULT_FILES])
 def test_all_partitions_have_all_backends(md_path):
     """Every non-baseline partition in the leaderboard must have a row for
-    each of the three concrete backends (triton, cutedsl, helion) plus best.
+    each of the three concrete backends (triton, cutedsl, helion).
     A missing backend means the benchmark runner skipped or crashed on it.
     """
     rows = _parse_leaderboard(md_path)
     if not rows:
         pytest.skip("No leaderboard rows found")
 
-    expected = set(BACKENDS) | {"best"}
+    expected = set(BACKENDS)
     partitions = {r["partition"] for r in rows if r["partition"] != "baseline"}
     missing = []
 
