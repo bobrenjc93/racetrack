@@ -32,7 +32,7 @@ from benchmarks.common import (
     normalize_backend_name,
 )
 
-BACKENDS = ("torch", TORCH_COMPILE_BACKEND, *CONCRETE_BACKENDS, "best")
+BACKENDS = ("torch", TORCH_COMPILE_BACKEND, *CONCRETE_BACKENDS)
 REAL_DISABLED_BACKENDS: dict[str, frozenset[str]] = {}
 
 
@@ -114,8 +114,6 @@ def discover_real_kernel_rows(
             if b not in disabled and (spec.kernel_root / b).is_dir()
         ]
         backends = list(concrete_backends)
-        if len(backends) > 1:
-            backends.append("best")
 
         if backend_filter != "all":
             wanted_backends = {

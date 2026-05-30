@@ -636,7 +636,7 @@ def parse_args() -> argparse.Namespace:
         description="Run a realistic-shape sharded synthetic DeepSeek benchmark with torchrun."
     )
     parser.add_argument("--model", default="dsv3_2", choices=("dsv3_2",))
-    parser.add_argument("--backend", default="all", choices=("torch", "triton", "cutedsl", "helion", "best", "all"))
+    parser.add_argument("--backend", default="all", choices=("torch", "triton", "cutedsl", "helion", "all"))
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--layers", default="realistic", help="'realistic' or an integer layer count")
     parser.add_argument("--dtype", default="bf16")

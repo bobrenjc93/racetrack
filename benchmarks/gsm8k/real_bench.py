@@ -430,7 +430,7 @@ def run(
     cg_candidates = [
         r for r in rows
         if r.spec is not None and _can_use_fused_patches(r)
-        and r.backend in (*CONCRETE_BACKENDS, "best")
+        and r.backend in CONCRETE_BACKENDS
     ]
     cg_backends_to_run = sorted({r.backend for r in cg_candidates})
     if cg_candidates:
@@ -690,13 +690,7 @@ def _winner_line(row: dict, speedup: float | None) -> str:
 
 
 def _backend_cell(row: dict) -> str:
-    if row["backend"] != "best" or not row.get("selected_backends"):
-        return row["backend"]
-    kernels_note = ", ".join(
-        f"{op}={'+'.join(backends)}"
-        for op, backends in sorted(row["selected_backends"].items())
-    )
-    return f"{row['backend']} ({kernels_note})"
+    return row["backend"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
