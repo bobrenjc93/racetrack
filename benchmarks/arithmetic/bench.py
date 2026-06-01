@@ -55,7 +55,6 @@ KERNEL_FILTERS = (
     "cutedsl",
     "cutedl",
     "helion",
-    "best",
 )
 
 MODEL_OVERRIDES: dict[str, int | float | str] = {
@@ -273,10 +272,6 @@ def _benchmark_backend(
         device=device,
     )
     dispatcher = getattr(model, "dispatcher", None)
-    if backend == "best":
-        best_summary = getattr(dispatcher, "best_summary", None)
-        if callable(best_summary):
-            backend_status = best_summary()
 
     kernel_map = None
     if dispatcher is not None and backend in CONCRETE_BACKENDS:
@@ -366,90 +361,6 @@ def _combo_key(r: Result) -> tuple[str, str, str]:
     return (r.model, r.partition, r.backend)
 
 
-def _single_backend_mixed_plan(status: str) -> str | None:
-    if not status.startswith("mixed="):
-        return None
-    plan = status.removeprefix("mixed=")
-    if ";" in plan or "=" in plan:
-        return None
-    return plan if plan in CONCRETE_BACKENDS else None
-
-
-def _discover_dispatched_ops(results: list[Result], partition: str) -> list[str]:
-    for result in results:
-        if result.partition != partition or result.backend in ("torch", TORCH_COMPILE_BACKEND):
-            continue
-        module = _load_partition_module(result.model)
-        pr = _partition_root(result.model, partition)
-        model = _build_model_with_partition(module, pr)
-        dispatcher = getattr(model, "dispatcher", None)
-        if dispatcher is None:
-            return []
-        ops: list[str] = []
-        for backend in CONCRETE_BACKENDS:
-            for mod in dispatcher._load_backend_modules(backend):
-                if not bool(getattr(mod, "BACKEND_AVAILABLE", False)):
-                    continue
-                for name in sorted(dir(mod)):
-                    if (
-                        not name.startswith("_")
-                        and name != "BACKEND_AVAILABLE"
-                        and callable(getattr(mod, name))
-                        and name not in ops
-                    ):
-                        ops.append(name)
-        del model
-        return ops
-    return []
-
-
-def _synthesize_best(results: list[Result]) -> list[Result]:
-    by_partition: dict[str, dict[str, list[Result]]] = {}
-    for result in results:
-        by_partition.setdefault(result.partition, {}).setdefault(result.backend, []).append(result)
-
-    best_results: list[Result] = []
-    for partition, backends in by_partition.items():
-        if partition == "baseline" or not any(
-            backend in CONCRETE_BACKENDS for backend in backends
-        ):
-            continue
-        concrete_backends = {backend for backend in backends if backend != "best"}
-        best_backend, runs = min(
-            backends.items(),
-            key=lambda kv: sum(result.mean_ms for result in kv[1]),
-        )
-        if best_backend == "best":
-            single_backend = _single_backend_mixed_plan(runs[0].backend_status)
-            if single_backend in concrete_backends:
-                continue
-        kernel_map = None
-        if best_backend in CONCRETE_BACKENDS:
-            dispatched_ops = _discover_dispatched_ops(results, partition)
-            kernel_map = {op: best_backend for op in dispatched_ops} if dispatched_ops else None
-        for result in runs:
-            best_results.append(
-                Result(
-                    model=result.model,
-                    partition=result.partition,
-                    backend="best",
-                    backend_status=f"={best_backend}",
-                    case=result.case,
-                    prompt=result.prompt,
-                    expected=result.expected,
-                    tokens=result.tokens,
-                    device=result.device,
-                    dtype=result.dtype,
-                    mean_ms=result.mean_ms,
-                    min_ms=result.min_ms,
-                    max_ms=result.max_ms,
-                    tokens_per_second=result.tokens_per_second,
-                    kernels=kernel_map,
-                )
-            )
-    return best_results
-
-
 def _build_combo_entry(runs: list[Result], baseline_ms: dict[str, float]) -> dict:
     kernel_map = next((result.kernels for result in runs if result.kernels), None)
     aggregate = sum(result.mean_ms for result in runs)
@@ -481,7 +392,7 @@ def _build_combo_entry(runs: list[Result], baseline_ms: dict[str, float]) -> dic
 
 
 def pick_winner(results: list[Result]) -> dict:
-    all_results = results + _synthesize_best(results)
+    all_results = results
 
     combos: dict[tuple[str, str, str], list[Result]] = {}
     for result in all_results:
@@ -682,15 +593,10 @@ def _render_markdown(report: dict, slug: str) -> str:
     for rank, entry in enumerate(report["leaderboard"], 1):
         speedup_val = entry.get("speedup_vs_baseline")
         speedup_cell = f"{speedup_val:.3f}x" if speedup_val is not None else "-"
-        kernels_note = ""
-        if entry["backend"] == "best" and entry.get("kernels"):
-            kernels_note = " (" + ", ".join(
-                f"{op}={backend}" for op, backend in sorted(entry["kernels"].items())
-            ) + ")"
         row = [
             str(rank),
             entry["partition"],
-            f"{entry['backend']}{kernels_note}",
+            entry["backend"],
             f"{entry['aggregate_mean_ms']:.3f}",
             speedup_cell,
             _format_correctness(

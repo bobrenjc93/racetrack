@@ -230,61 +230,6 @@ def test_dsv3_2_nvfp4_real_rows_include_full_topk_indexer() -> None:
     assert "fused_swiglu" in row.ops
 
 
-def test_dsv3_2_best_ignores_cached_disabled_backend(tmp_path) -> None:
-    triton_dir = tmp_path / "kernels" / "triton"
-    helion_dir = tmp_path / "kernels" / "helion"
-    triton_dir.mkdir(parents=True)
-    helion_dir.mkdir(parents=True)
-    (tmp_path / "kernels" / "best.json").write_text('{"fused_swiglu": "helion"}\n')
-    (triton_dir / "ops.py").write_text(
-        textwrap.dedent(
-            """
-            BACKEND_AVAILABLE = True
-
-            def fused_swiglu(gate, up, *, fallback):
-                return fallback(gate, up)
-            """
-        )
-    )
-    (helion_dir / "ops.py").write_text(
-        textwrap.dedent(
-            """
-            BACKEND_AVAILABLE = True
-
-            def fused_swiglu(gate, up, *, fallback):
-                raise RuntimeError("helion should not run")
-            """
-        )
-    )
-
-    from racetrack.models.deepseek import MLP
-
-    model = MLP(8, 16).float().eval()
-    x = torch.randn(2, 3, 8)
-
-    spec = _make_spec("dsv3_2", "test", [
-        {"name": "fused_swiglu", "kind": "fx_pattern"},
-    ])
-    row = RealKernelRow(
-        partition_model="dsv3_2",
-        partition="test",
-        backend="best",
-        kernel_root=tmp_path / "kernels",
-        ops=("fused_swiglu",),
-        spec=spec,
-    )
-
-    with patch_real_model(model, row, strict_kernel_use=False) as stats:
-        model(x)
-
-    selected = {
-        backend
-        for backends in stats.selected_backends.values()
-        for backend in backends
-    }
-    assert "helion" not in selected
-
-
 def test_real_kernel_patcher_can_route_indexer_forward(tmp_path) -> None:
     kernel_dir = tmp_path / "kernels" / "triton"
     kernel_dir.mkdir(parents=True)
@@ -522,7 +467,7 @@ def test_real_report_keeps_legacy_leaderboard_schema() -> None:
             },
             {
                 "partition": "test",
-                "backend": "best",
+                "backend": "triton",
                 "ops": ["fused_swiglu"],
                 "mean_ms": 5.0,
                 "total_ms": 5.0,
@@ -534,7 +479,7 @@ def test_real_report_keeps_legacy_leaderboard_schema() -> None:
                 "token_match": 0,
                 "max_abs_diff": 0.0,
                 "calls": {"fused_swiglu": 1},
-                "selected_backends": {"fused_swiglu": ["triton"]},
+                "selected_backends": {},
             },
         ],
     }
@@ -544,7 +489,7 @@ def test_real_report_keeps_legacy_leaderboard_schema() -> None:
     assert "| # | partition | backend | total (ms) | vs baseline | validation | max diff |" in markdown
     assert "answer match" not in markdown
     assert "token match" not in markdown
-    assert "| 1 | test | best (fused_swiglu=triton) | 5.0 | 2.000x | pass | 0.000e+00 |" in markdown
+    assert "| 1 | test | triton | 5.0 | 2.000x | pass | 0.000e+00 |" in markdown
 
 
 def test_post_load_transform_hooks_run_once_per_module() -> None:

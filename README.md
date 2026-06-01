@@ -67,24 +67,15 @@ Set `RACETRACK_KERNEL_BACKEND` or pass `--kernel-filter`:
   `torch.compile`; included in the baseline `all` sweep
 - `triton`: uses native Triton kernels for RMSNorm and RoPE on CUDA
 - `cutedsl` or `cutedl`: uses native CuTe/CUTLASS DSL kernels for RMSNorm and RoPE on CUDA
-- `helion`: uses Helion kernels for RMSNorm and RoPE, with Helion autotuning on first use
-- `best`: runtime mixed-kernel mode; each kernel callsite is timed across
-  implemented concrete backends, then the winner is cached for that callsite
-- `all`: runner-only option that reports implemented concrete backends and a
-  final `best` row. Today that means `triton`, `cutedsl`, `helion`, and `best`.
-
-For `best`, the status column reports what won. `pure=helion` means the pure
-Helion run was the fastest end-to-end candidate. If the mixed-kernel plan wins,
-the status includes the selected callsite plan, for example
-`mixed=fused_norm_rope=helion`. If the mixed planner selects the same backend
-for every callsite, the end-to-end report uses the pure backend row for clarity.
+- `helion`: uses Helion kernels for RMSNorm and RoPE
+- `all`: runner-only option that sweeps all implemented concrete backends
+  (`triton`, `cutedsl`, `helion`)
 
 CUTEDSL and Helion are optional dependencies. Explicitly selecting a backend
 whose real kernel is unavailable is an error. The runner does not silently
-substitute torch. Helion's default autotune effort is `none` (to avoid OOM during
-autotuning); set `RACETRACK_HELION_AUTOTUNE_EFFORT=quick` or `=full` before
-running to search harder, or `HELION_FORCE_AUTOTUNE=1` to ignore cached configs
-and re-run the search.
+substitute torch. Helion kernels ship with hardcoded `helion.Config` tuned on
+H100 at DeepSeek-scale shapes (full autotune search, ~450-1500 configs per
+kernel). No runtime autotuning is needed.
 
 ## Quick Start
 

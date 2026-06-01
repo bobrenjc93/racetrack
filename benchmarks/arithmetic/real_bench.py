@@ -132,7 +132,7 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
     cg_candidates = [
         r for r in rows
         if r.spec is not None and _can_use_fused_patches(r)
-        and r.backend in (*CONCRETE_BACKENDS, "best")
+        and r.backend in CONCRETE_BACKENDS
     ]
     cg_backends = sorted({r.backend for r in cg_candidates})
 
@@ -208,9 +208,6 @@ def run(*, ckpt_path, hf_token, hf_direct, partition_model, backend_filter, warm
 
 
 def _format_backend(r):
-    if r.backend == "best" and r.selected_backends:
-        ops = ", ".join(f"{k}={v[0]}" for k, v in sorted(r.selected_backends.items()))
-        return f"best ({ops})"
     return r.backend
 
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 
@@ -16,10 +15,6 @@ except Exception:
     BACKEND_AVAILABLE = False
 
 
-def _autotune_effort() -> str:
-    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "none")
-
-
 def _require_helion_cuda(*tensors: torch.Tensor) -> None:
     if not BACKEND_AVAILABLE:
         raise RuntimeError("Helion backend requested, but helion is not installed")
@@ -29,7 +24,16 @@ def _require_helion_cuda(*tensors: torch.Tensor) -> None:
 
 if BACKEND_AVAILABLE:
 
-    @helion.kernel(autotune_effort=_autotune_effort())
+    @helion.kernel(config=helion.Config(
+        block_sizes=[1],
+        indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor',
+                  'tensor_descriptor', 'pointer', 'pointer', 'pointer'],
+        load_eviction_policies=['last', '', 'first', 'last', 'last'],
+        num_stages=8, num_warps=32, pid_type='flat',
+        range_flattens=[None], range_multi_buffers=[None],
+        range_num_stages=[0], range_unroll_factors=[0],
+        range_warp_specializes=[], reduction_loops=[None],
+    ))
     def _rms_norm_kernel(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -47,7 +51,17 @@ if BACKEND_AVAILABLE:
             ).to(x.dtype)
         return out
 
-    @helion.kernel(autotune_effort=_autotune_effort())
+    @helion.kernel(config=helion.Config(
+        block_sizes=[1, 2],
+        indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor',
+                  'tensor_descriptor', 'tensor_descriptor'],
+        l2_groupings=[16],
+        load_eviction_policies=['first', 'first', 'first'],
+        loop_orders=[[0, 1]], num_stages=7, num_warps=4, pid_type='flat',
+        range_flattens=[None], range_multi_buffers=[None],
+        range_num_stages=[0], range_unroll_factors=[0],
+        range_warp_specializes=[],
+    ))
     def _rope_kernel(
         x: torch.Tensor,
         positions: torch.Tensor,
@@ -69,7 +83,18 @@ if BACKEND_AVAILABLE:
             out[tile_t, tile_h + half] = (x2 * cos + x1 * sin).to(x.dtype)
         return out
 
-    @helion.kernel(autotune_effort=_autotune_effort())
+    @helion.kernel(config=helion.Config(
+        block_sizes=[1],
+        indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor',
+                  'tensor_descriptor', 'pointer', 'pointer', 'pointer', 'pointer',
+                  'pointer', 'tensor_descriptor', 'tensor_descriptor',
+                  'tensor_descriptor'],
+        load_eviction_policies=['', '', '', '', 'first', 'first', '', ''],
+        num_stages=6, num_warps=32, pid_type='flat',
+        range_flattens=[None], range_multi_buffers=[None],
+        range_num_stages=[0], range_unroll_factors=[0],
+        range_warp_specializes=[], reduction_loops=[None],
+    ))
     def _residual_norm_kernel(
         residual: torch.Tensor,
         update: torch.Tensor,
@@ -89,7 +114,16 @@ if BACKEND_AVAILABLE:
             ).to(residual.dtype)
         return out_hidden, out_normed
 
-    @helion.kernel(autotune_effort=_autotune_effort())
+    @helion.kernel(config=helion.Config(
+        block_sizes=[1, 1024], flatten_loops=[True],
+        indexing=['pointer', 'tensor_descriptor', 'tensor_descriptor'],
+        l2_groupings=[8],
+        load_eviction_policies=['last', 'first'],
+        loop_orders=[[0, 1]], num_stages=4, num_warps=4, pid_type='xyz',
+        range_flattens=[None], range_multi_buffers=[None],
+        range_num_stages=[0], range_unroll_factors=[0],
+        range_warp_specializes=[],
+    ))
     def _swiglu_kernel(
         gate: torch.Tensor,
         up: torch.Tensor,

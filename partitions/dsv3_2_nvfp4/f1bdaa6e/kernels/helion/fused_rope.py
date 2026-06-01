@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 
 import torch
 
@@ -15,13 +14,21 @@ except Exception:
     BACKEND_AVAILABLE = False
 
 
-def _autotune_effort() -> str:
-    return os.getenv("RACETRACK_HELION_AUTOTUNE_EFFORT", "none")
 
 
 if BACKEND_AVAILABLE:
 
-    @helion.kernel(autotune_effort=_autotune_effort())
+    @helion.kernel(config=helion.Config(
+            block_sizes=[1],
+            indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor',
+                      'tensor_descriptor', 'pointer', 'pointer', 'pointer'],
+            load_eviction_policies=['last', '', 'first', 'last', 'last'],
+            num_stages=8, num_warps=32, pid_type='flat',
+            range_flattens=[None], range_multi_buffers=[None],
+            range_num_stages=[0], range_unroll_factors=[0],
+            range_warp_specializes=[], reduction_loops=[None],
+        )
+    )
     def _rms_norm_kernel(
         x: torch.Tensor,
         weight: torch.Tensor,

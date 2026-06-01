@@ -33,6 +33,7 @@ class KernelDispatcher:
         self._best: dict[str, str] = {}
         self._best_ops: dict[str, set[str]] = {}
         self._best_fast_path: dict[str, str] = {}
+        self._best_validated: set[str] = set()
         self._load_best_config()
 
     @staticmethod
@@ -155,6 +156,21 @@ class KernelDispatcher:
                 self._best_ops.setdefault(op_name, set()).add(cached)
             return cached
 
+        # If a prior shape already determined this op's winner during THIS
+        # process (i.e., the warm-up timed all candidates and picked a winner),
+        # reuse it for unseen shapes. MoE routing produces a different batch dim
+        # on every call, but the winning backend is shape-independent for these
+        # kernels, so re-timing every unseen batch size wastes time and inflates
+        # the 'best' row. We only trust winners validated by timing in this
+        # session (_best_validated), not stale on-disk best.json entries that may
+        # reference backends that are broken at runtime.
+        if op_name in self._best_validated:
+            fast = self._best_fast_path.get(op_name)
+            if fast is not None:
+                self._best[key] = fast
+                self._best_ops.setdefault(op_name, set()).add(fast)
+                return fast
+
         timings: list[tuple[float, str]] = []
         for candidate in self.BACKENDS:
             fn = self._resolve(candidate, op_name)
@@ -172,6 +188,7 @@ class KernelDispatcher:
         else:
             selected = min(timings)[1]
         self._best[key] = selected
+        self._best_validated.add(op_name)
         if selected != "torch":
             self._best_ops.setdefault(op_name, set()).add(selected)
             self._best_fast_path[op_name] = selected

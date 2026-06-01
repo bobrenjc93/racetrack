@@ -24,7 +24,6 @@ BACKENDS = (
     "triton",
     "cutedsl",
     "helion",
-    "best",
     "all",
 )
 MODELS = ("dsv3_2", "dsv3_2_nvfp4")
@@ -262,11 +261,6 @@ def _benchmark_backend(
         repeat=repeat,
         device=device,
     )
-    if backend == "best":
-        dispatcher = getattr(model, "dispatcher", None)
-        best_summary = getattr(dispatcher, "best_summary", None)
-        if callable(best_summary):
-            backend_status = best_summary()
     diff = None
     ok = True
     if check:
@@ -295,47 +289,6 @@ def _benchmark_backend(
         _cleanup_compile_state(device)
         _sync(device)
     return result
-
-
-def _best_result_from_candidates(candidates: list[BenchResult]) -> BenchResult:
-    concrete_backends = {result.backend for result in candidates if result.backend != "best"}
-    normalized_candidates = []
-    for result in candidates:
-        if result.backend == "best":
-            single_backend = _single_backend_mixed_plan(result.backend_status)
-            if single_backend in concrete_backends:
-                continue
-        normalized_candidates.append(result)
-    normalized_ok = [result for result in normalized_candidates if result.ok]
-    best = min(normalized_ok or normalized_candidates, key=lambda result: result.mean_ms)
-    backend_status = (
-        best.backend_status if best.backend == "best" else f"pure={best.backend}"
-    )
-    return BenchResult(
-        model=best.model,
-        partition=best.partition,
-        backend="best",
-        backend_status=backend_status,
-        case=best.case,
-        device=best.device,
-        tokens=best.tokens,
-        dtype=best.dtype,
-        mean_ms=best.mean_ms,
-        min_ms=best.min_ms,
-        max_ms=best.max_ms,
-        tokens_per_second=best.tokens_per_second,
-        max_abs_diff=best.max_abs_diff,
-        ok=best.ok,
-    )
-
-
-def _single_backend_mixed_plan(status: str) -> str | None:
-    if not status.startswith("mixed="):
-        return None
-    plan = status.removeprefix("mixed=")
-    if ";" in plan or "=" in plan:
-        return None
-    return plan if plan in CONCRETE_KERNEL_BACKENDS else None
 
 
 def _print_table(results: list[BenchResult]) -> None:
@@ -416,10 +369,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
 
                 for partition in _discover_partitions(model_name, args.partition):
                     backends = _backend_list(args.kernel_filter, partition)
-                    if args.kernel_filter == "all" and partition != "baseline":
-                        candidate_results = []
-                        for backend in backends:
-                            result = _benchmark_backend(
+                    for backend in backends:
+                        results.append(
+                            _benchmark_backend(
                                 model_name=model_name,
                                 partition=partition,
                                 backend=backend,
@@ -434,45 +386,7 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                                 check=args.check,
                                 atol=args.atol,
                             )
-                            results.append(result)
-                            candidate_results.append(result)
-                        candidate_results.append(
-                            _benchmark_backend(
-                                model_name=model_name,
-                                partition=partition,
-                                backend="best",
-                                case=case,
-                                device=device,
-                                dtype=dtype,
-                                input_ids=input_ids,
-                                positions=positions,
-                                baseline_out=baseline_out,
-                                warmup=warmup,
-                                repeat=repeat,
-                                check=args.check,
-                                atol=args.atol,
-                            )
                         )
-                        results.append(_best_result_from_candidates(candidate_results))
-                    else:
-                        for backend in backends:
-                            results.append(
-                                _benchmark_backend(
-                                    model_name=model_name,
-                                    partition=partition,
-                                    backend=backend,
-                                    case=case,
-                                    device=device,
-                                    dtype=dtype,
-                                    input_ids=input_ids,
-                                    positions=positions,
-                                    baseline_out=baseline_out,
-                                    warmup=warmup,
-                                    repeat=repeat,
-                                    check=args.check,
-                                    atol=args.atol,
-                                )
-                            )
     return results
 
 
